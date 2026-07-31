@@ -51,7 +51,7 @@ def _execute_guarded(spec: ToolSpec | None, name: str, raw_input: dict[str, Any]
         return json.dumps({"error": str(exc)}), True
     try:
         return spec.execute(**validated), False
-    except Exception as exc:  # surfaced to the model, not swallowed
+    except Exception as exc:  # noqa: BLE001 — surfaced to the model, not swallowed
         return json.dumps({"error": str(exc)}), True
 
 

@@ -209,7 +209,7 @@ async def run_evals(limit: int | None, concurrency: int) -> dict[str, Any]:
         async with semaphore:
             try:
                 return await run_case(client, case, kb_text)
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 — one bad case must not sink the suite
                 return CaseResult(id=case["id"], passed=False, error=f"harness: {exc}")
 
     results = await asyncio.gather(*(bounded(c) for c in cases))
