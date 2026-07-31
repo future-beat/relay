@@ -24,8 +24,9 @@ fully visible and testable.
 - [x] **Phase 3 — Evaluation harness**: 12-ticket golden dataset, deterministic
       action/category grading plus LLM-as-judge grounding checks, JSON report
       artifact, threshold exit code for CI (`python -m relay.evals`)
-- [ ] **Phase 4 — Observability**: structured logs, OpenTelemetry traces,
-      token/cost/latency metrics
+- [x] **Phase 4 — Observability**: JSON structured logs, OpenTelemetry spans
+      per run/model-call/tool (OTLP export via `OTEL_EXPORTER_OTLP_ENDPOINT`),
+      per-run metrics in SQLite, `/metrics` aggregates, `/dashboard` page
 - [ ] **Phase 5 — MCP server**: expose the same tools over the Model Context
       Protocol
 - [ ] **Phase 6 — Ship it**: Docker, GitHub Actions CI, cloud deploy, live demo
@@ -60,6 +61,8 @@ result, and a final `resolution` event.
 | `POST` | `/tickets`                    | Create a ticket                               |
 | `GET`  | `/tickets/{id}`               | Fetch a ticket                                |
 | `POST` | `/tickets/{id}/process`       | Run the agent; streams steps as SSE. `?dry_run=true` denies write tools by policy |
+| `GET`  | `/metrics`                    | Run counts, outcomes, token/cost totals, latency p50/p95 |
+| `GET`  | `/dashboard`                  | Minimal live dashboard over `/metrics`        |
 
 ## Tests
 

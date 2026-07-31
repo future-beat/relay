@@ -29,6 +29,19 @@ CREATE TABLE IF NOT EXISTS escalations (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS runs (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ticket_id     INTEGER NOT NULL,
+    model         TEXT NOT NULL,
+    duration_ms   INTEGER NOT NULL,
+    steps         INTEGER NOT NULL,
+    input_tokens  INTEGER NOT NULL,
+    output_tokens INTEGER NOT NULL,
+    cost_usd      REAL NOT NULL,
+    outcome       TEXT NOT NULL,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS replies (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     ticket_id  INTEGER NOT NULL REFERENCES tickets(id),
