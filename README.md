@@ -1,5 +1,7 @@
 # Relay
 
+[![CI](https://github.com/future-beat/relay/actions/workflows/ci.yml/badge.svg)](https://github.com/future-beat/relay/actions/workflows/ci.yml)
+
 An AI support-triage agent, built as a **production service** — not a notebook.
 
 Relay receives support tickets for a fictional SaaS product (Lanekeep) over a REST
@@ -30,7 +32,9 @@ fully visible and testable.
 - [x] **Phase 5 — MCP server**: the same tool registry (plus ticket
       lifecycle tools) served over the Model Context Protocol via stdio,
       behind the same validation and write-policy guardrails
-- [ ] **Phase 6 — Ship it**: Docker, GitHub Actions CI, cloud deploy, live demo
+- [x] **Phase 6 — Ship it**: Dockerfile with container healthcheck, GitHub
+      Actions CI (lint + tests + Docker smoke test on every push; on-demand
+      eval workflow with report artifact), Fly.io deploy config
 
 See [docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md) for the full project definition.
 
@@ -96,6 +100,29 @@ client ──POST /tickets/{id}/process──▶ FastAPI ──▶ agent loop (C
                           tools ──▶ SQLite (customers, tickets,
                                     escalations, replies)
                                 └─▶ kb/*.md (docs search)
+```
+
+## Deployment
+
+CI runs lint, the 37-test suite, and a Docker build + container smoke test on
+every push. The eval suite runs on demand (Actions → Evals) against the
+`ANTHROPIC_API_KEY` repository secret and uploads the JSON report as an
+artifact.
+
+Deploy to [Fly.io](https://fly.io) with the included [fly.toml](fly.toml):
+
+```bash
+fly launch --no-deploy
+fly volumes create relay_data --size 1
+fly secrets set ANTHROPIC_API_KEY=sk-ant-...
+fly deploy
+```
+
+Or run the container anywhere:
+
+```bash
+docker build -t relay .
+docker run -p 8000:8000 -e ANTHROPIC_API_KEY=sk-ant-... relay
 ```
 
 ## License

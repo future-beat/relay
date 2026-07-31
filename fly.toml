@@ -1,0 +1,27 @@
+# Fly.io deployment. One-time setup:
+#   fly launch --no-deploy        (creates the app; pick a unique name)
+#   fly volumes create relay_data --size 1
+#   fly secrets set ANTHROPIC_API_KEY=sk-ant-...
+#   fly deploy
+app = "relay-agent"
+primary_region = "syd"
+
+[build]
+
+[env]
+  RELAY_DB_PATH = "/data/relay.db"
+
+[[mounts]]
+  source = "relay_data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

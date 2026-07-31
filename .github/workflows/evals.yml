@@ -1,0 +1,32 @@
+name: Evals
+
+# Agent-quality evals cost real API tokens, so they run on demand rather than
+# on every push. The suite fails the job below an 80% pass rate.
+on:
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: "Minimum pass rate (0-1)"
+        default: "0.8"
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        run: pip install -e .
+      - name: Run eval suite
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python -m relay.evals --concurrency 4 --threshold "${{ inputs.threshold }}"
+      - name: Upload report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval_results/
