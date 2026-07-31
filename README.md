@@ -21,8 +21,9 @@ fully visible and testable.
 - [x] **Phase 2 — Guardrails**: Pydantic-validated tool inputs, per-run cost
       budget with hard abort, write-tool policy (`?dry_run=true`), structured
       error events on API failure, per-step `usage` events with running cost
-- [ ] **Phase 3 — Evaluation harness**: golden ticket dataset, LLM-as-judge
-      grading, eval report in CI
+- [x] **Phase 3 — Evaluation harness**: 12-ticket golden dataset, deterministic
+      action/category grading plus LLM-as-judge grounding checks, JSON report
+      artifact, threshold exit code for CI (`python -m relay.evals`)
 - [ ] **Phase 4 — Observability**: structured logs, OpenTelemetry traces,
       token/cost/latency metrics
 - [ ] **Phase 5 — MCP server**: expose the same tools over the Model Context
