@@ -98,3 +98,9 @@ def test_json_log_formatter_includes_context():
     assert line["event"] == "tool.executed"
     assert line["ticket_id"] == 7
     assert line["level"] == "info"
+
+
+def test_root_redirects_to_dashboard(client):
+    resp = client.get("/", follow_redirects=False)
+    assert resp.status_code in (302, 307)
+    assert resp.headers["location"] == "/dashboard"

@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 
 from anthropic import AsyncAnthropic
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from . import __version__
 from .agent import run_ticket
@@ -30,6 +30,12 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Relay", version=__version__, lifespan=lifespan)
+
+
+@app.get("/", include_in_schema=False)
+async def root() -> RedirectResponse:
+    """Send visitors to the dashboard rather than a bare 404."""
+    return RedirectResponse("/dashboard")
 
 
 @app.get("/health")
