@@ -13,9 +13,11 @@ COPY kb ./kb
 ENV RELAY_DB_PATH=/data/relay.db
 RUN mkdir -p /data
 
+# Honour $PORT so the image runs unchanged on Fly, Render, Railway, Cloud Run…
+ENV PORT=8000
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health')"
+    CMD python -c "import os,urllib.request;urllib.request.urlopen('http://127.0.0.1:'+os.environ.get('PORT','8000')+'/health')"
 
-CMD ["uvicorn", "relay.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "uvicorn relay.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

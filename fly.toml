@@ -10,6 +10,8 @@ primary_region = 'syd'
 
 [env]
   RELAY_DB_PATH = '/data/relay.db'
+  # Must match http_service.internal_port below; the container binds $PORT.
+  PORT = '8080'
 
 [[mounts]]
   source = 'relay_data'
