@@ -19,7 +19,7 @@ async def lifespan(app: FastAPI):
     init_db(conn)
     app.state.conn = conn
     app.state.registry = build_registry(conn, settings.kb_dir)
-    app.state.client = AsyncAnthropic()
+    app.state.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
     yield
     conn.close()
 
