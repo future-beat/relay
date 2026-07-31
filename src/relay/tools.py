@@ -7,15 +7,27 @@ write actions behind confirmation or policy without touching the loop.
 import json
 import re
 import sqlite3
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
+
+from pydantic import BaseModel
+
+from .guardrails import (
+    CreateEscalationInput,
+    LookupCustomerInput,
+    SearchDocsInput,
+    SendReplyInput,
+    SetCategoryInput,
+)
 
 
 @dataclass(frozen=True)
 class ToolSpec:
     schema: dict[str, Any]
     tier: str  # "read" | "write"
+    input_model: type[BaseModel]
     execute: Callable[..., str]
 
 
@@ -99,6 +111,7 @@ def build_registry(conn: sqlite3.Connection, kb_dir: Path) -> dict[str, ToolSpec
                 "strict": True,
             },
             tier="read",
+            input_model=LookupCustomerInput,
             execute=lambda email: lookup_customer(conn, email),
         ),
         "search_docs": ToolSpec(
@@ -120,6 +133,7 @@ def build_registry(conn: sqlite3.Connection, kb_dir: Path) -> dict[str, ToolSpec
                 "strict": True,
             },
             tier="read",
+            input_model=SearchDocsInput,
             execute=lambda query: search_docs(kb_dir, query),
         ),
         "set_category": ToolSpec(
@@ -147,6 +161,7 @@ def build_registry(conn: sqlite3.Connection, kb_dir: Path) -> dict[str, ToolSpec
                 "strict": True,
             },
             tier="write",
+            input_model=SetCategoryInput,
             execute=lambda ticket_id, category: set_category(conn, ticket_id, category),
         ),
         "send_reply": ToolSpec(
@@ -169,6 +184,7 @@ def build_registry(conn: sqlite3.Connection, kb_dir: Path) -> dict[str, ToolSpec
                 "strict": True,
             },
             tier="write",
+            input_model=SendReplyInput,
             execute=lambda ticket_id, body: send_reply(conn, ticket_id, body),
         ),
         "create_escalation": ToolSpec(
@@ -192,6 +208,7 @@ def build_registry(conn: sqlite3.Connection, kb_dir: Path) -> dict[str, ToolSpec
                 "strict": True,
             },
             tier="write",
+            input_model=CreateEscalationInput,
             execute=lambda ticket_id, reason, priority: create_escalation(
                 conn, ticket_id, reason, priority
             ),

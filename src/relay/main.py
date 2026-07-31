@@ -9,6 +9,7 @@ from . import __version__
 from .agent import run_ticket
 from .config import settings
 from .db import connect, init_db
+from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .tools import build_registry
 
@@ -49,15 +50,22 @@ async def get_ticket(ticket_id: int) -> Ticket:
 
 
 @app.post("/tickets/{ticket_id}/process")
-async def process_ticket(ticket_id: int) -> StreamingResponse:
-    """Run the agent on a ticket, streaming each step as a server-sent event."""
+async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResponse:
+    """Run the agent on a ticket, streaming each step as a server-sent event.
+
+    With dry_run=true, write-tier tools are denied by policy: the agent can
+    read data and search docs but cannot reply, escalate, or categorise.
+    """
     ticket = _get_ticket(ticket_id)
     if ticket.status != "open":
         raise HTTPException(409, f"ticket is already {ticket.status.value}")
 
     async def event_stream():
         async for event in run_ticket(
-            app.state.client, app.state.registry, ticket.model_dump()
+            app.state.client,
+            app.state.registry,
+            ticket.model_dump(),
+            policy=ToolPolicy(allow_writes=not dry_run),
         ):
             yield f"event: {event.type}\ndata: {json.dumps(event.data)}\n\n"
         yield "event: done\ndata: {}\n\n"

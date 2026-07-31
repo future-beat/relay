@@ -18,8 +18,9 @@ fully visible and testable.
 - [x] **Phase 1 — Core agent service**: FastAPI + SSE, hand-written agent loop,
       tools (`lookup_customer`, `search_docs`, `set_category`, `send_reply`,
       `create_escalation`), SQLite with seed data, keyword doc search
-- [ ] **Phase 2 — Guardrails**: per-request cost/step caps, tool permission tiers
-      enforced (read vs write), retries and graceful failure
+- [x] **Phase 2 — Guardrails**: Pydantic-validated tool inputs, per-run cost
+      budget with hard abort, write-tool policy (`?dry_run=true`), structured
+      error events on API failure, per-step `usage` events with running cost
 - [ ] **Phase 3 — Evaluation harness**: golden ticket dataset, LLM-as-judge
       grading, eval report in CI
 - [ ] **Phase 4 — Observability**: structured logs, OpenTelemetry traces,
@@ -57,7 +58,7 @@ result, and a final `resolution` event.
 | `GET`  | `/health`                     | Liveness + configured model                   |
 | `POST` | `/tickets`                    | Create a ticket                               |
 | `GET`  | `/tickets/{id}`               | Fetch a ticket                                |
-| `POST` | `/tickets/{id}/process`       | Run the agent; streams steps as SSE           |
+| `POST` | `/tickets/{id}/process`       | Run the agent; streams steps as SSE. `?dry_run=true` denies write tools by policy |
 
 ## Tests
 

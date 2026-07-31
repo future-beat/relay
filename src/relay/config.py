@@ -15,5 +15,10 @@ class Settings(BaseSettings):
     max_agent_steps: int = 10
     max_tokens: int = 16000
 
+    # Guardrails (phase 2). Prices default to Claude Opus 5 per-MTok rates.
+    max_run_cost_usd: float = 0.50
+    price_in_per_mtok: float = 5.0
+    price_out_per_mtok: float = 25.0
+
 
 settings = Settings()
