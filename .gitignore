@@ -7,8 +7,10 @@ venv/
 dist/
 build/
 
-# Environment
+# Environment — never commit local env files in any format
 .env
+.env.*
+!.env.example
 
 # Local data
 *.db
