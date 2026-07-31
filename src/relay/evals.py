@@ -19,7 +19,7 @@ import asyncio
 import json
 import sys
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -216,7 +216,7 @@ async def run_evals(limit: int | None, concurrency: int) -> dict[str, Any]:
     passed = sum(r.passed for r in results)
     qualities = [r.quality for r in results if r.quality is not None]
     return {
-        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "ran_at": datetime.now(UTC).isoformat(),
         "model": settings.model,
         "cases": len(results),
         "passed": passed,
@@ -235,8 +235,8 @@ def print_summary(report: dict[str, Any]) -> None:
             f"{r['id']:<24} "
             f"{(r['action'] or r['error'] or '—'):<20} "
             f"{'ok' if r['category_ok'] else 'X':<4} "
-            f"{str(r['grounded']):<9} "
-            f"{str(r['quality'] or '—'):<3} "
+            f"{r['grounded']!s:<9} "
+            f"{r['quality'] or '—'!s:<3} "
             f"{'PASS' if r['passed'] else 'FAIL'}"
         )
     print("-" * 68)
@@ -257,7 +257,7 @@ def main() -> None:
 
     report = asyncio.run(run_evals(args.limit, args.concurrency))
     args.output.mkdir(exist_ok=True)
-    out_path = args.output / f"eval-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.json"
+    out_path = args.output / f"eval-{datetime.now(UTC).strftime('%Y%m%dT%H%M%SZ')}.json"
     out_path.write_text(json.dumps(report, indent=2))
     print_summary(report)
     print(f"report: {out_path}")
