@@ -15,6 +15,9 @@ class Settings(BaseSettings):
     max_agent_steps: int = 10
     max_tokens: int = 16000
 
+    # MCP server (phase 5)
+    mcp_allow_writes: bool = True
+
     # Guardrails (phase 2). Prices default to Claude Sonnet 5 per-MTok rates.
     max_run_cost_usd: float = 0.50
     price_in_per_mtok: float = 3.0

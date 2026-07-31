@@ -27,8 +27,9 @@ fully visible and testable.
 - [x] **Phase 4 — Observability**: JSON structured logs, OpenTelemetry spans
       per run/model-call/tool (OTLP export via `OTEL_EXPORTER_OTLP_ENDPOINT`),
       per-run metrics in SQLite, `/metrics` aggregates, `/dashboard` page
-- [ ] **Phase 5 — MCP server**: expose the same tools over the Model Context
-      Protocol
+- [x] **Phase 5 — MCP server**: the same tool registry (plus ticket
+      lifecycle tools) served over the Model Context Protocol via stdio,
+      behind the same validation and write-policy guardrails
 - [ ] **Phase 6 — Ship it**: Docker, GitHub Actions CI, cloud deploy, live demo
 
 See [docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md) for the full project definition.
@@ -63,6 +64,19 @@ result, and a final `resolution` event.
 | `POST` | `/tickets/{id}/process`       | Run the agent; streams steps as SSE. `?dry_run=true` denies write tools by policy |
 | `GET`  | `/metrics`                    | Run counts, outcomes, token/cost totals, latency p50/p95 |
 | `GET`  | `/dashboard`                  | Minimal live dashboard over `/metrics`        |
+
+## MCP server
+
+The same tools are exposed over the [Model Context Protocol](https://modelcontextprotocol.io/),
+so Claude Desktop, Claude Code, or any MCP client can drive Relay directly:
+
+```bash
+claude mcp add relay -- /path/to/.venv/bin/python -m relay.mcp_server
+```
+
+Tool calls go through the same guardrail chain as the agent loop (Pydantic
+input validation + write policy). Set `RELAY_MCP_ALLOW_WRITES=false` to serve
+a read-only surface.
 
 ## Tests
 
