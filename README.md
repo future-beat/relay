@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/future-beat/relay/actions/workflows/ci.yml/badge.svg)](https://github.com/future-beat/relay/actions/workflows/ci.yml)
 
-**Live demo: https://relay-6i5seq.fly.dev** — the root redirects to a dashboard of real agent runs (cost, latency, outcomes).
+**Live demo: https://relay-agent.fly.dev** — the root redirects to a dashboard of real agent runs (cost, latency, outcomes).
 
 An AI support-triage agent, built as a **production service** — not a notebook.
 

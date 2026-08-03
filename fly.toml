@@ -1,9 +1,9 @@
-# fly.toml app configuration file generated for relay-6i5seq on 2026-07-31T12:03:33Z
+# fly.toml app configuration file for relay-agent
 #
 # See https://fly.io/docs/reference/configuration/ for information about how to use this file.
 #
 
-app = 'relay-6i5seq'
+app = 'relay-agent'
 primary_region = 'syd'
 
 [build]
