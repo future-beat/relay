@@ -31,7 +31,14 @@ Decimal phases appear between their surrounding integers in numeric order.
   3. Once the daily USD spend ceiling (read from `runs.cost_usd`) is reached, processing returns 503 with a reset message — and it stays enforced across a cold start
   4. A ticket body that instructs the agent to act on a different ticket produces a visible denial event in the run stream (the model retries in-run, the service does not crash) and the write lands on the correct ticket
   5. A freshly started MCP server refuses write tools unless `RELAY_MCP_ALLOW_WRITES=true` is explicitly set
-**Plans**: TBD
+**Plans**: 5 plans
+
+Plans:
+- [ ] 01-01-PLAN.md — Config settings, `limits` dependency, MCP writes off by default (SEC-05)
+- [ ] 01-02-PLAN.md — Server-side `ticket_id` binding and the `guardrail` event (SEC-04)
+- [ ] 01-03-PLAN.md — `auth.py` and `ratelimit.py` modules plus the shared test harness (SEC-01/02/03/06)
+- [ ] 01-04-PLAN.md — Wire the composed gate into routes; integration coverage (SEC-01/02/03/06)
+- [ ] 01-05-PLAN.md — Publish the demo key, docs, demo script, end-to-end verification (SEC-06)
 
 ### Phase 2: Async-Safe Data Layer & Graceful Shutdown
 **Goal**: Concurrent runs and deploy restarts no longer block the event loop, corrupt connection state, or lose run records
@@ -98,7 +105,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Security Perimeter | 0/TBD | Not started | - |
+| 1. Security Perimeter | 0/5 | Planned | - |
 | 2. Async-Safe Data Layer & Graceful Shutdown | 0/TBD | Not started | - |
 | 3. Semantic Retrieval | 0/TBD | Not started | - |
 | 4. Evaluation Coverage | 0/TBD | Not started | - |
