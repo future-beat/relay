@@ -1,5 +1,6 @@
 """Shared test doubles for driving the agent loop without the Claude API."""
 
+import re
 from types import SimpleNamespace
 
 
@@ -31,3 +32,21 @@ class FakeClient:
 
     async def _create(self, **kwargs):
         return next(self._responses)
+
+
+class TicketAwareFakeClient:
+    """Replies to whichever ticket the prompt names, so overlapping runs can share one
+    client and still issue genuinely concurrent writes."""
+
+    def __init__(self):
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, *, messages, **kw):
+        # ticket_prompt renders "New support ticket #<id>" as the first line.
+        ticket_id = int(re.search(r"[Tt]icket #?(\d+)", messages[0]["content"]).group(1))
+        if len(messages) == 1:
+            # 40 chars clears SendReplyInput's min_length=20 on the first turn.
+            return response(
+                [tool_use_block("send_reply", {"ticket_id": ticket_id, "body": "z" * 40})]
+            )
+        return response([text_block("done")], stop_reason="end_turn")

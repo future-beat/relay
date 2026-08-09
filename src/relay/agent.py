@@ -20,6 +20,7 @@ one child span per model request and per tool execution, and each step emits
 a structured JSON log line.
 """
 
+import asyncio
 import json
 import logging
 import time
@@ -191,7 +192,16 @@ async def run_ticket(
                     ) as span:
                         # Bound at call time from this run's own ticket — never stored on
                         # the registry, which is built once and shared by every live run.
-                        result, is_error = _execute_guarded(
+                        #
+                        # Offloaded because tool execution is blocking SQLite and file I/O,
+                        # and every other run on this process waits behind it otherwise.
+                        # to_thread copies the current context, so this span is still the
+                        # parent inside the worker. What it does not buy: cancelling the run
+                        # returns from this await at once but the thread runs to completion,
+                        # so a disconnect is not "no side effect" — the write is inside a
+                        # transaction and either commits or rolls back, never lands halfway.
+                        result, is_error = await asyncio.to_thread(
+                            _execute_guarded,
                             spec, block.name, block.input, policy,
                             bound_ticket_id=ticket["id"],
                         )
