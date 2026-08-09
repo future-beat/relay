@@ -45,7 +45,7 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 01-03-PLAN.md — `auth.py` and `ratelimit.py` modules plus the shared test harness (SEC-01/02/03/06)
+- [x] 01-03-PLAN.md — `auth.py` and `ratelimit.py` modules plus the shared test harness (SEC-01/02/03/06)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -135,7 +135,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 1. Security Perimeter | 2/5 | In Progress|  |
+| 1. Security Perimeter | 3/5 | In Progress|  |
 | 2. Async-Safe Data Layer & Graceful Shutdown | 0/TBD | Not started | - |
 | 3. Semantic Retrieval | 0/TBD | Not started | - |
 | 4. Evaluation Coverage | 0/TBD | Not started | - |
