@@ -167,3 +167,34 @@ def test_auth_not_configured_fails_closed(client, monkeypatch):
     # The pairing is the point: failing closed must not take /health down with it,
     # or the container HEALTHCHECK and the CI smoke job die alongside auth.
     assert client.get("/health").status_code == 200
+
+
+# --- published demo key (D-02 / SEC-06) ---
+
+
+def test_dashboard_publishes_the_demo_key(client):
+    with without_key(client) as anon:
+        resp = anon.get("/dashboard")
+    assert resp.status_code == 200
+    assert settings.demo_key in resp.text
+
+
+def test_dashboard_demo_key_is_sourced_not_hardcoded(client, monkeypatch):
+    # The point of D-02 is one source of truth. If the dashboard rendered a
+    # literal, it would eventually advertise a key the service rejects — so the
+    # test moves the setting and requires the page to follow it.
+    monkeypatch.setattr(settings, "demo_key", "sentinel-key-4f21b9")
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert "sentinel-key-4f21b9" in resp.text
+    assert "test-demo-key" not in resp.text
+
+
+def test_dashboard_without_a_demo_key_does_not_render_none(client, monkeypatch):
+    # /dashboard is the public landing surface: an unconfigured deployment must
+    # still serve it, and must not print the string "None" as if it were a key.
+    monkeypatch.setattr(settings, "demo_key", None)
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert ">None<" not in resp.text
+    assert "None" not in resp.text
