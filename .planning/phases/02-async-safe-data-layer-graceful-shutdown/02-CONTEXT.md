@@ -30,6 +30,12 @@ This is the widest-blast-radius phase in the milestone — it must land before P
 ### Scope boundary
 - **D-07:** DATA-02's "record on interruption" half is **already done** — Phase 1's CR-01 fix (`b6da97e`) moved `record_run` into a `finally` in `event_stream`, with a `recorded` guard. This phase must **preserve** that behaviour (a regression test already exists: `test_mid_stream_disconnect_still_records_the_spend`) and add only the shutdown-drain half.
 
+### Resolved after research (orchestrator decisions, 2026-08-09)
+- **D-08:** Do **not** set `kill_signal` in `fly.toml`. Fly's docs contradict themselves on the default (SIGINT vs SIGTERM); uvicorn handles both identically, so pinning the wrong one is the only way to break it.
+- **D-09:** `POST /tickets/{id}/process` returns **503 while draining** — one line, one test. A new paid run must not start against a database that is about to close.
+- **D-10:** Add `CREATE INDEX IF NOT EXISTS idx_runs_created_at` in this phase. Mild scope expansion, accepted: `spent_today()` currently scans the whole `runs` table on the event loop for **every** gated request, which is exactly the class of event-loop blocking this phase exists to remove.
+- **D-11:** Leave the now-stale `sqlite3.Connection` type hints in `mcp_server.py` and `evals.py` rather than editing those files — D-03 forbids touching them. Record the staleness deliberately in the SUMMARY.
+
 ### Claude's Discretion
 - Connection ownership specifics: whether to keep one shared connection behind a lock, adopt connection-per-thread, or introduce a thread-safe `Database` wrapper. Derive from D-01. **Hard constraint:** today's single shared connection is only accidentally correct because access is single-threaded — handing that same connection to worker threads makes `commit()` cross-request, committing another request's partial transaction. Whatever is chosen must make connection ownership explicit.
 - WAL and `busy_timeout` pragma placement, and how tests stay representative given the trap below.
@@ -85,7 +91,9 @@ This is the widest-blast-radius phase in the milestone — it must land before P
 
 - Two traps from research that a naive implementation hits, both worth explicit test coverage:
   1. **Shared connection across threads:** `commit()` is connection-scoped, so offloading the *existing* shared connection to worker threads makes one request commit another's partial transaction. Today's blocking behaviour is accidentally correct; a careless `to_thread` is a regression, not a fix.
-  2. **WAL on `:memory:` is a silent no-op** — SQLite leaves the journal mode unchanged. Every current fixture uses `:memory:`, so a WAL pragma would appear to work while being inert across all 110 tests. Any WAL assertion needs a file-backed database.
+  2. **WAL on `:memory:` is a silent no-op** — SQLite leaves the journal mode unchanged, so a WAL pragma appears to work while being inert. Any WAL assertion needs a file-backed database.
+     **Corrected 2026-08-09 by phase research:** an earlier draft of this file claimed *every* fixture uses `:memory:`. That is false — `conftest.py`'s `client` fixture is already file-backed at `tmp_path/"test.db"`, so most of the suite already exercises WAL. Only the `conn` fixture is `:memory:`. A *new* file-backed fixture is sufficient; no existing fixture needs changing.
+     Also corrected: PITFALLS.md states SQLite's `busy_timeout` defaults to 0. For Python's `sqlite3` it is measured at 5000 ms, set from `connect(timeout=5.0)`.
 - Success criterion 2 in ROADMAP.md references "the existing 37-test suite" — that count is stale (the suite is 110 after Phase 1). Treat the criterion as "the suite does not regress", not as a literal count.
 
 </specifics>
