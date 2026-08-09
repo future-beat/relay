@@ -21,8 +21,10 @@ logger = logging.getLogger("relay.auth")
 Tier = Literal["owner", "demo"]
 
 # Errors are raised here, not by the extractor, so this module owns the message
-# and can distinguish a missing header from an invalid one.
-_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
+# and can distinguish a missing header from an invalid one. Public because main.py
+# declares it too: the gate calls require_tier's dependency by hand rather than
+# nesting it, and the declaration is what keeps the scheme in the OpenAPI document.
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 _UNAUTHENTICATED = {"WWW-Authenticate": "APIKey"}  # matches FastAPI's own challenge shape
 
 
@@ -54,7 +56,7 @@ def require_tier(*allowed: Tier):
     """Dependency factory. 401 = unauthenticated; 403 = authenticated but not
     permitted on this surface; 503 = the deployment configured no keys at all."""
 
-    def _dependency(presented: str | None = Security(_HEADER)) -> Tier:
+    def _dependency(presented: str | None = Security(api_key_header)) -> Tier:
         # Fail closed. A deploy that forgets `fly secrets set RELAY_API_KEY` would
         # otherwise ship a wide-open paid endpoint. Raised per request, never at
         # import or startup, so /health stays public and the container still boots.

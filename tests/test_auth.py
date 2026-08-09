@@ -129,6 +129,39 @@ def test_invalid_key_401(client):
     assert resp.status_code == 401
 
 
+def test_repeated_wrong_keys_are_rate_limited(client, monkeypatch):
+    # SEC-01/SEC-02: a 401 raised from a sub-dependency used to short-circuit the
+    # limiter, so key guessing cost the attacker nothing. The anon bucket is charged
+    # before the credential resolves, which is the only thing that bounds the rate.
+    monkeypatch.setattr(settings, "anon_auth_limit", "3/minute")
+    bad = {"X-API-Key": "not-a-real-key"}
+    for _ in range(3):
+        assert client.post("/tickets", json=TICKET, headers=bad).status_code == 401
+    resp = client.post("/tickets", json=TICKET, headers=bad)
+    assert resp.status_code == 429
+    assert resp.json()["detail"]["tier"] == "anon"
+
+
+def test_the_anon_meter_is_charged_across_every_protected_route(client, monkeypatch):
+    # One bucket per IP, not per route: otherwise an attacker just rotates endpoints.
+    monkeypatch.setattr(settings, "anon_auth_limit", "2/minute")
+    bad = {"X-API-Key": "not-a-real-key"}
+    assert client.post("/tickets", json=TICKET, headers=bad).status_code == 401
+    assert client.get("/tickets/1", headers=bad).status_code == 401
+    assert client.post("/tickets/1/process", headers=bad).status_code == 429
+
+
+def test_public_routes_are_not_charged_the_anon_meter(client, monkeypatch):
+    # /health backs the container HEALTHCHECK and the CI smoke job — it must never
+    # be throttleable by anyone hammering the protected surface.
+    monkeypatch.setattr(settings, "anon_auth_limit", "1/minute")
+    with without_key(client) as anon:
+        assert anon.post("/tickets", json=TICKET).status_code == 401
+        for _ in range(5):
+            assert anon.get("/health").status_code == 200
+        assert anon.get("/metrics").status_code == 200
+
+
 def test_valid_key_allows(client):
     assert client.post("/tickets", json=TICKET).status_code == 201
 

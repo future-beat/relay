@@ -46,7 +46,7 @@ See [docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md) for the full project definiti
 python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
-cp .env.example .env   # add your ANTHROPIC_API_KEY
+cp .env.example .env   # add your ANTHROPIC_API_KEY and generate the two RELAY_ keys
 
 uvicorn relay.main:app --reload
 ```

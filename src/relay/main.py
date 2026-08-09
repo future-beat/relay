@@ -4,12 +4,12 @@ from contextlib import asynccontextmanager
 from html import escape
 
 from anthropic import AsyncAnthropic
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from . import __version__
 from .agent import run_ticket
-from .auth import Tier, require_tier
+from .auth import Tier, api_key_header, require_tier
 from .config import settings
 from .db import connect, init_db
 from .guardrails import ToolPolicy
@@ -35,25 +35,35 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Relay", version=__version__, lifespan=lifespan)
 
 
-# D-07 permits both tiers on every protected surface, so one shared dependency
-# covers all three gates. Built once at module level: ruff's B008 rightly rejects
-# a call in an argument default (auth.py's _HEADER is the same pattern).
-_ANY_TIER = Depends(require_tier("owner", "demo"))
+# D-07 permits both tiers on every protected surface, so one shared resolver covers
+# all three gates. Both are built once at module level: ruff's B008 rightly rejects
+# a call in an argument default (auth.py is the same pattern).
+_ANY_TIER = require_tier("owner", "demo")
+_API_KEY = Security(api_key_header)
 
 
 def _gate(bucket: str, *, meter_spend: bool = False):
-    """Build the perimeter dependency for one route: auth, then the daily spend
-    ceiling on costly routes, then the per-IP window.
+    """Build the perimeter dependency for one route: an anonymous per-IP meter,
+    then auth, then the daily spend ceiling on costly routes, then the tiered
+    per-IP window.
 
     Every control is a route dependency and never middleware: a StreamingResponse
     locks its status line at 200 once the generator yields, so a rejection raised
     any later than this could only surface as an in-stream error on a 200.
 
-    The ceiling is checked before the window because it is a global condition —
-    a budget outage should not also burn the caller's per-IP allowance.
+    The anon bucket is charged before the credential is resolved, and the resolver
+    is called by hand rather than nested as a sub-dependency, because FastAPI
+    resolves sub-dependencies before the body that would meter them: a 401 raised
+    from there consumed no allowance at all, leaving the key itself open to
+    unlimited online guessing.
+
+    The ceiling is checked before the tiered window because it is a global
+    condition — a budget outage should not also burn the caller's per-IP allowance.
     """
 
-    async def _dependency(request: Request, tier: Tier = _ANY_TIER) -> Tier:
+    async def _dependency(request: Request, presented: str | None = _API_KEY) -> Tier:
+        await enforce("auth", "anon", request)
+        tier = _ANY_TIER(presented)
         if meter_spend:
             enforce_daily_budget(app.state.conn)
         await enforce(bucket, tier, request)

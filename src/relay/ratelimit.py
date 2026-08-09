@@ -51,6 +51,8 @@ _tokens = itertools.count()
 # itself is parsed on demand, never at import: parsing here would freeze the
 # value before a test could monkeypatch it.
 _LIMIT_SETTINGS: dict[tuple[str, str], str] = {
+    # Consumed before a tier is known, which is what meters the failed-auth path.
+    ("auth", "anon"): "anon_auth_limit",
     ("process", "demo"): "demo_process_limit",
     ("process", "owner"): "owner_process_limit",
     ("create", "demo"): "demo_create_limit",

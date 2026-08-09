@@ -28,6 +28,11 @@ class Settings(BaseSettings):
         default=False,
         validation_alias=AliasChoices("RELAY_TRUST_PROXY", "RELAY_TRUST_PROXY_HEADER"),
     )
+    # Charged before the presented key is known good, so guessing costs the same
+    # allowance a correct key does. Deliberately well above every tier's own limit:
+    # this is the outer bound on an anonymous caller, not the working ceiling for an
+    # authenticated one.
+    anon_auth_limit: str = "60/minute"
     demo_process_limit: str = "5/hour"
     owner_process_limit: str = "60/hour"
     demo_create_limit: str = "20/hour"
