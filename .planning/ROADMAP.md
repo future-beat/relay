@@ -14,7 +14,7 @@ Relay v1 is live at https://relay-agent.fly.dev with a working agent loop, guard
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Security Perimeter** - API-key auth, tiered rate limits, daily spend circuit breaker, server-bound ticket_id, MCP writes off by default (completed 2026-08-09)
-- [ ] **Phase 2: Async-Safe Data Layer & Graceful Shutdown** - Thread-safe SQLite with WAL, single async offload seam, drain in-flight SSE runs before close
+- [x] **Phase 2: Async-Safe Data Layer & Graceful Shutdown** - Thread-safe SQLite with WAL, single async offload seam, drain in-flight SSE runs before close (completed 2026-08-09)
 - [ ] **Phase 3: Semantic Retrieval** - Committed Voyage embeddings index, cited replies, keyword fallback
 - [ ] **Phase 4: Evaluation Coverage** - Retrieval recall@k, prompt-injection guard case, citation-faithfulness check, no regression
 - [ ] **Phase 5: Run Event Persistence & Live Feed** - run_events table plus a public, redacted SSE feed rendering live on the dashboard
@@ -82,7 +82,7 @@ Plans:
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 02-05-PLAN.md — Concurrency/contract/lifecycle integration tests plus `fly.toml` `kill_timeout` and the Dockerfile graceful-shutdown window (DATA-01/DATA-02)
+- [x] 02-05-PLAN.md — Concurrency/contract/lifecycle integration tests plus `fly.toml` `kill_timeout` and the Dockerfile graceful-shutdown window (DATA-01/DATA-02)
 
 ### Phase 3: Semantic Retrieval
 
@@ -151,7 +151,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Security Perimeter | 5/5 | Complete   | 2026-08-09 |
-| 2. Async-Safe Data Layer & Graceful Shutdown | 4/5 | In Progress|  |
+| 2. Async-Safe Data Layer & Graceful Shutdown | 5/5 | Complete   | 2026-08-09 |
 | 3. Semantic Retrieval | 0/TBD | Not started | - |
 | 4. Evaluation Coverage | 0/TBD | Not started | - |
 | 5. Run Event Persistence & Live Feed | 0/TBD | Not started | - |
