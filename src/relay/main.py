@@ -3,15 +3,17 @@ import time
 from contextlib import asynccontextmanager
 
 from anthropic import AsyncAnthropic
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from . import __version__
 from .agent import run_ticket
+from .auth import Tier, require_tier
 from .config import settings
 from .db import connect, init_db
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
+from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
 
@@ -32,6 +34,40 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Relay", version=__version__, lifespan=lifespan)
 
 
+# D-07 permits both tiers on every protected surface, so one shared dependency
+# covers all three gates. Built once at module level: ruff's B008 rightly rejects
+# a call in an argument default (auth.py's _HEADER is the same pattern).
+_ANY_TIER = Depends(require_tier("owner", "demo"))
+
+
+def _gate(bucket: str, *, meter_spend: bool = False):
+    """Build the perimeter dependency for one route: auth, then the daily spend
+    ceiling on costly routes, then the per-IP window.
+
+    Every control is a route dependency and never middleware: a StreamingResponse
+    locks its status line at 200 once the generator yields, so a rejection raised
+    any later than this could only surface as an in-stream error on a 200.
+
+    The ceiling is checked before the window because it is a global condition —
+    a budget outage should not also burn the caller's per-IP allowance.
+    """
+
+    async def _dependency(request: Request, tier: Tier = _ANY_TIER) -> Tier:
+        if meter_spend:
+            enforce_daily_budget(app.state.conn)
+        await enforce(bucket, tier, request)
+        return tier
+
+    return _dependency
+
+
+# D-07: these three cover every mutating or paid surface; /, /health, /metrics and
+# /dashboard stay public so the container HEALTHCHECK and the CI smoke job keep working.
+create_gate = _gate("create")
+read_gate = _gate("read")
+process_gate = _gate("process", meter_spend=True)
+
+
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
     """Send visitors to the dashboard rather than a bare 404."""
@@ -43,7 +79,12 @@ async def health() -> dict:
     return {"status": "ok", "version": __version__, "model": settings.model}
 
 
-@app.post("/tickets", response_model=Ticket, status_code=201)
+@app.post(
+    "/tickets",
+    response_model=Ticket,
+    status_code=201,
+    dependencies=[Depends(create_gate)],
+)
 async def create_ticket(payload: TicketCreate) -> Ticket:
     conn = app.state.conn
     cur = conn.execute(
@@ -54,12 +95,12 @@ async def create_ticket(payload: TicketCreate) -> Ticket:
     return _get_ticket(cur.lastrowid)
 
 
-@app.get("/tickets/{ticket_id}", response_model=Ticket)
+@app.get("/tickets/{ticket_id}", response_model=Ticket, dependencies=[Depends(read_gate)])
 async def get_ticket(ticket_id: int) -> Ticket:
     return _get_ticket(ticket_id)
 
 
-@app.post("/tickets/{ticket_id}/process")
+@app.post("/tickets/{ticket_id}/process", dependencies=[Depends(process_gate)])
 async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResponse:
     """Run the agent on a ticket, streaming each step as a server-sent event.
 
@@ -71,35 +112,47 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     if ticket.status != "open":
         raise HTTPException(409, f"ticket is already {ticket.status.value}")
 
+    # Claim this run's worst-case cost now that the gate has admitted it. record_run
+    # only fires once the stream ends, so without a reservation a burst of concurrent
+    # runs would all read the same stale SUM and all clear the daily ceiling.
+    reserve_run()
+
     async def event_stream():
         started = time.perf_counter()
         usage: dict = {}
         outcome = "incomplete"
-        async for event in run_ticket(
-            app.state.client,
-            app.state.registry,
-            ticket.model_dump(),
-            policy=ToolPolicy(allow_writes=not dry_run),
-        ):
-            if event.type == "usage":
-                usage = event.data
-            elif event.type == "resolution":
-                outcome = event.data["via"] or "dry_run_complete"
-            elif event.type == "error":
-                outcome = f"error:{event.data['reason']}"
-            yield f"event: {event.type}\ndata: {json.dumps(event.data)}\n\n"
-        record_run(
-            app.state.conn,
-            ticket_id=ticket.id,
-            model=settings.model,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-            steps=usage.get("steps", 0),
-            input_tokens=usage.get("input_tokens", 0),
-            output_tokens=usage.get("output_tokens", 0),
-            cost_usd=usage.get("cost_usd", 0.0),
-            outcome=outcome,
-        )
-        yield "event: done\ndata: {}\n\n"
+        try:
+            async for event in run_ticket(
+                app.state.client,
+                app.state.registry,
+                ticket.model_dump(),
+                policy=ToolPolicy(allow_writes=not dry_run),
+            ):
+                if event.type == "usage":
+                    usage = event.data
+                elif event.type == "resolution":
+                    outcome = event.data["via"] or "dry_run_complete"
+                elif event.type == "error":
+                    outcome = f"error:{event.data['reason']}"
+                yield f"event: {event.type}\ndata: {json.dumps(event.data)}\n\n"
+            record_run(
+                app.state.conn,
+                ticket_id=ticket.id,
+                model=settings.model,
+                duration_ms=int((time.perf_counter() - started) * 1000),
+                steps=usage.get("steps", 0),
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+                cost_usd=usage.get("cost_usd", 0.0),
+                outcome=outcome,
+            )
+            yield "event: done\ndata: {}\n\n"
+        finally:
+            # A plain finally, never a context manager: run_ticket suspends at every
+            # yield, and anything held across a yield leaks into whatever coroutine
+            # runs in between (see agent.py's run-span note). Released after
+            # record_run so the row and the reservation are never both missing.
+            release_run()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

@@ -12,6 +12,9 @@ primary_region = 'syd'
   RELAY_DB_PATH = '/data/relay.db'
   # Must match http_service.internal_port below; the container binds $PORT.
   PORT = '8080'
+  # Only here: behind the Fly proxy, Fly-Client-IP is authoritative. Off-proxy the
+  # header is client-controlled, so trusting it anywhere else is a rate-limit bypass.
+  RELAY_TRUST_PROXY = 'true'
 
 [[mounts]]
   source = 'relay_data'
