@@ -795,7 +795,15 @@ Whether this lives in `tests/helpers.py` (which is a test double module, so it f
 | A4 | Awaiting inside a cancelled async generator's `finally` behaves the same on CPython 3.12 (CI/Docker) as on 3.14 (verified locally) | Pitfall 6 | Only matters if the planner offloads `record_run`; the recommendation is not to. CI runs 3.12 and would catch it. |
 | A5 | `os.cpu_count()` on Fly `shared-cpu-1x` yields a default executor of ~5 threads | Pattern 2 | Only affects the *degree* of concurrency, not whether the hazard exists. Any value > 1 is sufficient. |
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All five were resolved on 2026-08-09 and recorded as D-08..D-11 in `02-CONTEXT.md`, then
+> implemented by plans 02-01..02-05. Resolutions, in order:
+> 1. **RESOLVED (D-08)** — `kill_signal` is deliberately not set; asserted absent by `tomllib` in 02-05.
+> 2. **RESOLVED (D-09)** — `process_ticket` returns 503 while draining; implemented in 02-04 T3, tested in 02-05 T2.
+> 3. **RESOLVED (D-10)** — `idx_runs_created_at` is in scope; implemented in 02-01.
+> 4. **RESOLVED** — `TicketAwareFakeClient` lives in `tests/helpers.py` (plan 02-03).
+> 5. **RESOLVED (D-11)** — stale `sqlite3.Connection` hints in `mcp_server.py`/`evals.py` are left in place per D-03, recorded deliberately in the SUMMARY.
 
 1. **Does Fly send SIGINT or SIGTERM first?**
    - What we know: `fly.io/docs/reference/configuration/` says "Fly.io sends a `SIGINT` signal to the running process by default"; `fly.io/docs/blueprints/long-running-tasks/` says "Fly sends `kill_signal` (default: `SIGTERM`) to PID 1."
