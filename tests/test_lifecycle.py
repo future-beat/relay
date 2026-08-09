@@ -7,8 +7,10 @@ so a registry shared across tests would be awaited on the wrong loop.
 
 import asyncio
 import inspect
+import re
 import threading
 import time
+import tomllib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +23,7 @@ from helpers import (
     tool_use_block,
 )
 from relay.agent import run_ticket
+from relay.config import settings
 from relay.main import app, process_ticket
 from relay.mcp_server import build_mcp_registry
 from relay.ratelimit import reserved_usd
@@ -379,3 +382,33 @@ def test_a_cancelled_run_task_still_records_and_drains(client):
     assert rows[0]["ticket_id"] == ticket_id
     assert rows[0]["cost_usd"] > 0
     assert rows[0]["outcome"] == "incomplete"
+
+
+# --- shutdown timeout arithmetic ---
+
+
+def test_shutdown_timeouts_nest_correctly():
+    # Three timeouts, three files, three languages, and nothing else ties them
+    # together. Fly's kill_timeout is the outermost budget; uvicorn's graceful window
+    # has to expire inside it; the lifespan drain has to finish inside that. Widen or
+    # narrow any one of them on its own and a deploy during an active run goes back to
+    # being a SIGKILL that loses the run's row — the exact failure this phase exists
+    # to remove, and one no unit test of the drain itself can see.
+    fly = tomllib.loads((_REPO_ROOT / "fly.toml").read_text(encoding="utf-8"))
+    dockerfile = (_REPO_ROOT / "Dockerfile").read_text(encoding="utf-8")
+
+    # Read off the parser, not a grep: a bare key written below a table header is
+    # valid TOML that silently lands inside that table instead of at the top level.
+    kill_timeout = fly["kill_timeout"]
+    # D-08. Fly's docs disagree with themselves about the default and uvicorn treats
+    # SIGINT and SIGTERM identically, so naming one can only ever make this worse.
+    assert "kill_signal" not in fly
+
+    # Without this the signal stops at the shell, which never forwards it.
+    assert "exec uvicorn" in dockerfile
+
+    window = re.search(r"--timeout-graceful-shutdown (\d+)", dockerfile)
+    assert window, "the container CMD sets no uvicorn graceful-shutdown window"
+    graceful_seconds = int(window.group(1))
+
+    assert kill_timeout > graceful_seconds > settings.shutdown_drain_seconds

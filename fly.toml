@@ -5,6 +5,14 @@
 
 app = 'relay-agent'
 primary_region = 'syd'
+# Fly's default is 5 seconds: SIGTERM, then SIGKILL before the lifespan drain has even
+# started, which would make every line of shutdown code decorative. 30 covers a typical
+# ~20s run plus lifespan teardown and stays well under Fly's 300 maximum. Top-level on
+# purpose — a bare key placed after a table header is parsed into that table.
+# Deliberately no kill_signal: Fly's own docs contradict themselves on the default, and
+# uvicorn handles SIGINT and SIGTERM identically, so pinning one is the only way to
+# break a mechanism that already works.
+kill_timeout = 30
 
 [build]
 
