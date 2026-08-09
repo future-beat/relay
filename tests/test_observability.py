@@ -1,8 +1,10 @@
+import asyncio
 import json
 import logging
 
 from helpers import FakeClient, response, text_block, tool_use_block
-from relay.main import app
+from relay.main import app, process_ticket
+from relay.ratelimit import spent_today
 from relay.telemetry import JsonFormatter, run_metrics
 
 
@@ -51,6 +53,33 @@ def test_failed_run_recorded_with_error_outcome(client):
     client.post(f"/tickets/{ticket_id}/process")
     metrics = client.get("/metrics").json()
     assert metrics["outcomes"] == {"error:ended_without_action": 1}
+
+
+def test_mid_stream_disconnect_still_records_the_spend(client):
+    # SEC-03's ceiling reads SUM(runs.cost_usd), so a run whose row is never written
+    # is spend the ceiling cannot see. A disconnect cancels the generator at its
+    # suspended yield, which skips everything placed after the loop — the handler is
+    # driven directly here because TestClient always drains the body.
+    ticket_id = _make_ticket(client)
+    app.state.client = FakeClient([
+        response([tool_use_block("search_docs", {"query": "rate limits"})]),
+        response([text_block("Done.")], stop_reason="end_turn"),
+    ])
+
+    async def abort_after_the_first_event():
+        stream = await process_ticket(ticket_id)
+        first = await stream.body_iterator.__anext__()
+        assert first.startswith("event: usage")
+        await stream.body_iterator.aclose()
+
+    asyncio.run(abort_after_the_first_event())
+
+    rows = app.state.conn.execute("SELECT cost_usd, outcome FROM runs").fetchall()
+    assert len(rows) == 1
+    assert rows[0]["cost_usd"] > 0
+    assert rows[0]["outcome"] == "incomplete"
+    # The whole point: the partial cost is now visible to the daily ceiling.
+    assert spent_today(app.state.conn) == rows[0]["cost_usd"]
 
 
 def test_metrics_empty_state(client):

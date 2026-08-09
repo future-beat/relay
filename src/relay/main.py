@@ -122,6 +122,7 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
         started = time.perf_counter()
         usage: dict = {}
         outcome = "incomplete"
+        recorded = False
         try:
             async for event in run_ticket(
                 app.state.client,
@@ -136,23 +137,33 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                 elif event.type == "error":
                     outcome = f"error:{event.data['reason']}"
                 yield f"event: {event.type}\ndata: {json.dumps(event.data)}\n\n"
-            record_run(
-                app.state.conn,
-                ticket_id=ticket.id,
-                model=settings.model,
-                duration_ms=int((time.perf_counter() - started) * 1000),
-                steps=usage.get("steps", 0),
-                input_tokens=usage.get("input_tokens", 0),
-                output_tokens=usage.get("output_tokens", 0),
-                cost_usd=usage.get("cost_usd", 0.0),
-                outcome=outcome,
-            )
             yield "event: done\ndata: {}\n\n"
         finally:
             # A plain finally, never a context manager: run_ticket suspends at every
             # yield, and anything held across a yield leaks into whatever coroutine
-            # runs in between (see agent.py's run-span note). Released after
-            # record_run so the row and the reservation are never both missing.
+            # runs in between (see agent.py's run-span note).
+            #
+            # The row is written from here rather than after the loop because a client
+            # that disconnects mid-stream cancels this generator at its suspended
+            # yield: every Claude call already made is real money, and the daily
+            # ceiling reads it back out of `runs`. An aborted run keeps `outcome`
+            # "incomplete", which is also the honest value for /metrics. The flag
+            # keeps a second close from writing the row twice and double-charging
+            # the ledger.
+            if not recorded:
+                recorded = True
+                record_run(
+                    app.state.conn,
+                    ticket_id=ticket.id,
+                    model=settings.model,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    steps=usage.get("steps", 0),
+                    input_tokens=usage.get("input_tokens", 0),
+                    output_tokens=usage.get("output_tokens", 0),
+                    cost_usd=usage.get("cost_usd", 0.0),
+                    outcome=outcome,
+                )
+            # Released after the row exists, so the two are never both missing.
             release_run()
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
