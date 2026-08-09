@@ -16,6 +16,7 @@ from .db import connect, init_db
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
+from .runs import RunRegistry
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
 
@@ -29,7 +30,15 @@ async def lifespan(app: FastAPI):
     app.state.conn = conn
     app.state.registry = build_registry(conn, settings.kb_dir)
     app.state.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    app.state.runs = RunRegistry()
     yield
+    # Drained before the connection closes. uvicorn cancels in-flight request tasks
+    # when its graceful-shutdown window expires and then runs lifespan shutdown
+    # without awaiting those cancellations, so a stream's finally — which writes the
+    # run's cost that SEC-03's daily ceiling reads back — can still be pending here.
+    # Closing first turns that write into "Cannot operate on a closed database" and
+    # loses the row, which is spend the ceiling can never see again.
+    await app.state.runs.drain(timeout=settings.shutdown_drain_seconds)
     conn.close()
 
 
@@ -143,6 +152,15 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
 
     async def event_stream():
         started = time.perf_counter()
+        # Registered here rather than beside reserve_run() above, and the difference
+        # is the whole point: Starlette can cancel a StreamingResponse before its
+        # generator ever starts, and a finally in a generator whose body never ran
+        # does not execute. Registering outside the body would leak an entry on every
+        # aborted request, stalling every later drain for its full grace period and
+        # leaving an idle server non-empty — which is what breaks scale-to-zero.
+        # Inside the body, register and deregister are exactly balanced, which is why
+        # this needs no TTL where the reservation above does.
+        run_token = app.state.runs.register(ticket_id=ticket.id)
         usage: dict = {}
         outcome = "incomplete"
         recorded = False
@@ -188,6 +206,8 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                 )
             # Released after the row exists, so the two are never both missing.
             release_run(token)
+            # Last, so a drain waiting on this run only wakes once its row is written.
+            app.state.runs.deregister(run_token)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
