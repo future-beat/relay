@@ -77,8 +77,8 @@ Plans:
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 02-03-PLAN.md — Transactions in `tools.py`/`telemetry.py`, the single `asyncio.to_thread` seam in `agent.py`, ticket-aware test double (DATA-01)
-- [ ] 02-04-PLAN.md — HTTP edge: offloaded handlers, registry wiring, drain before `conn.close()`, 503-while-draining (DATA-01/DATA-02)
+- [x] 02-03-PLAN.md — Transactions in `tools.py`/`telemetry.py`, the single `asyncio.to_thread` seam in `agent.py`, ticket-aware test double (DATA-01)
+- [x] 02-04-PLAN.md — HTTP edge: offloaded handlers, registry wiring, drain before `conn.close()`, 503-while-draining (DATA-01/DATA-02)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
@@ -151,7 +151,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Security Perimeter | 5/5 | Complete   | 2026-08-09 |
-| 2. Async-Safe Data Layer & Graceful Shutdown | 2/5 | In Progress|  |
+| 2. Async-Safe Data Layer & Graceful Shutdown | 4/5 | In Progress|  |
 | 3. Semantic Retrieval | 0/TBD | Not started | - |
 | 4. Evaluation Coverage | 0/TBD | Not started | - |
 | 5. Run Event Persistence & Live Feed | 0/TBD | Not started | - |
