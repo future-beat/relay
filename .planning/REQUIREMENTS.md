@@ -8,8 +8,8 @@
 ### Security Perimeter
 
 - [x] **SEC-01**: All mutating/costly endpoints (`POST /tickets`, `POST /tickets/{id}/process`) require an API key via `X-API-Key` header, checked with constant-time compare against env-var keys; 401 (with `WWW-Authenticate`) vs 403 semantics are correct
-- [x] **SEC-02**: Ticket creation and processing are rate-limited per key (IP fallback), with `429` responses carrying `Retry-After` and rate-limit headers; limits key on `Fly-Client-IP` behind the Fly proxy
-- [x] **SEC-03**: A global daily USD spend circuit breaker (derived from `runs.cost_usd` in SQLite, surviving cold starts) returns 503 with a clear reset message when the demo budget is exhausted
+- [ ] **SEC-02**: Ticket creation and processing are rate-limited per key (IP fallback), with `429` responses carrying `Retry-After` and rate-limit headers; limits key on `Fly-Client-IP` behind the Fly proxy
+- [ ] **SEC-03**: A global daily USD spend circuit breaker (derived from `runs.cost_usd` in SQLite, surviving cold starts) returns 503 with a clear reset message when the demo budget is exhausted
 - [x] **SEC-04**: The tool executor binds `ticket_id` server-side to the run's actual ticket; a mismatched model-supplied id produces a model-visible denial event (not a crash) and a counter increment
 - [x] **SEC-05**: MCP writes default to disabled; enabling requires an explicit `RELAY_MCP_ALLOW_WRITES=true`
 - [x] **SEC-06**: A published, tightly-limited demo key lets visitors run the agent; auth/rate-limit tiers distinguish it from the owner key
@@ -70,8 +70,8 @@ Mapped by roadmap creation 2026-08-06 — 22/22 v1 requirements, no orphans.
 | Requirement | Phase | Status |
 |-------------|-------|--------|
 | SEC-01 | Phase 1 | Complete |
-| SEC-02 | Phase 1 | Complete |
-| SEC-03 | Phase 1 | Complete |
+| SEC-02 | Phase 1 | Blocked (see 01-REVIEW.md) |
+| SEC-03 | Phase 1 | Blocked (see 01-REVIEW.md) |
 | SEC-04 | Phase 1 | Complete |
 | SEC-05 | Phase 1 | Complete |
 | SEC-06 | Phase 1 | Complete |
