@@ -1,10 +1,13 @@
+import math
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from relay.config import settings
+from relay.main import app
 from relay.ratelimit import (
     client_ip,
     enforce,
@@ -234,3 +237,118 @@ def test_next_utc_midnight_is_the_next_day_boundary():
 
 def test_next_utc_midnight_is_strictly_in_the_future():
     assert next_utc_midnight() > datetime.now(UTC)
+
+
+# --- routes ---
+
+
+DEMO = {"X-API-Key": "test-demo-key"}
+TICKET = {
+    "customer_email": "ava@acmecorp.com",
+    "subject": "Cannot log in",
+    "body": "SSO redirect loops forever.",
+}
+
+
+def _process(client, headers: dict[str, str] | None = None):
+    """Hit the process gate without ever reaching Claude.
+
+    The gate consumes its unit before the handler looks the ticket up, so an
+    unknown id exercises auth, budget and limiter and then stops at 404 — no
+    agent loop, no model call, nothing to stub.
+    """
+    return client.post("/tickets/9999/process", headers=headers)
+
+
+def _exhaust_budget(conn) -> None:
+    record_run(
+        conn,
+        ticket_id=1,
+        model="m",
+        duration_ms=1,
+        steps=1,
+        input_tokens=1,
+        output_tokens=1,
+        cost_usd=settings.max_daily_cost_usd,
+        outcome="send_reply",
+    )
+
+
+def test_demo_tier_defaults_match_d04():
+    assert settings.demo_process_limit == "5/hour"
+    assert settings.demo_create_limit == "20/hour"
+
+
+def test_demo_process_limit_429(client):
+    for _ in range(5):
+        assert _process(client, DEMO).status_code == 404
+    resp = _process(client, DEMO)
+    assert resp.status_code == 429
+    assert int(resp.headers["Retry-After"]) >= 1
+    assert resp.headers["X-RateLimit-Limit"] == "5"
+    assert resp.headers["X-RateLimit-Remaining"] == "0"
+    assert int(resp.headers["X-RateLimit-Reset"]) > 0
+    detail = resp.json()["detail"]
+    assert detail["error"] == "rate_limited"
+    assert detail["limit"] == "5 per 1 hour"
+    assert detail["tier"] == "demo"
+    assert "cost control" in detail["note"]
+
+
+def test_demo_create_limit_429(client, monkeypatch):
+    # Patched down rather than issuing 21 requests. Limit items are parsed lazily,
+    # so this is also the standing proof that lazy construction has not regressed.
+    monkeypatch.setattr(settings, "demo_create_limit", "2/hour")
+    for _ in range(2):
+        assert client.post("/tickets", json=TICKET, headers=DEMO).status_code == 201
+    assert client.post("/tickets", json=TICKET, headers=DEMO).status_code == 429
+
+
+def test_owner_tier_looser(client):
+    # Same bucket, well past the demo threshold, on the owner key the fixture sends.
+    for _ in range(8):
+        assert _process(client).status_code == 404
+
+
+def test_daily_budget_503(client):
+    _exhaust_budget(app.state.conn)
+    resp = _process(client)
+    assert resp.status_code == 503
+    detail = resp.json()["detail"]
+    assert detail["error"] == "daily_budget_exhausted"
+    assert detail["resets_at"]
+    assert "cap is a feature" in detail["note"]
+
+
+def test_budget_survives_restart(client):
+    # The fixture's db_path is a real tmp_path file rather than an in-memory
+    # database, so a second TestClient runs lifespan against the same durable
+    # state. The ceiling has to come from there, not from process memory.
+    _exhaust_budget(app.state.conn)
+    with TestClient(app, headers={"X-API-Key": "test-owner-key"}) as restarted:
+        assert _process(restarted).status_code == 503
+
+
+def test_in_flight_reservation(client):
+    conn = app.state.conn
+    # Driven through the seam rather than a concurrency harness: the requirement is
+    # that admitted-but-unfinished runs count against the ceiling, and record_run
+    # only fires once the SSE generator ends.
+    for _ in range(math.ceil(settings.max_daily_cost_usd / settings.max_run_cost_usd)):
+        reserve_run()
+    assert _process(client).status_code == 503
+    # The whole point: refused before a single row was written.
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def test_rate_limit_and_budget_ordering(client, monkeypatch):
+    monkeypatch.setattr(settings, "demo_process_limit", "1/hour")
+    _exhaust_budget(app.state.conn)
+    # The budget is global, so it is checked first: an outage must not also burn
+    # the caller's per-IP allowance.
+    for _ in range(3):
+        assert _process(client, DEMO).status_code == 503
+
+    monkeypatch.setattr(settings, "max_daily_cost_usd", 1000.0)
+    assert _process(client, DEMO).status_code == 404
+    assert _process(client, DEMO).status_code == 429
