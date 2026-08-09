@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+from relay.config import Settings, settings
 from relay.guardrails import ToolPolicy
 from relay.mcp_server import build_mcp_registry, call_mcp_tool, list_mcp_tools
 
@@ -59,3 +60,18 @@ def test_invalid_input_raises(mcp_registry):
 def test_unknown_tool_raises(mcp_registry):
     with pytest.raises(RuntimeError, match="unknown tool"):
         call_mcp_tool(mcp_registry, ToolPolicy(), "nope", {})
+
+
+def test_writes_disabled_by_default():
+    # Built without an env file so a developer's local .env cannot make this pass.
+    assert Settings(_env_file=None).mcp_allow_writes is False
+
+
+def test_default_server_is_read_only(mcp_registry, monkeypatch):
+    monkeypatch.setattr(settings, "mcp_allow_writes", Settings(_env_file=None).mcp_allow_writes)
+    # The policy create_server builds from the setting at call time.
+    policy = ToolPolicy(allow_writes=settings.mcp_allow_writes)
+    with pytest.raises(RuntimeError, match="dry-run"):
+        call_mcp_tool(mcp_registry, policy, "send_reply", {
+            "ticket_id": 1, "body": "Thanks for reaching out — your refund is on its way.",
+        })
