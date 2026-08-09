@@ -6,7 +6,6 @@ write actions behind confirmation or policy without touching the loop.
 
 import json
 import re
-import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from .db import Database
 from .guardrails import (
     CreateEscalationInput,
     LookupCustomerInput,
@@ -31,11 +31,11 @@ class ToolSpec:
     execute: Callable[..., str]
 
 
-def lookup_customer(conn: sqlite3.Connection, email: str) -> str:
-    row = conn.execute("SELECT * FROM customers WHERE email = ?", (email,)).fetchone()
+def lookup_customer(db: Database, email: str) -> str:
+    row = db.execute("SELECT * FROM customers WHERE email = ?", (email,)).fetchone()
     if row is None:
         return json.dumps({"found": False})
-    tickets = conn.execute(
+    tickets = db.execute(
         "SELECT id, subject, status, created_at FROM tickets"
         " WHERE customer_email = ? ORDER BY created_at DESC LIMIT 10",
         (email,),
@@ -64,33 +64,36 @@ def search_docs(kb_dir: Path, query: str, max_results: int = 3) -> str:
     return json.dumps({"results": results})
 
 
-def create_escalation(conn: sqlite3.Connection, ticket_id: int, reason: str, priority: str) -> str:
-    cur = conn.execute(
-        "INSERT INTO escalations (ticket_id, reason, priority) VALUES (?, ?, ?)",
-        (ticket_id, reason, priority),
-    )
-    conn.execute("UPDATE tickets SET status = 'escalated' WHERE id = ?", (ticket_id,))
-    conn.commit()
-    return json.dumps({"escalation_id": cur.lastrowid, "status": "escalated"})
+def create_escalation(db: Database, ticket_id: int, reason: str, priority: str) -> str:
+    with db.transaction():
+        cur = db.execute(
+            "INSERT INTO escalations (ticket_id, reason, priority) VALUES (?, ?, ?)",
+            (ticket_id, reason, priority),
+        )
+        db.execute("UPDATE tickets SET status = 'escalated' WHERE id = ?", (ticket_id,))
+        # Read inside the block: once the lock drops another thread's insert has moved it.
+        escalation_id = cur.lastrowid
+    return json.dumps({"escalation_id": escalation_id, "status": "escalated"})
 
 
-def send_reply(conn: sqlite3.Connection, ticket_id: int, body: str) -> str:
+def send_reply(db: Database, ticket_id: int, body: str) -> str:
     # Email delivery is mocked: the reply is persisted, nothing leaves the system.
-    cur = conn.execute(
-        "INSERT INTO replies (ticket_id, body) VALUES (?, ?)", (ticket_id, body)
-    )
-    conn.execute("UPDATE tickets SET status = 'resolved' WHERE id = ?", (ticket_id,))
-    conn.commit()
-    return json.dumps({"reply_id": cur.lastrowid, "status": "resolved"})
+    with db.transaction():
+        cur = db.execute(
+            "INSERT INTO replies (ticket_id, body) VALUES (?, ?)", (ticket_id, body)
+        )
+        db.execute("UPDATE tickets SET status = 'resolved' WHERE id = ?", (ticket_id,))
+        reply_id = cur.lastrowid
+    return json.dumps({"reply_id": reply_id, "status": "resolved"})
 
 
-def set_category(conn: sqlite3.Connection, ticket_id: int, category: str) -> str:
-    conn.execute("UPDATE tickets SET category = ? WHERE id = ?", (category, ticket_id))
-    conn.commit()
+def set_category(db: Database, ticket_id: int, category: str) -> str:
+    with db.transaction():
+        db.execute("UPDATE tickets SET category = ? WHERE id = ?", (category, ticket_id))
     return json.dumps({"ticket_id": ticket_id, "category": category})
 
 
-def build_registry(conn: sqlite3.Connection, kb_dir: Path) -> dict[str, ToolSpec]:
+def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
     return {
         "lookup_customer": ToolSpec(
             schema={
