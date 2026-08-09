@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
@@ -65,6 +66,11 @@ def _gate(bucket: str, *, meter_spend: bool = False):
         await enforce("auth", "anon", request)
         tier = _ANY_TIER(presented)
         if meter_spend:
+            # The one DB read left on the event loop, and deliberately so. It sums
+            # tens of rows behind idx_runs_created_at, so contention is microseconds;
+            # offloading it would also move a read of ratelimit's in-process
+            # reservations onto a worker thread, and that state is not this phase's
+            # to disturb.
             enforce_daily_budget(app.state.conn)
         await enforce(bucket, tier, request)
         return tier
@@ -97,18 +103,22 @@ async def health() -> dict:
     dependencies=[Depends(create_gate)],
 )
 async def create_ticket(payload: TicketCreate) -> Ticket:
-    conn = app.state.conn
-    cur = conn.execute(
-        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
-        (payload.customer_email, payload.subject, payload.body),
-    )
-    conn.commit()
-    return _get_ticket(cur.lastrowid)
+    def _insert() -> int:
+        with app.state.conn.transaction() as db:
+            cur = db.execute(
+                "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+                (payload.customer_email, payload.subject, payload.body),
+            )
+            # Read inside the block: once the lock drops another thread's insert has
+            # already moved lastrowid, and this row's id is what the caller gets back.
+            return cur.lastrowid
+
+    return await _get_ticket(await asyncio.to_thread(_insert))
 
 
 @app.get("/tickets/{ticket_id}", response_model=Ticket, dependencies=[Depends(read_gate)])
 async def get_ticket(ticket_id: int) -> Ticket:
-    return _get_ticket(ticket_id)
+    return await _get_ticket(ticket_id)
 
 
 @app.post("/tickets/{ticket_id}/process", dependencies=[Depends(process_gate)])
@@ -119,7 +129,7 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     read data and search docs but cannot reply, escalate, or categorise.
     Every run is recorded in the runs table for /metrics.
     """
-    ticket = _get_ticket(ticket_id)
+    ticket = await _get_ticket(ticket_id)
     if ticket.status != "open":
         raise HTTPException(409, f"ticket is already {ticket.status.value}")
 
@@ -184,7 +194,9 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
 
 @app.get("/metrics")
 async def metrics() -> dict:
-    return run_metrics(app.state.conn)
+    # run_metrics does SELECT * FROM runs, the one read here that grows unbounded:
+    # the dashboard polls this every 5s, so it is the last place to hold the loop.
+    return await asyncio.to_thread(run_metrics, app.state.conn)
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -242,10 +254,15 @@ async def dashboard() -> str:
     return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
 
 
-def _get_ticket(ticket_id: int) -> Ticket:
-    row = app.state.conn.execute(
-        "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
-    ).fetchone()
+async def _get_ticket(ticket_id: int) -> Ticket:
+    # fetchone() is called inside the offloaded callable, not after it: Database
+    # materialises rows while its lock is held, and stepping the result back on the
+    # event loop would put the read half a statement outside the thread it belongs to.
+    row = await asyncio.to_thread(
+        lambda: app.state.conn.execute(
+            "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
+        ).fetchone()
+    )
     if row is None:
         raise HTTPException(404, "ticket not found")
     return Ticket(**dict(row))
