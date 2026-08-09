@@ -38,5 +38,6 @@ class Ticket(BaseModel):
 class AgentEvent(BaseModel):
     """One step in an agent run, streamed to the client as SSE."""
 
-    type: str  # "text" | "tool_use" | "tool_result" | "resolution" | "error"
+    # "text" | "tool_use" | "tool_result" | "guardrail" | "usage" | "resolution" | "error"
+    type: str
     data: dict[str, Any]

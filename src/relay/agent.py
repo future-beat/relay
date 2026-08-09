@@ -189,14 +189,41 @@ async def run_ticket(
                     with tracer.start_as_current_span(
                         f"tool.{block.name}", context=run_ctx
                     ) as span:
-                        result, is_error = _execute_guarded(spec, block.name, block.input, policy)
+                        # Bound at call time from this run's own ticket — never stored on
+                        # the registry, which is built once and shared by every live run.
+                        result, is_error = _execute_guarded(
+                            spec, block.name, block.input, policy,
+                            bound_ticket_id=ticket["id"],
+                        )
+                        payload = json.loads(result)
+                        binding_violation = (
+                            is_error and payload.get("denied_by") == "ticket_binding"
+                        )
                         span.set_attributes({
                             "relay.tool.tier": spec.tier if spec else "unknown",
                             "relay.tool.is_error": is_error,
+                            "relay.tool.binding_violation": binding_violation,
                         })
                     logger.info("tool.executed", extra={"ctx": {
                         "ticket_id": ticket["id"], "tool": block.name, "is_error": is_error,
                     }})
+                    if binding_violation:
+                        logger.warning("guardrail.ticket_id_mismatch", extra={"ctx": {
+                            "ticket_id": ticket["id"],
+                            "tool": block.name,
+                            "supplied_ticket_id": payload["supplied_ticket_id"],
+                        }})
+                        # Cause before effect: the stream shows the denial, then its result.
+                        yield AgentEvent(
+                            type="guardrail",
+                            data={
+                                "guard": "ticket_binding",
+                                "tool": block.name,
+                                "expected_ticket_id": payload["expected_ticket_id"],
+                                "supplied_ticket_id": payload["supplied_ticket_id"],
+                                "action": "denied",
+                            },
+                        )
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -209,7 +236,7 @@ async def run_ticket(
                         type="tool_result",
                         data={
                             "tool": block.name,
-                            "result": json.loads(result),
+                            "result": payload,
                             "is_error": is_error,
                         },
                     )
