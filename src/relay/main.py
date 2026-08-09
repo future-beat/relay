@@ -142,6 +142,26 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     if ticket.status != "open":
         raise HTTPException(409, f"ticket is already {ticket.status.value}")
 
+    # Refused before the reservation below, so a rejected caller never claims spend
+    # it will not use. A run admitted mid-drain would extend the shutdown window and
+    # can outlive conn.close(). Best-effort by nature — uvicorn stops accepting
+    # connections before lifespan runs, so the window this closes is narrow, which is
+    # why it is one check and not a mechanism. The dict detail follows ratelimit.py's
+    # perimeter convention rather than the short-string domain form, and carries no
+    # active counts, ticket ids or timeouts.
+    if app.state.runs.draining:
+        raise HTTPException(
+            503,
+            detail={
+                "error": "shutting_down",
+                "note": (
+                    "Relay is finishing the runs already in flight before it restarts."
+                    " Retry in a few seconds — this is a deploy, not an outage."
+                ),
+            },
+            headers={"Retry-After": "5"},
+        )
+
     # Claim this run's worst-case cost now that the gate has admitted it. record_run
     # only fires once the stream ends, so without a reservation a burst of concurrent
     # runs would all read the same stale SUM and all clear the daily ceiling. The
