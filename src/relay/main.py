@@ -1,3 +1,4 @@
+import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
@@ -15,6 +16,7 @@ from .db import connect, init_db
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
+from .runs import RunRegistry
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
 
@@ -28,7 +30,15 @@ async def lifespan(app: FastAPI):
     app.state.conn = conn
     app.state.registry = build_registry(conn, settings.kb_dir)
     app.state.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    app.state.runs = RunRegistry()
     yield
+    # Drained before the connection closes. uvicorn cancels in-flight request tasks
+    # when its graceful-shutdown window expires and then runs lifespan shutdown
+    # without awaiting those cancellations, so a stream's finally — which writes the
+    # run's cost that SEC-03's daily ceiling reads back — can still be pending here.
+    # Closing first turns that write into "Cannot operate on a closed database" and
+    # loses the row, which is spend the ceiling can never see again.
+    await app.state.runs.drain(timeout=settings.shutdown_drain_seconds)
     conn.close()
 
 
@@ -65,6 +75,11 @@ def _gate(bucket: str, *, meter_spend: bool = False):
         await enforce("auth", "anon", request)
         tier = _ANY_TIER(presented)
         if meter_spend:
+            # The one DB read left on the event loop, and deliberately so. It sums
+            # tens of rows behind idx_runs_created_at, so contention is microseconds;
+            # offloading it would also move a read of ratelimit's in-process
+            # reservations onto a worker thread, and that state is not this phase's
+            # to disturb.
             enforce_daily_budget(app.state.conn)
         await enforce(bucket, tier, request)
         return tier
@@ -97,18 +112,22 @@ async def health() -> dict:
     dependencies=[Depends(create_gate)],
 )
 async def create_ticket(payload: TicketCreate) -> Ticket:
-    conn = app.state.conn
-    cur = conn.execute(
-        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
-        (payload.customer_email, payload.subject, payload.body),
-    )
-    conn.commit()
-    return _get_ticket(cur.lastrowid)
+    def _insert() -> int:
+        with app.state.conn.transaction() as db:
+            cur = db.execute(
+                "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+                (payload.customer_email, payload.subject, payload.body),
+            )
+            # Read inside the block: once the lock drops another thread's insert has
+            # already moved lastrowid, and this row's id is what the caller gets back.
+            return cur.lastrowid
+
+    return await _get_ticket(await asyncio.to_thread(_insert))
 
 
 @app.get("/tickets/{ticket_id}", response_model=Ticket, dependencies=[Depends(read_gate)])
 async def get_ticket(ticket_id: int) -> Ticket:
-    return _get_ticket(ticket_id)
+    return await _get_ticket(ticket_id)
 
 
 @app.post("/tickets/{ticket_id}/process", dependencies=[Depends(process_gate)])
@@ -119,9 +138,29 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     read data and search docs but cannot reply, escalate, or categorise.
     Every run is recorded in the runs table for /metrics.
     """
-    ticket = _get_ticket(ticket_id)
+    ticket = await _get_ticket(ticket_id)
     if ticket.status != "open":
         raise HTTPException(409, f"ticket is already {ticket.status.value}")
+
+    # Refused before the reservation below, so a rejected caller never claims spend
+    # it will not use. A run admitted mid-drain would extend the shutdown window and
+    # can outlive conn.close(). Best-effort by nature — uvicorn stops accepting
+    # connections before lifespan runs, so the window this closes is narrow, which is
+    # why it is one check and not a mechanism. The dict detail follows ratelimit.py's
+    # perimeter convention rather than the short-string domain form, and carries no
+    # active counts, ticket ids or timeouts.
+    if app.state.runs.draining:
+        raise HTTPException(
+            503,
+            detail={
+                "error": "shutting_down",
+                "note": (
+                    "Relay is finishing the runs already in flight before it restarts."
+                    " Retry in a few seconds — this is a deploy, not an outage."
+                ),
+            },
+            headers={"Retry-After": "5"},
+        )
 
     # Claim this run's worst-case cost now that the gate has admitted it. record_run
     # only fires once the stream ends, so without a reservation a burst of concurrent
@@ -133,6 +172,15 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
 
     async def event_stream():
         started = time.perf_counter()
+        # Registered here rather than beside reserve_run() above, and the difference
+        # is the whole point: Starlette can cancel a StreamingResponse before its
+        # generator ever starts, and a finally in a generator whose body never ran
+        # does not execute. Registering outside the body would leak an entry on every
+        # aborted request, stalling every later drain for its full grace period and
+        # leaving an idle server non-empty — which is what breaks scale-to-zero.
+        # Inside the body, register and deregister are exactly balanced, which is why
+        # this needs no TTL where the reservation above does.
+        run_token = app.state.runs.register(ticket_id=ticket.id)
         usage: dict = {}
         outcome = "incomplete"
         recorded = False
@@ -178,13 +226,17 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                 )
             # Released after the row exists, so the two are never both missing.
             release_run(token)
+            # Last, so a drain waiting on this run only wakes once its row is written.
+            app.state.runs.deregister(run_token)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/metrics")
 async def metrics() -> dict:
-    return run_metrics(app.state.conn)
+    # run_metrics does SELECT * FROM runs, the one read here that grows unbounded:
+    # the dashboard polls this every 5s, so it is the last place to hold the loop.
+    return await asyncio.to_thread(run_metrics, app.state.conn)
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -242,10 +294,15 @@ async def dashboard() -> str:
     return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
 
 
-def _get_ticket(ticket_id: int) -> Ticket:
-    row = app.state.conn.execute(
-        "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
-    ).fetchone()
+async def _get_ticket(ticket_id: int) -> Ticket:
+    # fetchone() is called inside the offloaded callable, not after it: Database
+    # materialises rows while its lock is held, and stepping the result back on the
+    # event loop would put the read half a statement outside the thread it belongs to.
+    row = await asyncio.to_thread(
+        lambda: app.state.conn.execute(
+            "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
+        ).fetchone()
+    )
     if row is None:
         raise HTTPException(404, "ticket not found")
     return Ticket(**dict(row))
