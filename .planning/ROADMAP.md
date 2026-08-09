@@ -72,8 +72,8 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 02-01-PLAN.md — `Database` wrapper (RLock + materialised results + `transaction()`), WAL/busy_timeout pragmas, `idx_runs_created_at`, storage tests (DATA-01)
-- [ ] 02-02-PLAN.md — `runs.py` `RunRegistry`, `shutdown_drain_seconds`, drain unit tests (DATA-02)
+- [x] 02-01-PLAN.md — `Database` wrapper (RLock + materialised results + `transaction()`), WAL/busy_timeout pragmas, `idx_runs_created_at`, storage tests (DATA-01)
+- [x] 02-02-PLAN.md — `runs.py` `RunRegistry`, `shutdown_drain_seconds`, drain unit tests (DATA-02)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
@@ -151,7 +151,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Security Perimeter | 5/5 | Complete   | 2026-08-09 |
-| 2. Async-Safe Data Layer & Graceful Shutdown | 0/5 | Planned | - |
+| 2. Async-Safe Data Layer & Graceful Shutdown | 2/5 | In Progress|  |
 | 3. Semantic Retrieval | 0/TBD | Not started | - |
 | 4. Evaluation Coverage | 0/TBD | Not started | - |
 | 5. Run Event Persistence & Live Feed | 0/TBD | Not started | - |
