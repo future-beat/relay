@@ -161,11 +161,14 @@ because it reads durable state rather than process memory.
 
 In-flight runs are reserved up front, because `runs` is only written when a
 stream finishes; without a reservation a burst of concurrent requests would all
-read the same stale sum and all clear the ceiling. One known edge: if a client
-disconnects after a run is admitted but before the response body starts
-streaming, its reservation leaks until the process restarts. It fails strict —
-the ceiling over-counts spend and closes early, never late — and the reservation
-is process-local, so a restart clears it.
+read the same stale sum and all clear the ceiling. Each reservation carries its
+own token and its own five-minute expiry, which matters because the release is
+not guaranteed to happen: a client that disconnects after a run is admitted but
+before the response body starts streaming cancels the generator that would have
+freed the claim. The expiry bounds that leak to one TTL of headroom instead of
+the life of the process, and a run that ends mid-stream still writes its partial
+cost to `runs`, so the durable half of the ceiling sees the money that was
+actually spent.
 
 ### Prompt injection: `ticket_id` is bound server-side
 

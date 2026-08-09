@@ -115,8 +115,11 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
 
     # Claim this run's worst-case cost now that the gate has admitted it. record_run
     # only fires once the stream ends, so without a reservation a burst of concurrent
-    # runs would all read the same stale SUM and all clear the daily ceiling.
-    reserve_run()
+    # runs would all read the same stale SUM and all clear the daily ceiling. The
+    # token is claimed here but released below, and the two can be separated by a
+    # cancellation that skips the release entirely — which is why the claim expires
+    # on its own rather than trusting this handoff.
+    token = reserve_run()
 
     async def event_stream():
         started = time.perf_counter()
@@ -164,7 +167,7 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                     outcome=outcome,
                 )
             # Released after the row exists, so the two are never both missing.
-            release_run()
+            release_run(token)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 

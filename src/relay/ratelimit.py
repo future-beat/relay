@@ -12,6 +12,7 @@ middleware — see auth.py for why streaming responses make middleware unusable
 for rejections.
 """
 
+import itertools
 import logging
 import math
 import sqlite3
@@ -32,8 +33,19 @@ logger = logging.getLogger("relay.ratelimit")
 _storage = MemoryStorage()
 _limiter = MovingWindowRateLimiter(_storage)
 
-# Cost of runs admitted but not yet written to `runs`.
-_reserved_usd: float = 0.0
+# Cost of runs admitted but not yet written to `runs`: token -> (expires_at, usd).
+#
+# Self-expiring because the release is not guaranteed to happen. Starlette can
+# cancel a streaming response before its generator is ever started, and a `finally`
+# in an async generator that never began does not run — so that run's claim is
+# never handed back. Without a TTL, ceil(max_daily / max_run) such requests pin the
+# ceiling shut for the life of the process, which is a remotely triggerable outage
+# rather than a strict failure. Identity-bearing for the same reason: a release must
+# free exactly the claim it was given, never another run's and never whatever
+# max_run_cost_usd happens to read at release time.
+RESERVATION_TTL_S = 300.0
+_reservations: dict[int, tuple[float, float]] = {}
+_tokens = itertools.count()
 
 # (bucket, tier) -> the settings attribute holding that limit string. The item
 # itself is parsed on demand, never at import: parsing here would freeze the
@@ -117,30 +129,53 @@ def next_utc_midnight(now: datetime | None = None) -> datetime:
     return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def spent_today(conn: sqlite3.Connection) -> float:
+def spent_today(conn: sqlite3.Connection, *, now: float | None = None) -> float:
     """Today's Claude spend in USD: rows written since UTC midnight, plus what
     currently-streaming runs could still cost.
 
     `datetime('now')` (which writes `created_at`) and `datetime('now', 'start of
-    day')` are both UTC, so the comparison needs no timezone conversion.
+    day')` are both UTC, so the comparison needs no timezone conversion. `now` is
+    a monotonic reading forwarded to reserved_usd().
     """
-    return float(conn.execute(DAILY_SPEND_SQL).fetchone()[0]) + _reserved_usd
+    return float(conn.execute(DAILY_SPEND_SQL).fetchone()[0]) + reserved_usd(now)
 
 
-def reserve_run() -> None:
-    """Claim this run's worst-case cost before it starts.
+def _prune(now: float) -> None:
+    for token, (expires_at, _) in list(_reservations.items()):
+        if expires_at <= now:
+            _reservations.pop(token, None)
+
+
+def reserved_usd(now: float | None = None) -> float:
+    """Worst-case cost of runs admitted but not yet written to `runs`.
+
+    Expired claims are dropped on read, which is what bounds a lost release to
+    RESERVATION_TTL_S instead of the process's lifetime. `now` is a monotonic
+    reading, injectable so expiry is testable without waiting out the TTL.
+    """
+    now = time.monotonic() if now is None else now
+    _prune(now)
+    return sum(usd for _, usd in _reservations.values())
+
+
+def reserve_run() -> int:
+    """Claim this run's worst-case cost before it starts, returning its token.
 
     `record_run` only fires once the SSE generator finishes, so without this a
     burst of concurrent requests all read the same stale SUM and all pass the
     ceiling — overshooting by up to concurrency x max_run_cost_usd.
     """
-    global _reserved_usd
-    _reserved_usd += settings.max_run_cost_usd
+    now = time.monotonic()
+    _prune(now)
+    token = next(_tokens)
+    _reservations[token] = (now + RESERVATION_TTL_S, settings.max_run_cost_usd)
+    return token
 
 
-def release_run() -> None:
-    global _reserved_usd
-    _reserved_usd = max(0.0, _reserved_usd - settings.max_run_cost_usd)
+def release_run(token: int | None) -> None:
+    """Hand back one claim. Idempotent, and never frees another run's."""
+    if token is not None:
+        _reservations.pop(token, None)
 
 
 def enforce_daily_budget(conn: sqlite3.Connection) -> None:
@@ -173,8 +208,7 @@ def enforce_daily_budget(conn: sqlite3.Connection) -> None:
 
 
 async def reset_limits() -> None:
-    """Test hook — MemoryStorage and the reservation are process-wide state."""
-    global _reserved_usd
+    """Test hook — MemoryStorage and the reservations are process-wide state."""
     await _storage.reset()
     _items.clear()
-    _reserved_usd = 0.0
+    _reservations.clear()

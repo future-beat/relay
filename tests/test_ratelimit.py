@@ -1,4 +1,6 @@
+import asyncio
 import math
+import time
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -7,8 +9,9 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from relay.config import settings
-from relay.main import app
+from relay.main import app, process_ticket
 from relay.ratelimit import (
+    RESERVATION_TTL_S,
     client_ip,
     enforce,
     enforce_daily_budget,
@@ -193,18 +196,55 @@ def test_daily_budget_raises_503_at_the_ceiling(conn, monkeypatch):
 def test_reserved_runs_count_toward_todays_spend(conn, monkeypatch):
     monkeypatch.setattr(settings, "max_run_cost_usd", 0.5)
     assert spent_today(conn) == 0.0
-    reserve_run()
-    reserve_run()
+    first = reserve_run()
+    second = reserve_run()
     assert spent_today(conn) == pytest.approx(1.0)
-    release_run()
+    release_run(first)
     assert spent_today(conn) == pytest.approx(0.5)
-    release_run()
+    release_run(second)
     assert spent_today(conn) == 0.0
 
 
-def test_releasing_more_than_reserved_clamps_at_zero(conn):
-    release_run()
+def test_releasing_an_unknown_token_frees_nothing(conn, monkeypatch):
+    # Tokens replaced a bare float precisely so a stray release cannot silently
+    # spend another run's claim — the old accumulator just clamped at zero.
+    monkeypatch.setattr(settings, "max_run_cost_usd", 0.5)
+    token = reserve_run()
+    release_run(token + 10_000)
+    release_run(None)
+    assert spent_today(conn) == pytest.approx(0.5)
+    release_run(token)
     assert spent_today(conn) == 0.0
+
+
+def test_a_claim_keeps_the_amount_it_was_reserved_at(conn, monkeypatch):
+    # The claim carries its own amount rather than re-reading the setting, so a
+    # value that moves mid-run cannot leave the total drifting up or down.
+    monkeypatch.setattr(settings, "max_run_cost_usd", 0.5)
+    token = reserve_run()
+    monkeypatch.setattr(settings, "max_run_cost_usd", 0.1)
+    assert spent_today(conn) == pytest.approx(0.5)
+    release_run(token)
+    assert spent_today(conn) == 0.0
+
+
+def test_unreleased_reservation_expires_after_its_ttl(conn, monkeypatch):
+    # The failure this closes: Starlette can cancel a streaming response before the
+    # generator holding the release ever starts, so the `finally` never runs. Ten
+    # such requests used to pin the ceiling shut until the process restarted.
+    monkeypatch.setattr(settings, "max_run_cost_usd", 0.5)
+    reserve_run()  # token dropped on the floor, as a never-started generator does
+    assert spent_today(conn) == pytest.approx(0.5)
+
+    # The clock is injected rather than waited out — the TTL is five minutes.
+    assert spent_today(conn, now=time.monotonic() + RESERVATION_TTL_S + 1) == 0.0
+    assert spent_today(conn) == 0.0
+
+
+def test_a_live_reservation_survives_short_of_its_ttl(conn, monkeypatch):
+    monkeypatch.setattr(settings, "max_run_cost_usd", 0.5)
+    reserve_run()
+    assert spent_today(conn, now=time.monotonic() + RESERVATION_TTL_S - 1) == pytest.approx(0.5)
 
 
 def test_reservations_alone_can_exhaust_the_daily_budget(conn, monkeypatch):
@@ -339,6 +379,19 @@ def test_in_flight_reservation(client):
     assert _process(client).status_code == 503
     # The whole point: refused before a single row was written.
     assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+
+
+def test_a_stream_that_never_starts_leaks_only_until_the_ttl(client):
+    # The real shape of the leak: Starlette can cancel a streaming response before
+    # the generator holding release_run() is ever started, and a `finally` in an
+    # un-started async generator does not run. Ten of these used to pin the ceiling
+    # shut for the life of the process. The body is never iterated here on purpose.
+    conn = app.state.conn
+    ticket_id = client.post("/tickets", json=TICKET).json()["id"]
+    asyncio.run(process_ticket(ticket_id))
+
+    assert spent_today(conn) == pytest.approx(settings.max_run_cost_usd)
+    assert spent_today(conn, now=time.monotonic() + RESERVATION_TTL_S + 1) == 0.0
 
 
 def test_rate_limit_and_budget_ordering(client, monkeypatch):
