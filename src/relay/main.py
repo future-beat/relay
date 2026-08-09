@@ -1,17 +1,20 @@
 import json
 import time
 from contextlib import asynccontextmanager
+from html import escape
 
 from anthropic import AsyncAnthropic
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request, Security
 from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
 from . import __version__
 from .agent import run_ticket
+from .auth import Tier, api_key_header, require_tier
 from .config import settings
 from .db import connect, init_db
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
+from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
 
@@ -32,6 +35,50 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Relay", version=__version__, lifespan=lifespan)
 
 
+# D-07 permits both tiers on every protected surface, so one shared resolver covers
+# all three gates. Both are built once at module level: ruff's B008 rightly rejects
+# a call in an argument default (auth.py is the same pattern).
+_ANY_TIER = require_tier("owner", "demo")
+_API_KEY = Security(api_key_header)
+
+
+def _gate(bucket: str, *, meter_spend: bool = False):
+    """Build the perimeter dependency for one route: an anonymous per-IP meter,
+    then auth, then the daily spend ceiling on costly routes, then the tiered
+    per-IP window.
+
+    Every control is a route dependency and never middleware: a StreamingResponse
+    locks its status line at 200 once the generator yields, so a rejection raised
+    any later than this could only surface as an in-stream error on a 200.
+
+    The anon bucket is charged before the credential is resolved, and the resolver
+    is called by hand rather than nested as a sub-dependency, because FastAPI
+    resolves sub-dependencies before the body that would meter them: a 401 raised
+    from there consumed no allowance at all, leaving the key itself open to
+    unlimited online guessing.
+
+    The ceiling is checked before the tiered window because it is a global
+    condition — a budget outage should not also burn the caller's per-IP allowance.
+    """
+
+    async def _dependency(request: Request, presented: str | None = _API_KEY) -> Tier:
+        await enforce("auth", "anon", request)
+        tier = _ANY_TIER(presented)
+        if meter_spend:
+            enforce_daily_budget(app.state.conn)
+        await enforce(bucket, tier, request)
+        return tier
+
+    return _dependency
+
+
+# D-07: these three cover every mutating or paid surface; /, /health, /metrics and
+# /dashboard stay public so the container HEALTHCHECK and the CI smoke job keep working.
+create_gate = _gate("create")
+read_gate = _gate("read")
+process_gate = _gate("process", meter_spend=True)
+
+
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
     """Send visitors to the dashboard rather than a bare 404."""
@@ -43,7 +90,12 @@ async def health() -> dict:
     return {"status": "ok", "version": __version__, "model": settings.model}
 
 
-@app.post("/tickets", response_model=Ticket, status_code=201)
+@app.post(
+    "/tickets",
+    response_model=Ticket,
+    status_code=201,
+    dependencies=[Depends(create_gate)],
+)
 async def create_ticket(payload: TicketCreate) -> Ticket:
     conn = app.state.conn
     cur = conn.execute(
@@ -54,12 +106,12 @@ async def create_ticket(payload: TicketCreate) -> Ticket:
     return _get_ticket(cur.lastrowid)
 
 
-@app.get("/tickets/{ticket_id}", response_model=Ticket)
+@app.get("/tickets/{ticket_id}", response_model=Ticket, dependencies=[Depends(read_gate)])
 async def get_ticket(ticket_id: int) -> Ticket:
     return _get_ticket(ticket_id)
 
 
-@app.post("/tickets/{ticket_id}/process")
+@app.post("/tickets/{ticket_id}/process", dependencies=[Depends(process_gate)])
 async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResponse:
     """Run the agent on a ticket, streaming each step as a server-sent event.
 
@@ -71,35 +123,61 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     if ticket.status != "open":
         raise HTTPException(409, f"ticket is already {ticket.status.value}")
 
+    # Claim this run's worst-case cost now that the gate has admitted it. record_run
+    # only fires once the stream ends, so without a reservation a burst of concurrent
+    # runs would all read the same stale SUM and all clear the daily ceiling. The
+    # token is claimed here but released below, and the two can be separated by a
+    # cancellation that skips the release entirely — which is why the claim expires
+    # on its own rather than trusting this handoff.
+    token = reserve_run()
+
     async def event_stream():
         started = time.perf_counter()
         usage: dict = {}
         outcome = "incomplete"
-        async for event in run_ticket(
-            app.state.client,
-            app.state.registry,
-            ticket.model_dump(),
-            policy=ToolPolicy(allow_writes=not dry_run),
-        ):
-            if event.type == "usage":
-                usage = event.data
-            elif event.type == "resolution":
-                outcome = event.data["via"] or "dry_run_complete"
-            elif event.type == "error":
-                outcome = f"error:{event.data['reason']}"
-            yield f"event: {event.type}\ndata: {json.dumps(event.data)}\n\n"
-        record_run(
-            app.state.conn,
-            ticket_id=ticket.id,
-            model=settings.model,
-            duration_ms=int((time.perf_counter() - started) * 1000),
-            steps=usage.get("steps", 0),
-            input_tokens=usage.get("input_tokens", 0),
-            output_tokens=usage.get("output_tokens", 0),
-            cost_usd=usage.get("cost_usd", 0.0),
-            outcome=outcome,
-        )
-        yield "event: done\ndata: {}\n\n"
+        recorded = False
+        try:
+            async for event in run_ticket(
+                app.state.client,
+                app.state.registry,
+                ticket.model_dump(),
+                policy=ToolPolicy(allow_writes=not dry_run),
+            ):
+                if event.type == "usage":
+                    usage = event.data
+                elif event.type == "resolution":
+                    outcome = event.data["via"] or "dry_run_complete"
+                elif event.type == "error":
+                    outcome = f"error:{event.data['reason']}"
+                yield f"event: {event.type}\ndata: {json.dumps(event.data)}\n\n"
+            yield "event: done\ndata: {}\n\n"
+        finally:
+            # A plain finally, never a context manager: run_ticket suspends at every
+            # yield, and anything held across a yield leaks into whatever coroutine
+            # runs in between (see agent.py's run-span note).
+            #
+            # The row is written from here rather than after the loop because a client
+            # that disconnects mid-stream cancels this generator at its suspended
+            # yield: every Claude call already made is real money, and the daily
+            # ceiling reads it back out of `runs`. An aborted run keeps `outcome`
+            # "incomplete", which is also the honest value for /metrics. The flag
+            # keeps a second close from writing the row twice and double-charging
+            # the ledger.
+            if not recorded:
+                recorded = True
+                record_run(
+                    app.state.conn,
+                    ticket_id=ticket.id,
+                    model=settings.model,
+                    duration_ms=int((time.perf_counter() - started) * 1000),
+                    steps=usage.get("steps", 0),
+                    input_tokens=usage.get("input_tokens", 0),
+                    output_tokens=usage.get("output_tokens", 0),
+                    cost_usd=usage.get("cost_usd", 0.0),
+                    outcome=outcome,
+                )
+            # Released after the row exists, so the two are never both missing.
+            release_run(token)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -117,8 +195,18 @@ h1 { font-size: 1.2rem; } .cards { display: flex; gap: 1rem; flex-wrap: wrap; }
 .card b { display: block; font-size: 1.4rem; } .card span { color: #666; font-size: .8rem; }
 table { border-collapse: collapse; width: 100%; margin-top: 1.5rem; font-size: .85rem; }
 th, td { text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; }
+.demo { border: 1px solid #ccc; border-left: 4px solid #444; border-radius: 8px;
+        padding: .8rem 1.2rem; margin-bottom: 1.5rem; font-size: .85rem; }
+.demo code { background: #f4f4f4; padding: .1rem .3rem; border-radius: 4px; }
+.demo em { color: #666; font-style: normal; }
 </style></head><body>
-<h1>Relay — agent runs</h1><div class="cards" id="cards"></div>
+<h1>Relay — agent runs</h1>
+<div class="demo">
+Try it yourself — this key is published on purpose:
+<code>X-API-Key: __RELAY_DEMO_KEY__</code><br>
+<em>Deliberately limited: 5 runs/hour per IP, and the demo caps Claude spend at $5/day.</em>
+</div>
+<div class="cards" id="cards"></div>
 <table id="runs"><thead><tr><th>id</th><th>ticket</th><th>outcome</th><th>steps</th>
 <th>tokens in/out</th><th>cost</th><th>ms</th><th>at</th></tr></thead><tbody></tbody></table>
 <script>
@@ -140,7 +228,18 @@ refresh(); setInterval(refresh, 5000);
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard() -> str:
-    return DASHBOARD_HTML
+    """Serve the dashboard, substituting the demo key at request time.
+
+    D-02 publishes the demo key here and in the README. Substituting from
+    settings rather than baking a literal into DASHBOARD_HTML means the page
+    can never advertise a key the service would reject. A .replace() and not an
+    f-string: the inline JS is full of ${...} template literals.
+
+    An unconfigured deployment renders a neutral placeholder — /dashboard is the
+    public landing surface and must not print "None" as if it were a credential.
+    """
+    published = escape(settings.demo_key) if settings.demo_key else "(not configured)"
+    return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
 
 
 def _get_ticket(ticket_id: int) -> Ticket:

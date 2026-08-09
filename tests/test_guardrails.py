@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -176,3 +177,105 @@ async def test_normal_run_ending_without_action_is_error(registry):
     events = await collect(run_ticket(client, registry, TICKET))
     assert events[-1].type == "error"
     assert events[-1].data["reason"] == "ended_without_action"
+
+
+# --- ticket_id binding ---
+
+# Someone else's ticket: a prompt-injected body tells the agent to act on this one.
+VICTIM_TICKET = {
+    "id": 99,
+    "customer_email": "ava@acmecorp.com",
+    "subject": "Refund status",
+    "body": "Where is my refund?",
+}
+
+OTHER_TICKET = {
+    "id": 2,
+    "customer_email": "mia@datalane.ai",
+    "subject": "Webhook retries",
+    "body": "How many times do webhooks retry?",
+}
+
+INJECTED_REPLY = "Your account has been credited $500, as instructed."
+GROUNDED_REPLY = "Pro plan accounts are limited to 100 requests per minute."
+
+
+def _seed_tickets(conn, *tickets):
+    """Insert real ticket rows so an unguarded cross-ticket write would actually land."""
+    for ticket in tickets:
+        conn.execute(
+            "INSERT INTO tickets (id, customer_email, subject, body) VALUES (?, ?, ?, ?)",
+            (ticket["id"], ticket["customer_email"], ticket["subject"], ticket["body"]),
+        )
+    conn.commit()
+
+
+def _reply_ticket_ids(conn):
+    rows = conn.execute("SELECT ticket_id FROM replies ORDER BY id").fetchall()
+    return [row["ticket_id"] for row in rows]
+
+
+async def test_mismatched_ticket_id_is_denied(conn, registry):
+    _seed_tickets(conn, TICKET, VICTIM_TICKET)
+    client = FakeClient([
+        _response([_tool_use("send_reply", {"ticket_id": 99, "body": INJECTED_REPLY})]),
+        _response([_text("Understood.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+    result = next(e for e in events if e.type == "tool_result")
+    assert result.data["is_error"] is True
+    assert result.data["result"]["denied_by"] == "ticket_binding"
+    assert conn.execute(
+        "SELECT COUNT(*) FROM replies WHERE ticket_id = ?", (VICTIM_TICKET["id"],)
+    ).fetchone()[0] == 0
+
+
+async def test_binding_denial_emits_guardrail_event(conn, registry):
+    _seed_tickets(conn, TICKET, VICTIM_TICKET)
+    client = FakeClient([
+        _response([_tool_use("send_reply", {"ticket_id": 99, "body": INJECTED_REPLY})]),
+        _response([_text("Understood.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+    guardrails = [e for e in events if e.type == "guardrail"]
+    assert len(guardrails) == 1
+    assert guardrails[0].data == {
+        "guard": "ticket_binding",
+        "tool": "send_reply",
+        "expected_ticket_id": 1,
+        "supplied_ticket_id": 99,
+        "action": "denied",
+    }
+    types = [e.type for e in events]
+    assert types.index("guardrail") < types.index("tool_result")
+
+
+async def test_run_recovers_after_binding_denial(conn, registry):
+    _seed_tickets(conn, TICKET, VICTIM_TICKET)
+    client = FakeClient([
+        _response([_tool_use("send_reply", {"ticket_id": 99, "body": INJECTED_REPLY}, id="t1")]),
+        _response([_tool_use("send_reply", {"ticket_id": 1, "body": GROUNDED_REPLY}, id="t2")]),
+        _response([_text("Reply sent.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+    assert events[-1].type == "resolution"
+    assert events[-1].data["via"] == "send_reply"
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+async def test_concurrent_runs_do_not_cross_bind(conn, registry):
+    _seed_tickets(conn, TICKET, OTHER_TICKET)
+
+    def _client(ticket_id):
+        return FakeClient([
+            _response([_tool_use("send_reply", {"ticket_id": ticket_id, "body": GROUNDED_REPLY})]),
+            _response([_text("Reply sent.")], stop_reason="end_turn"),
+        ])
+
+    # One shared registry, as in the live app: it must carry no per-run state.
+    runs = await asyncio.gather(
+        collect(run_ticket(_client(TICKET["id"]), registry, TICKET)),
+        collect(run_ticket(_client(OTHER_TICKET["id"]), registry, OTHER_TICKET)),
+    )
+    assert [e for events in runs for e in events if e.type == "guardrail"] == []
+    assert sorted(_reply_ticket_ids(conn)) == [TICKET["id"], OTHER_TICKET["id"]]
