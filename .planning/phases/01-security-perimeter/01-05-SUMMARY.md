@@ -165,3 +165,7 @@ None. This plan introduced no new network endpoint, auth path, file access patte
 2. On approval: record the eval pass rate from step 7 verbatim in this file, mark SEC-01/02/03/06 complete, advance `STATE.md`.
 3. On failure: record the failure verbatim here — the plan forbids fixing inside the checkpoint; a follow-up plan handles it.
 4. Before any `fly deploy`: `fly secrets set RELAY_API_KEY=... RELAY_DEMO_KEY=relay-demo-2026`. Auth fails closed, so deploying first returns 503 on every protected route.
+
+## Self-Check: PASSED
+
+All four task commits (`e0804d5`, `63d8145`, `ea54e24`, `55e1770`) plus the metadata commit (`80f7a65`) exist on `worktree-agent-a765aeefbbe24c479`. All claimed files exist on disk. The metadata commit deleted no tracked files. `STATE.md`, `ROADMAP.md` and `REQUIREMENTS.md` are unmodified across the whole plan diff, as intended.
