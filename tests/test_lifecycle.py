@@ -8,6 +8,7 @@ so a registry shared across tests would be awaited on the wrong loop.
 import asyncio
 import inspect
 import re
+import sqlite3
 import threading
 import time
 import tomllib
@@ -302,6 +303,51 @@ def test_a_stream_that_never_starts_registers_nothing(client):
 
     assert app.state.runs.active == 0
     assert app.state.runs.snapshot() == []
+
+
+def test_a_failed_record_run_still_releases_the_reservation_and_the_registry(client, monkeypatch):
+    # CR-01. record_run is the only statement in event_stream's finally that touches
+    # the database, and the likeliest way it fails is the race this phase closes: a
+    # drain times out, lifespan closes the connection, and the write raises the exact
+    # error below. Run sequentially in that finally, the exception skipped both
+    # cleanups — and the registry leak is permanent, so every later drain burns its
+    # full grace period and returns False for the life of the process. That is why
+    # the registry assertion is the first one here: it is the unrecoverable half.
+    ticket_id = _make_ticket(client)
+    app.state.client = FakeClient([
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id,
+            "body": "Hi Liam — your Pro plan allows 600 requests/minute per workspace.",
+        })]),
+        response([text_block("Done.")], stop_reason="end_turn"),
+    ])
+
+    def record_run_against_a_closed_database(*args, **kwargs):
+        raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+
+    monkeypatch.setattr("relay.main.record_run", record_run_against_a_closed_database)
+
+    escaped: list = []
+
+    async def drive_one_run_to_completion() -> str:
+        stream = await process_ticket(ticket_id)
+        try:
+            return "".join([chunk async for chunk in stream.body_iterator])
+        except BaseException as exc:  # noqa: BLE001 — reported below, not swallowed
+            escaped.append(exc)
+            return ""
+
+    body = asyncio.run(drive_one_run_to_completion())
+
+    assert app.state.runs.active == 0, "a failed telemetry write leaked a registry entry"
+    assert app.state.runs.snapshot() == []
+    assert reserved_usd() == 0.0, "a failed telemetry write stranded a spend reservation"
+    # The drain the leak would have broken still works, rather than waiting out its
+    # timeout — the actual consequence, not just the counter that predicts it.
+    assert asyncio.run(app.state.runs.drain(timeout=0.05)) is True
+    # The caller is unaffected: losing the row must not also break the stream.
+    assert escaped == [], f"the telemetry failure escaped to the client: {escaped}"
+    assert "event: done" in body
 
 
 def test_process_returns_503_while_draining(client):

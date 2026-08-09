@@ -58,8 +58,13 @@ class RunRegistry:
         No expiry, unlike ratelimit.py's reservations. Those are claimed in the
         handler and handed back in the generator, so a stream cancelled before it
         starts never releases its claim. Registration happens inside the generator
-        itself, which makes register and deregister exactly balanced — a future
-        reader should not "fix" this by adding a TTL.
+        itself, so register and deregister can be balanced — but that balance is the
+        *caller's* guarantee, not this class's: it holds only because event_stream
+        deregisters from a finally that nothing in its body can skip, telemetry
+        failures included. A leaked entry is unrecoverable here — it pins the
+        registry non-empty, so every later drain waits out its full grace period and
+        returns False. Before adding a TTL to paper over that, check the caller's
+        finally instead; a TTL would only hide the caller regressing.
         """
         token = next(self._tokens)
         self._active[token] = ActiveRun(ticket_id=ticket_id, started_at=time.monotonic())

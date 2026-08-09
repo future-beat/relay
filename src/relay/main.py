@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from html import escape
@@ -19,6 +20,8 @@ from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
 from .runs import RunRegistry
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
+
+logger = logging.getLogger("relay.main")
 
 
 @asynccontextmanager
@@ -211,23 +214,36 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
             # "incomplete", which is also the honest value for /metrics. The flag
             # keeps a second close from writing the row twice and double-charging
             # the ledger.
-            if not recorded:
-                recorded = True
-                record_run(
-                    app.state.conn,
-                    ticket_id=ticket.id,
-                    model=settings.model,
-                    duration_ms=int((time.perf_counter() - started) * 1000),
-                    steps=usage.get("steps", 0),
-                    input_tokens=usage.get("input_tokens", 0),
-                    output_tokens=usage.get("output_tokens", 0),
-                    cost_usd=usage.get("cost_usd", 0.0),
-                    outcome=outcome,
-                )
-            # Released after the row exists, so the two are never both missing.
-            release_run(token)
-            # Last, so a drain waiting on this run only wakes once its row is written.
-            app.state.runs.deregister(run_token)
+            #
+            # The write is wrapped because it is the one statement here that talks to
+            # the database, and the likeliest way it fails is the race this phase
+            # closes: a drain times out, lifespan closes the connection, and this
+            # write raises "Cannot operate on a closed database". Unguarded, that
+            # exception would skip both cleanups below — leaking the registry entry
+            # permanently, so every later drain burns its full grace period and
+            # returns False, and stranding $0.50 of the daily ceiling until its TTL.
+            # Losing one telemetry row must not cost the process its drain.
+            try:
+                if not recorded:
+                    recorded = True
+                    record_run(
+                        app.state.conn,
+                        ticket_id=ticket.id,
+                        model=settings.model,
+                        duration_ms=int((time.perf_counter() - started) * 1000),
+                        steps=usage.get("steps", 0),
+                        input_tokens=usage.get("input_tokens", 0),
+                        output_tokens=usage.get("output_tokens", 0),
+                        cost_usd=usage.get("cost_usd", 0.0),
+                        outcome=outcome,
+                    )
+            except Exception:
+                logger.exception("run.record_failed", extra={"ctx": {"ticket_id": ticket.id}})
+            finally:
+                # Released after the row exists, so the two are never both missing.
+                release_run(token)
+                # Last, so a drain waiting on this run only wakes once its row is written.
+                app.state.runs.deregister(run_token)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
