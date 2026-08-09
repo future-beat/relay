@@ -150,6 +150,13 @@ None. `RELAY_SHUTDOWN_DRAIN_SECONDS` has a working default, so an unset environm
 - **Not done here, by design:** `fly.toml`'s `kill_timeout = 30` and the `Dockerfile` CMD's `--timeout-graceful-shutdown 20` (plus the `exec` prefix). Without those two the app-level drain is real but the outer windows do not nest, and Fly's 5 s default would SIGKILL through it. They belong to a later plan in this phase — the drain is not actually effective in production until they land.
 - **No blockers.**
 
+## Self-Check: PASSED
+
+- Files verified present and tracked at HEAD: `src/relay/runs.py`, `tests/test_lifecycle.py`, `src/relay/config.py`, `.env.example`, `02-02-SUMMARY.md`
+- Commits verified in `git log`: `ecfc6a2`, `6d29f62`, `bdfe1ba`, `88e101f`
+- Working tree clean; no unexpected deletions in any task commit
+- STATE.md and ROADMAP.md deliberately untouched — the orchestrator owns those writes
+
 ---
 *Phase: 02-async-safe-data-layer-graceful-shutdown*
 *Completed: 2026-08-09*
