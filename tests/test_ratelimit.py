@@ -18,12 +18,6 @@ from relay.ratelimit import (
 from relay.telemetry import record_run
 
 
-@pytest.fixture(autouse=True)
-async def _reset_limits():
-    await reset_limits()
-    yield
-
-
 def _request(ip: str | None = "1.2.3.4", headers: dict[str, str] | None = None) -> Request:
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
     return Request({

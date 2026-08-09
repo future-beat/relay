@@ -1,22 +1,9 @@
 import json
 import logging
 
-import pytest
-from fastapi.testclient import TestClient
-
 from helpers import FakeClient, response, text_block, tool_use_block
 from relay.main import app
 from relay.telemetry import JsonFormatter, run_metrics
-
-
-@pytest.fixture()
-def client(tmp_path, monkeypatch):
-    from relay.config import settings
-
-    monkeypatch.setattr(settings, "db_path", tmp_path / "test.db")
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
-    with TestClient(app) as client:
-        yield client
 
 
 def _make_ticket(client) -> int:
