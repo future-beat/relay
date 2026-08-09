@@ -9,7 +9,8 @@ system end to end.
 Run over stdio:
     python -m relay.mcp_server
 
-Set RELAY_MCP_ALLOW_WRITES=false to serve a read-only tool surface.
+Writes are disabled by default — the tool surface is read-only until an
+operator sets RELAY_MCP_ALLOW_WRITES=true to opt in.
 """
 
 import asyncio
