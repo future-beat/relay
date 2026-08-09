@@ -1,6 +1,7 @@
 import json
 import time
 from contextlib import asynccontextmanager
+from html import escape
 
 from anthropic import AsyncAnthropic
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -170,8 +171,18 @@ h1 { font-size: 1.2rem; } .cards { display: flex; gap: 1rem; flex-wrap: wrap; }
 .card b { display: block; font-size: 1.4rem; } .card span { color: #666; font-size: .8rem; }
 table { border-collapse: collapse; width: 100%; margin-top: 1.5rem; font-size: .85rem; }
 th, td { text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; }
+.demo { border: 1px solid #ccc; border-left: 4px solid #444; border-radius: 8px;
+        padding: .8rem 1.2rem; margin-bottom: 1.5rem; font-size: .85rem; }
+.demo code { background: #f4f4f4; padding: .1rem .3rem; border-radius: 4px; }
+.demo em { color: #666; font-style: normal; }
 </style></head><body>
-<h1>Relay — agent runs</h1><div class="cards" id="cards"></div>
+<h1>Relay — agent runs</h1>
+<div class="demo">
+Try it yourself — this key is published on purpose:
+<code>X-API-Key: __RELAY_DEMO_KEY__</code><br>
+<em>Deliberately limited: 5 runs/hour per IP, and the demo caps Claude spend at $5/day.</em>
+</div>
+<div class="cards" id="cards"></div>
 <table id="runs"><thead><tr><th>id</th><th>ticket</th><th>outcome</th><th>steps</th>
 <th>tokens in/out</th><th>cost</th><th>ms</th><th>at</th></tr></thead><tbody></tbody></table>
 <script>
@@ -193,7 +204,18 @@ refresh(); setInterval(refresh, 5000);
 
 @app.get("/dashboard", response_class=HTMLResponse)
 async def dashboard() -> str:
-    return DASHBOARD_HTML
+    """Serve the dashboard, substituting the demo key at request time.
+
+    D-02 publishes the demo key here and in the README. Substituting from
+    settings rather than baking a literal into DASHBOARD_HTML means the page
+    can never advertise a key the service would reject. A .replace() and not an
+    f-string: the inline JS is full of ${...} template literals.
+
+    An unconfigured deployment renders a neutral placeholder — /dashboard is the
+    public landing surface and must not print "None" as if it were a credential.
+    """
+    published = escape(settings.demo_key) if settings.demo_key else "(not configured)"
+    return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
 
 
 def _get_ticket(ticket_id: int) -> Ticket:
