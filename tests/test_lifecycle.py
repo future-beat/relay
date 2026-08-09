@@ -31,6 +31,7 @@ from relay.mcp_server import build_mcp_registry
 from relay.ratelimit import reserved_usd
 from relay.runs import RunRegistry
 from relay.telemetry import record_run
+from test_db import instrument_write_grouping
 
 _REPO_ROOT = Path(__file__).parent.parent
 _KB_DIR = _REPO_ROOT / "kb"
@@ -450,6 +451,34 @@ def test_a_failed_record_run_still_releases_the_reservation_and_the_registry(cli
     # The caller is unaffected: losing the row must not also break the stream.
     assert escaped == [], f"the telemetry failure escaped to the client: {escaped}"
     assert "event: done" in body
+
+
+def test_create_ticket_groups_its_insert_and_id_read_in_one_transaction(client, monkeypatch):
+    # The fifth of the multi-statement writers, and the only one behind an HTTP
+    # handler rather than a plain function, so it is covered here rather than beside
+    # the other four in test_db.py. The unit of work is the INSERT plus the lastrowid
+    # read: drop the transaction() and another thread's insert moves lastrowid between
+    # them, handing this caller back somebody else's ticket id.
+    statements, bare_commits = instrument_write_grouping(app.state.conn, monkeypatch)
+
+    created = client.post(
+        "/tickets",
+        json={
+            "customer_email": "liam@brightco.io",
+            "subject": "API limits",
+            "body": "What are my rate limits?",
+        },
+    )
+
+    assert created.status_code == 201
+    writes = [(sql, depth) for sql, depth in statements if sql.lstrip().upper().startswith("INSERT")]
+    assert writes, "no INSERT was recorded — every assertion below is vacuous"
+    # The handler's follow-up read is deliberately outside the block and not asserted
+    # on: Result is materialised, so a read needs no transaction of its own.
+    assert all(depth >= 1 for _, depth in writes), (
+        f"create_ticket inserted outside a transaction(): {writes}"
+    )
+    assert bare_commits == [], "create_ticket committed outside a transaction()"
 
 
 def test_process_returns_503_while_draining(client):

@@ -1,9 +1,12 @@
 import sqlite3
 import threading
+from contextlib import contextmanager
 
 import pytest
 
 from relay.db import connect
+from relay.telemetry import record_run
+from relay.tools import create_escalation, send_reply, set_category
 
 # --- pragmas ---
 
@@ -113,3 +116,91 @@ def test_a_failed_write_does_not_leave_a_partial_row_when_another_thread_commits
     surviving = db.execute("SELECT ticket_id FROM replies").fetchall()
     assert [row["ticket_id"] for row in surviving] == [b_ticket]
     assert db.execute("SELECT status FROM tickets WHERE id = ?", (a_ticket,)).fetchone()[0] == "open"
+
+
+# --- transaction() adoption at the call sites ---
+
+
+def instrument_write_grouping(db, monkeypatch) -> tuple[list, list]:
+    """Record, for each statement a caller issues, whether a transaction was open.
+
+    Wraps the instance rather than the class so nothing leaks between tests, and
+    leans on transaction() committing through the private connection: a commit seen
+    here is therefore a caller's bare commit, never the transaction's own.
+    """
+    depth = [0]
+    statements: list[tuple[str, int]] = []
+    bare_commits: list[str] = []
+    real_transaction, real_execute, real_commit = db.transaction, db.execute, db.commit
+
+    @contextmanager
+    def recording_transaction():
+        depth[0] += 1
+        try:
+            with real_transaction() as handle:
+                yield handle
+        finally:
+            depth[0] -= 1
+
+    def recording_execute(sql, params=()):
+        statements.append((sql, depth[0]))
+        return real_execute(sql, params)
+
+    def recording_commit():
+        if depth[0] == 0:
+            bare_commits.append("commit")
+        return real_commit()
+
+    monkeypatch.setattr(db, "transaction", recording_transaction)
+    monkeypatch.setattr(db, "execute", recording_execute)
+    monkeypatch.setattr(db, "commit", recording_commit)
+    return statements, bare_commits
+
+
+def _seed_ticket(db) -> int:
+    ticket_id = db.execute(
+        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+        ("ava@acmecorp.com", "Refund", "Please refund me"),
+    ).lastrowid
+    db.commit()
+    return ticket_id
+
+
+@pytest.mark.parametrize(
+    "writer",
+    ["send_reply", "create_escalation", "set_category", "record_run"],
+)
+def test_business_writers_group_every_statement_in_one_transaction(writer, db, monkeypatch):
+    # The test above proves transaction() works; this proves the writers still use it.
+    # Adoption was the gap: rewriting send_reply or record_run as bare execute + commit()
+    # left the whole suite green, because nothing looked at how the five multi-statement
+    # writers research named as the hazard surface actually reach the database. A bare
+    # commit() is connection-scoped, so it lands whatever half-finished unit of work
+    # another thread has open — the exact regression this phase's data layer exists to
+    # make unrepresentable. record_run is the most exposed of the five: it runs on the
+    # event loop while worker threads write underneath it.
+    ticket_id = _seed_ticket(db)
+    statements, bare_commits = instrument_write_grouping(db, monkeypatch)
+
+    writers = {
+        "send_reply": lambda: send_reply(db, ticket_id, "Your refund is on its way."),
+        "create_escalation": lambda: create_escalation(db, ticket_id, "needs a human", "high"),
+        "set_category": lambda: set_category(db, ticket_id, "billing"),
+        "record_run": lambda: record_run(
+            db,
+            ticket_id=ticket_id,
+            model="test-model",
+            duration_ms=1,
+            steps=1,
+            input_tokens=1000,
+            output_tokens=500,
+            cost_usd=0.021,
+            outcome="send_reply",
+        ),
+    }
+    writers[writer]()
+
+    assert statements, f"{writer} issued no statements — every assertion below is vacuous"
+    ungrouped = [sql for sql, depth in statements if depth == 0]
+    assert ungrouped == [], f"{writer} issued statements outside a transaction(): {ungrouped}"
+    assert bare_commits == [], f"{writer} committed outside a transaction()"
