@@ -26,6 +26,11 @@ from relay.telemetry import record_run
 
 def _request(ip: str | None = "1.2.3.4", headers: dict[str, str] | None = None) -> Request:
     raw = [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()]
+    return _request_raw(ip, raw)
+
+
+def _request_raw(ip: str | None, raw: list[tuple[bytes, bytes]]) -> Request:
+    """Build a request from raw header pairs, so a header can appear twice."""
     return Request({
         "type": "http",
         "method": "GET",
@@ -73,6 +78,40 @@ def test_trusted_proxy_falls_back_to_peer_when_header_absent(monkeypatch):
 
 def test_missing_client_resolves_to_unknown():
     assert client_ip(_request(None)) == "unknown"
+
+
+def test_duplicated_proxy_header_takes_the_last_value(monkeypatch):
+    # A client-supplied Fly-Client-IP can only ever arrive ahead of the proxy's
+    # own append, so trusting the first occurrence hands the attacker the bucket.
+    monkeypatch.setattr(settings, "trust_proxy_header", True)
+    req = _request_raw(
+        "10.0.0.1",
+        [(b"fly-client-ip", b"198.51.100.7"), (b"fly-client-ip", b"203.0.113.9")],
+    )
+    assert client_ip(req) == "203.0.113.9"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "not-an-ip",
+        "203.0.113.9/../evil",  # "/" would inject extra segments into the limiter key
+        "",
+    ],
+)
+def test_non_ip_proxy_header_falls_back_to_the_peer(monkeypatch, value):
+    monkeypatch.setattr(settings, "trust_proxy_header", True)
+    req = _request("10.0.0.1", {"Fly-Client-IP": value})
+    assert client_ip(req) == "10.0.0.1"
+
+
+def test_proxy_header_value_is_normalised(monkeypatch):
+    # Two spellings of one address must not resolve to two distinct buckets.
+    monkeypatch.setattr(settings, "trust_proxy_header", True)
+    padded = client_ip(_request("10.0.0.1", {"Fly-Client-IP": " 203.0.113.9 "}))
+    compressed = client_ip(_request("10.0.0.1", {"Fly-Client-IP": "2001:0db8::0001"}))
+    assert padded == "203.0.113.9"
+    assert compressed == "2001:db8::1"
 
 
 # --- moving window ---

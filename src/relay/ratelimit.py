@@ -12,6 +12,7 @@ middleware — see auth.py for why streaming responses make middleware unusable
 for rejections.
 """
 
+import ipaddress
 import itertools
 import logging
 import math
@@ -83,9 +84,21 @@ def client_ip(request: Request) -> str:
     fully client-controlled, so an attacker mints a fresh bucket per request.
     """
     if settings.trust_proxy_header:
-        forwarded = request.headers.get("fly-client-ip")
-        if forwarded:
-            return forwarded
+        # Last value wins: only the nearest proxy's append is authoritative, and a
+        # client-supplied duplicate can only ever arrive ahead of it.
+        values = request.headers.getlist("fly-client-ip")
+        if values:
+            candidate = values[-1].strip()
+            try:
+                # Parsing normalises the value and rejects anything that is not an
+                # address — an unvalidated string becomes its own bucket, and a
+                # "/" in it would inject extra segments into the limiter's key.
+                return str(ipaddress.ip_address(candidate))
+            except ValueError:
+                logger.warning(
+                    "ratelimit.bad_proxy_header",
+                    extra={"ctx": {"value": candidate[:64]}},
+                )
     return request.client.host if request.client else "unknown"
 
 
