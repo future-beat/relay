@@ -908,23 +908,29 @@ This is not a rename phase, but it introduces secrets and published values that 
 | A6 | The `guardrail` event shape (`guard`/`tool`/`expected_ticket_id`/`supplied_ticket_id`/`action`) is what Phase 4 EVAL-02 and Phase 5/6 drill-down will want | Pattern 4 | A later reshape is an SSE contract change. Cheap to get right now; confirm the field names with the Phase 4/5 consumer intent |
 | A7 | `MemoryStorage.reset()` fully clears all buckets (not just expired entries) | Pitfall 6 | If it only prunes, tests stay order-dependent. Signature verified (`(self) -> int | None`) but semantics not executed end-to-end — **verify in the first `test_ratelimit.py` test** |
 
-## Open Questions
+## Open Questions (RESOLVED)
 
-1. **What triggers a 403? SEC-01 requires "401 vs 403 semantics are correct," but D-07 defines no owner-only route.**
+> All four questions were resolved by the planner on 2026-08-06 and locked into the phase plans. Resolutions are recorded inline below.
+
+1. **RESOLVED (plan 01-03) — What triggers a 403? SEC-01 requires "401 vs 403 semantics are correct," but D-07 defines no owner-only route.**
+   - **Resolution:** the recommendation was adopted. `require_tier(*allowed)` is implemented as a factory and applied as `require_tier("owner", "demo")` on all three protected routes; the 403 branch is unit-tested by calling `require_tier("owner")` directly with a demo key. No fake admin endpoint was created.
    - What we know: 401 = unauthenticated (missing/unknown key, MUST carry `WWW-Authenticate`); 403 = authenticated but not permitted. FastAPI's historic bug was returning 403 for *unauthenticated*, which 0.141.1 has fixed. Both tiers are permitted on all three protected routes, so 403 is currently unreachable through any route.
    - What's unclear: whether to invent an owner-only surface just to exercise 403.
    - **Recommendation:** implement `require_tier(*allowed)` as a factory (Example 1). Apply `require_tier("owner", "demo")` to all three routes today, and unit-test the 403 branch by calling `require_tier("owner")` directly with a demo key. This satisfies "semantics are correct" with real code coverage and zero invented endpoints. Do **not** create a fake admin route.
 
-2. **Should `GET /tickets/{id}` be rate-limited at all, and should the demo tier see other visitors' tickets?**
+2. **RESOLVED (plans 01-03, 01-05) — Should `GET /tickets/{id}` be rate-limited at all, and should the demo tier see other visitors' tickets?**
+   - **Resolution:** the recommendation was adopted. A loose read limit applies (120/hour demo, 600/hour owner), the enumeration exposure is documented as an accepted risk in the README threat-model paragraph, and per-tier ticket ownership is deferred to Phase 5/6.
    - What we know: D-07 puts it behind a key. It leaks `customer_email` and full ticket bodies of any ticket id, and the demo key is published (D-02), so effectively anyone can enumerate ticket bodies.
    - What's unclear: whether that matters for a demo seeded with fictional customers. Scoping demo reads to demo-created tickets needs a new `tickets` column — real scope creep, and Phase 5/6 territory.
    - **Recommendation:** apply a loose limit (120/hour demo) this phase, note the enumeration exposure in the README threat-model paragraph, and defer per-tier ticket ownership. Confirm with the user during planning.
 
-3. **Where exactly does the published demo key live on the dashboard?**
+3. **RESOLVED (plan 01-05) — Where exactly does the published demo key live on the dashboard?**
+   - **Resolution:** the recommendation was adopted. The key is rendered from `settings.demo_key` at serve time rather than hardcoded, so README, dashboard, and the accepted key cannot drift.
    - What we know: D-02 says README *and* dashboard. The dashboard is currently a Python string constant (`DASHBOARD_HTML`, `src/relay/main.py:112`), and Phase 6 replaces it with Jinja2 templates.
    - **Recommendation:** add a single line to `DASHBOARD_HTML` this phase (cheap, and Phase 6 will move it anyway), sourced from `settings.demo_key` rather than hardcoded, so README and dashboard cannot drift.
 
-4. **Is `guardrail` the right event name, given Phase 5 will persist `run_events`?**
+4. **RESOLVED (plan 01-02) — Is `guardrail` the right event name, given Phase 5 will persist `run_events`?**
+   - **Resolution:** the recommendation was adopted. `guardrail` is retained with a `guard` discriminator field inside `data`, so future guard types (e.g. RAG-04 citation validation) reuse the type rather than adding new ones.
    - Low risk, but the name becomes part of the SSE contract. `guardrail` reads well and is generic enough to carry future denials (policy denials, citation-validation failures in RAG-04). **Recommendation:** keep `guardrail` with a `guard` discriminator field inside `data` (as in Example 5) so future guard types don't need new event types.
 
 ## State of the Art
