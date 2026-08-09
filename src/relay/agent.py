@@ -10,6 +10,11 @@ Guardrails enforced here (phase 2):
 - API failures end the run with a structured error event, never a stack trace
   (transient 429/5xx are already retried inside the SDK)
 
+Guardrails enforced here (phase 1, remaster):
+- the run's ticket_id is bound server-side: a ticket body is untrusted input and
+  the model's tool arguments are therefore untrusted output, so a tool call
+  naming a different ticket is denied before execution rather than rebound
+
 Observability (phase 4): every run is an OpenTelemetry `agent.run` span with
 one child span per model request and per tool execution, and each step emits
 a structured JSON log line.
@@ -37,8 +42,14 @@ logger = logging.getLogger("relay.agent")
 tracer = trace.get_tracer("relay")
 
 
-def _execute_guarded(spec: ToolSpec | None, name: str, raw_input: dict[str, Any],
-                     policy: ToolPolicy) -> tuple[str, bool]:
+def _execute_guarded(
+    spec: ToolSpec | None,
+    name: str,
+    raw_input: dict[str, Any],
+    policy: ToolPolicy,
+    *,
+    bound_ticket_id: int | None = None,
+) -> tuple[str, bool]:
     """Run one tool call through the guardrail chain. Returns (result_json, is_error)."""
     if spec is None:
         return json.dumps({"error": f"unknown tool {name}"}), True
@@ -49,6 +60,27 @@ def _execute_guarded(spec: ToolSpec | None, name: str, raw_input: dict[str, Any]
         validated = validate_tool_input(spec.input_model, raw_input)
     except ToolInputError as exc:
         return json.dumps({"error": str(exc)}), True
+    # Server truth beats model output: validation first so the comparison runs on a
+    # coerced int, and before execution so this is a choke point, not an audit log.
+    # bound_ticket_id is None on the MCP path, where there is no "current run".
+    supplied_ticket_id = validated.get("ticket_id")
+    if (
+        bound_ticket_id is not None
+        and supplied_ticket_id is not None
+        and supplied_ticket_id != bound_ticket_id
+    ):
+        # Phrased as a retry instruction, not a refusal: a refusal makes the model
+        # give up, the run ends without a terminal action, and the eval gate regresses.
+        return json.dumps({
+            "error": (
+                f"ticket_id {supplied_ticket_id} is not this run's ticket."
+                f" This run may only act on ticket {bound_ticket_id}."
+                f" Retry with ticket_id={bound_ticket_id}."
+            ),
+            "denied_by": "ticket_binding",
+            "expected_ticket_id": bound_ticket_id,
+            "supplied_ticket_id": supplied_ticket_id,
+        }), True
     try:
         return spec.execute(**validated), False
     except Exception as exc:  # noqa: BLE001 — surfaced to the model, not swallowed
@@ -157,14 +189,41 @@ async def run_ticket(
                     with tracer.start_as_current_span(
                         f"tool.{block.name}", context=run_ctx
                     ) as span:
-                        result, is_error = _execute_guarded(spec, block.name, block.input, policy)
+                        # Bound at call time from this run's own ticket — never stored on
+                        # the registry, which is built once and shared by every live run.
+                        result, is_error = _execute_guarded(
+                            spec, block.name, block.input, policy,
+                            bound_ticket_id=ticket["id"],
+                        )
+                        payload = json.loads(result)
+                        binding_violation = (
+                            is_error and payload.get("denied_by") == "ticket_binding"
+                        )
                         span.set_attributes({
                             "relay.tool.tier": spec.tier if spec else "unknown",
                             "relay.tool.is_error": is_error,
+                            "relay.tool.binding_violation": binding_violation,
                         })
                     logger.info("tool.executed", extra={"ctx": {
                         "ticket_id": ticket["id"], "tool": block.name, "is_error": is_error,
                     }})
+                    if binding_violation:
+                        logger.warning("guardrail.ticket_id_mismatch", extra={"ctx": {
+                            "ticket_id": ticket["id"],
+                            "tool": block.name,
+                            "supplied_ticket_id": payload["supplied_ticket_id"],
+                        }})
+                        # Cause before effect: the stream shows the denial, then its result.
+                        yield AgentEvent(
+                            type="guardrail",
+                            data={
+                                "guard": "ticket_binding",
+                                "tool": block.name,
+                                "expected_ticket_id": payload["expected_ticket_id"],
+                                "supplied_ticket_id": payload["supplied_ticket_id"],
+                                "action": "denied",
+                            },
+                        )
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -177,7 +236,7 @@ async def run_ticket(
                         type="tool_result",
                         data={
                             "tool": block.name,
-                            "result": json.loads(result),
+                            "result": payload,
                             "is_error": is_error,
                         },
                     )
