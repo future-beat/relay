@@ -1,6 +1,19 @@
-"""SQLite storage. Phase 1 uses the stdlib driver; Postgres comes with deployment (phase 6)."""
+"""SQLite storage, and the module that owns connection ownership and transaction boundaries.
+
+Phase 1 used the stdlib driver directly: one `sqlite3.Connection` shared by every
+request, which was only accidentally correct because access was single-threaded.
+Phase 2 offloads DB work to worker threads, so that accident becomes a bug — `commit()`
+is connection-scoped, meaning one request can commit another's half-finished write.
+
+So the connection is no longer handed out. `connect()` returns a `Database` that keeps
+it private behind a re-entrant lock, materialises every result before releasing that
+lock, and exposes `transaction()` as the only way to group statements. Postgres comes
+with deployment (phase 6); until then this class is the concurrency story.
+"""
 
 import sqlite3
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 SCHEMA = """
@@ -48,6 +61,10 @@ CREATE TABLE IF NOT EXISTS replies (
     body       TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- spent_today() sums today's runs on the event loop for every gated request; without
+-- this it is a full table scan that grows for the life of the Fly volume.
+CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at);
 """
 
 SEED_CUSTOMERS = [
@@ -58,14 +75,113 @@ SEED_CUSTOMERS = [
 ]
 
 
-def connect(db_path: str | Path) -> sqlite3.Connection:
+class Result:
+    """A materialised query result covering the slice of sqlite3.Cursor this codebase uses.
+
+    Rows are fetched while Database's lock is still held. Returning the real cursor
+    instead lets the caller step it *after* the lock is released, so a concurrent
+    statement on the same connection interleaves with an in-flight read — which
+    surfaces not as `sqlite3.OperationalError: database is locked` but as rows with
+    null and empty-string columns (measured: `customer_email=None`, `status=''`).
+    That silent corruption is the entire reason this class exists.
+    """
+
+    __slots__ = ("_i", "_rows", "description", "lastrowid", "rowcount")
+
+    def __init__(self, rows, lastrowid, rowcount, description):
+        self._rows, self._i = rows, 0
+        self.lastrowid, self.rowcount, self.description = lastrowid, rowcount, description
+
+    def fetchone(self) -> sqlite3.Row | None:
+        if self._i >= len(self._rows):
+            return None
+        self._i += 1
+        return self._rows[self._i - 1]
+
+    def fetchall(self) -> list[sqlite3.Row]:
+        rows, self._i = self._rows[self._i:], len(self._rows)
+        return rows
+
+    def fetchmany(self, size: int = 1) -> list[sqlite3.Row]:
+        rows = self._rows[self._i:self._i + size]
+        self._i += len(rows)
+        return rows
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class Database:
+    """The single owner of the process's SQLite connection.
+
+    The connection is private: nothing outside this class can issue a statement
+    without holding the lock, which is what makes commit() this object's business
+    rather than five call sites' business. The lock is re-entrant because
+    transaction() calls execute() from inside its own critical section.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+        self._lock = threading.RLock()
+
+    def _run(self, method: str, *args) -> Result:
+        with self._lock:
+            cur = getattr(self._conn, method)(*args)
+            return Result(cur.fetchall(), cur.lastrowid, cur.rowcount, cur.description)
+
+    def execute(self, sql: str, params=()) -> Result:
+        return self._run("execute", sql, params)
+
+    def executemany(self, sql: str, seq) -> Result:
+        return self._run("executemany", sql, seq)
+
+    def executescript(self, script: str) -> Result:
+        return self._run("executescript", script)
+
+    def commit(self) -> None:
+        with self._lock:
+            self._conn.commit()
+
+    def rollback(self) -> None:
+        with self._lock:
+            self._conn.rollback()
+
+    def close(self) -> None:
+        with self._lock:
+            self._conn.close()
+
+    @contextmanager
+    def transaction(self):
+        """Hold the connection for one unit of work.
+
+        commit() is connection-scoped, so an INSERT+UPDATE pair that releases the lock
+        between statements can be committed halfway through by another request — and
+        its own rollback then undoes nothing. BaseException, not Exception: a bare
+        `except Exception` lets a CancelledError escape with the transaction still open.
+        """
+        with self._lock:
+            try:
+                yield self
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+
+
+def connect(db_path: str | Path) -> Database:
     conn = sqlite3.connect(db_path, check_same_thread=False)
     conn.row_factory = sqlite3.Row
+    # Silently a no-op on :memory: — SQLite returns 'memory' and raises nothing.
+    # tests/test_db.py asserts that, so nobody "fixes" it against the wrong fixture.
+    conn.execute("PRAGMA journal_mode = WAL")
+    # Python's sqlite3 already derives 5000 ms from connect(timeout=5.0); stated
+    # explicitly so a future timeout= change cannot silently zero it.
+    conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+    return Database(conn)
 
 
-def init_db(conn: sqlite3.Connection) -> None:
+def init_db(conn: Database) -> None:
     conn.executescript(SCHEMA)
     existing = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
     if existing == 0:
