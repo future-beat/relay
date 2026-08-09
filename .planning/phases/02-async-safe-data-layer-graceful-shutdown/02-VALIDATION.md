@@ -1,9 +1,9 @@
 ---
 phase: 2
 slug: async-safe-data-layer-graceful-shutdown
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: planned
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-08-09
 ---
 
@@ -103,4 +103,4 @@ present in `docker logs`.
 - [ ] Concurrency test green 5 consecutive runs
 - [ ] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** covered by plans 02-01..02-05 (2026-08-09)
