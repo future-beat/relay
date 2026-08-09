@@ -25,10 +25,12 @@ from helpers import (
 )
 from relay.agent import run_ticket
 from relay.config import settings
-from relay.main import app, process_ticket
+from relay.db import connect
+from relay.main import app, lifespan, process_ticket
 from relay.mcp_server import build_mcp_registry
 from relay.ratelimit import reserved_usd
 from relay.runs import RunRegistry
+from relay.telemetry import record_run
 
 _REPO_ROOT = Path(__file__).parent.parent
 _KB_DIR = _REPO_ROOT / "kb"
@@ -81,6 +83,106 @@ async def test_drain_times_out_rather_than_hanging_shutdown():
     assert drained is False
     assert registry.active == 1
     assert registry.draining is True
+
+
+# --- the drain as lifespan actually wires it ---
+#
+# Everything above builds its own RunRegistry and calls drain() by hand, which tests the
+# primitive and nothing about the deliverable. Both mutations that matter — deleting the
+# drain from lifespan, and moving it after conn.close() (Pitfall 5, exactly) — left the
+# whole suite green. The two tests below are the ones that fail on each.
+
+
+async def _lifespan_against_a_scratch_database(monkeypatch, tmp_path):
+    """Point the app at a throwaway file and hand back the real lifespan."""
+    monkeypatch.setattr(settings, "db_path", tmp_path / "shutdown.db")
+    # The client fixture sets this too; lifespan constructs AsyncAnthropic either way.
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    return lifespan(app)
+
+
+async def test_lifespan_drains_before_it_closes_the_connection(monkeypatch, tmp_path):
+    # SC-3/SC-4's ordering, asserted as ordering. The run is deregistered on a timer
+    # from outside the lifespan so the drain has something to actually wait for —
+    # against an empty registry drain() takes its fast path and proves nothing.
+    order: list[str] = []
+
+    async with await _lifespan_against_a_scratch_database(monkeypatch, tmp_path):
+        runs = app.state.runs
+        token = runs.register(ticket_id=1)
+        real_close = app.state.conn.close
+
+        def recording_close() -> None:
+            order.append("close")
+            real_close()
+
+        monkeypatch.setattr(app.state.conn, "close", recording_close)
+
+        async def finish_the_run_after_shutdown_has_begun() -> None:
+            await asyncio.sleep(0.05)
+            order.append("deregistered")
+            runs.deregister(token)
+
+        task = asyncio.create_task(finish_the_run_after_shutdown_has_begun())
+        assert runs.active == 1, "nothing in flight — the drain below would be vacuous"
+
+    await task
+    assert order == ["deregistered", "close"], (
+        "lifespan closed the connection without waiting for the in-flight run"
+    )
+
+
+async def test_lifespan_shutdown_lets_an_in_flight_run_finish_writing_its_row(
+    monkeypatch, tmp_path
+):
+    # The same ordering as the test above, but asserted through its consequence rather
+    # than through call order: a run still in flight at shutdown must be able to reach
+    # the database. Close first and its write raises "Cannot operate on a closed
+    # database" and the row — spend the daily ceiling can never see again — is lost.
+    # That is Pitfall 5, and it is the reason the drain exists at all.
+    db_path = tmp_path / "shutdown.db"
+    failures: list = []
+
+    async with await _lifespan_against_a_scratch_database(monkeypatch, tmp_path):
+        conn = app.state.conn
+        runs = app.state.runs
+        token = runs.register(ticket_id=7)
+
+        async def finish_the_run_the_way_event_stream_does() -> None:
+            await asyncio.sleep(0.05)
+            try:
+                record_run(
+                    conn,
+                    ticket_id=7,
+                    model="test-model",
+                    duration_ms=1,
+                    steps=1,
+                    input_tokens=1000,
+                    output_tokens=500,
+                    cost_usd=0.021,
+                    outcome="incomplete",
+                )
+            except BaseException as exc:  # noqa: BLE001 — reported below, not swallowed
+                failures.append(exc)
+            finally:
+                runs.deregister(token)
+
+        task = asyncio.create_task(finish_the_run_the_way_event_stream_does())
+
+    await task
+    assert failures == [], f"the in-flight run's write hit a closed database: {failures}"
+    assert runs.active == 0
+
+    # Re-opened from disk: the point is that the row is durable, not that it was
+    # visible on a connection the shutdown was supposed to have closed by now.
+    verify = connect(db_path)
+    try:
+        rows = verify.execute("SELECT ticket_id, cost_usd FROM runs").fetchall()
+    finally:
+        verify.close()
+    assert len(rows) == 1
+    assert rows[0]["ticket_id"] == 7
+    assert rows[0]["cost_usd"] == 0.021
 
 
 # --- the sync executor contract ---
