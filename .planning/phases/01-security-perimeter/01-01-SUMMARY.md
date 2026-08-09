@@ -126,6 +126,10 @@ None.
 - **Blocker for plan 01-03:** `limits` must be installed into the main venv after this merge (see Issues Encountered).
 - Plan 01-05 inherits the README MCP-opt-in correction (`README.md:84-85` still says set `=false` for read-only).
 
+## Self-Check: PASSED
+
+All five modified files and the summary exist on disk; all five commits (`f9c49af`, `c5118b9`, `b23ca38`, `24396d8`, `4bc4260`) are present in the branch log; working tree clean.
+
 ---
 *Phase: 01-security-perimeter*
 *Completed: 2026-08-09*
