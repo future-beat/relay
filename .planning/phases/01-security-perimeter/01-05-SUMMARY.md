@@ -3,7 +3,7 @@ phase: 01-security-perimeter
 plan: 05
 subsystem: security-perimeter
 tags: [auth, docs, dashboard, demo-key, readme, fly]
-status: incomplete-awaiting-human-verification
+status: complete
 requires:
   - "relay.config.settings.demo_key — from plan 01-01"
   - "relay.main._gate / create_gate / read_gate / process_gate — from plan 01-04"
@@ -35,7 +35,7 @@ key-decisions:
   - "REQUIREMENTS.md deliberately NOT updated: the plan's blocking human checkpoint has not run, so no requirement in this plan's frontmatter can honestly be marked complete yet"
 patterns-established:
   - "Single-source published credential: dashboard reads settings, README carries exactly one greppable literal, deploy note ties them together"
-requirements-completed: []  # NOT marked — Task 4 checkpoint outstanding. See "Requirements status" below.
+requirements-completed: [SEC-01, SEC-02, SEC-03, SEC-06]  # marked after Task 4 human verification passed 2026-08-09
 metrics:
   duration: ~5 min (autonomous tasks only; checkpoint pending)
   tasks: 3 of 4
@@ -49,9 +49,43 @@ metrics:
 
 **The demo key is now published on the dashboard from `settings.demo_key` and once in the README, `scripts/demo.sh` authenticates both of its calls, and the README documents every tier, limit, accepted risk and the pre-deploy secrets step — but the plan's blocking human end-to-end verification has not run, so this plan is NOT complete.**
 
-## Status: INCOMPLETE — awaiting human verification
+## Status: COMPLETE — human verification passed 2026-08-09
 
-Tasks 1-3 are done and committed. **Task 4 (`checkpoint:human-verify`, `gate="blocking"`) has not started.** It requires a real Claude API run and a paid eval pass (`python -m relay.evals --limit 3`), neither of which an executor may run or fabricate. The plan cannot be marked complete, and the phase cannot advance, until a human works through `<how-to-verify>` and returns the resume signal.
+Tasks 1-3 were committed autonomously. **Task 4 (`checkpoint:human-verify`, `gate="blocking"`) passed on 2026-08-09.**
+
+### Task 4 verification record
+
+**Eval suite** — run by the human, report `eval_results/eval-20260809T095909Z.json`:
+
+| Metric | Result |
+|--------|--------|
+| Cases | 3 |
+| Passed | 3 (pass_rate 1.0) |
+| Mean quality | 5.0 |
+| Total cost | $0.075 |
+| Model | claude-sonnet-5 |
+
+Per-case: `rate-limits-pro` → `send_reply` (grounded), `refund-monthly` → `create_escalation` (grounded), `password-reset` → `send_reply` (grounded).
+
+**The signal the checkpoint was watching for:** zero `ended_without_action` outcomes, and both terminal paths exercised (reply and escalation). The plan flagged that a pass-rate drop concentrated in `ended_without_action` would mean the SEC-04 binding denial was worded too unrecoverably for the model to self-correct. That did not occur — the denial is recoverable, and grounding held on every case.
+
+**Perimeter checks** — run by the orchestrator against a live local uvicorn on an isolated database (`RELAY_DB_PATH` pointed at scratch; the working `relay.db` was never touched):
+
+| Check | Result |
+|-------|--------|
+| `/`, `/health`, `/metrics`, `/dashboard` without a key | public (307/200/200/200) |
+| `POST /tickets` with no key | 401 + `WWW-Authenticate: APIKey` |
+| `POST /tickets` with a wrong key | 401 |
+| `POST /tickets` with the demo key | 201 |
+| Demo key rendered on `/dashboard` | present, matches `settings.demo_key` |
+| Demo rate limit (20/hr on create) | 429 at request 21 |
+| 429 payload | friendly JSON + `Retry-After` + `X-RateLimit-Limit/Remaining/Reset` |
+| Owner tier during demo lockout | 201 — independent bucket confirmed |
+| Fail-closed (no keys configured) | `/health` 200, `POST /tickets` 503 |
+
+That last row closes Task 2's deferred criterion and confirms the Docker `HEALTHCHECK` and CI `curl -sf` smoke job survive the fail-closed default.
+
+**Still not verified (deploy-time, non-blocking):** the live Fly proxy's `Fly-Client-IP` behaviour from two networks, and that the README's `relay-demo-2026` literal matches what `fly secrets set RELAY_DEMO_KEY=...` actually sets — no code or test asserts that pairing.
 
 ### Continuation note
 
@@ -61,8 +95,8 @@ The original executor agent for this plan died mid-stream on an API error after 
 
 - **Duration:** ~5 min of autonomous execution (17:01:29 → 17:05:58 +0800), plus continuation overhead
 - **Started:** 2026-08-09T17:01:29+08:00 (first task commit)
-- **Completed:** not complete — Task 4 outstanding
-- **Tasks:** 3 of 4 complete
+- **Completed:** 2026-08-09 (Task 4 human verification passed)
+- **Tasks:** 4 of 4 complete
 - **Files modified:** 4
 
 ## Accomplishments
@@ -78,7 +112,7 @@ The original executor agent for this plan died mid-stream on an API error after 
 2. **Task 1 (GREEN): publish the demo key on the dashboard from settings** — `63d8145` (feat) — `src/relay/main.py`
 3. **Task 2: send the published demo key from `scripts/demo.sh`** — `ea54e24` (feat)
 4. **Task 3: document the security perimeter in the README** — `55e1770` (docs)
-5. **Task 4: end-to-end human verification** — **NOT STARTED** (blocking checkpoint)
+5. **Task 4: end-to-end human verification** — **PASSED** 2026-08-09 (no code commit; evidence recorded in the Status section — eval report `eval_results/eval-20260809T095909Z.json`, 3/3 pass, plus the live perimeter check table)
 
 TDD gate compliance for Task 1: `test(...)` at `e0804d5` precedes `feat(...)` at `63d8145`. No REFACTOR commit — none was needed.
 
