@@ -143,3 +143,7 @@ None. Every export listed in the plan's `<interfaces>` is fully implemented and 
 - The `client` fixture's `X-API-Key` header is currently inert; it becomes load-bearing the moment the gate is wired.
 - `tests/test_api.py::test_get_missing_ticket_404` still asserts 404 and will keep passing because the fixture authenticates. The separate unauthenticated-401 test belongs to plan 04 (research Pitfall 2).
 - `reserve_run()`/`release_run()` must be called from the handler's `try/finally` in `main.py`, never wrapped around the agent loop with `async with`.
+
+## Self-Check: PASSED
+
+All six claimed files exist on disk; all six claimed commit hashes (`b3df1e5`, `f26137c`, `653134e`, `30bc2d9`, `8430ce8`, `5d4ad15`) are present in the branch history.
