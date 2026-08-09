@@ -29,6 +29,16 @@ def conn():
 
 
 @pytest.fixture()
+def db(tmp_path):
+    # File-backed on purpose: PRAGMA journal_mode = WAL is a silent no-op on :memory:,
+    # so every WAL assertion written against the `conn` fixture would be vacuous.
+    db = connect(tmp_path / "relay.db")
+    init_db(db)
+    yield db
+    db.close()
+
+
+@pytest.fixture()
 def registry(conn):
     return build_registry(conn, KB_DIR)
 
