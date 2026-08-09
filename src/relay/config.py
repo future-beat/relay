@@ -45,5 +45,11 @@ class Settings(BaseSettings):
     price_in_per_mtok: float = 3.0
     price_out_per_mtok: float = 15.0
 
+    # Shutdown drain (phase 2 remaster). How long the lifespan waits for in-flight
+    # SSE runs before closing the database. Innermost of three nested windows: it
+    # nests inside uvicorn's --timeout-graceful-shutdown (20s), which nests inside
+    # fly.toml's kill_timeout (30s). Overshooting any of them means SIGKILL instead.
+    shutdown_drain_seconds: float = 5.0
+
 
 settings = Settings()
