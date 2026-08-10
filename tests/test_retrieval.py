@@ -13,6 +13,7 @@ import httpx
 import numpy as np
 import pytest
 
+from relay import retrieval
 from relay.config import settings
 from relay.retrieval import Doc, Index, headings, kb_sha256, load_index, retrieve, slug
 
@@ -185,7 +186,9 @@ def test_a_result_carries_every_anchor_of_the_whole_file_it_returns(index, kb_do
 
 def test_a_doc_without_headings_still_anchors_its_bare_name(monkeypatch):
     monkeypatch.setattr(settings, "voyage_api_key", None)
-    plain = Doc(doc="plain.md", headings=[], text="no headings anywhere in this file")
+    # The word repeats so the doc clears KEYWORD_MIN_SCORE — this test is about the
+    # anchor/id fallback for a heading-less doc, not about the keyword gate.
+    plain = Doc(doc="plain.md", headings=[], text="no headings; headings are absent here")
     index = Index(docs=[plain], matrix=None, model=settings.voyage_model, dim=DIM)
     results, _, _, _ = retrieve(index, "headings", floor=0.55)
     assert results[0]["anchors"] == ["plain.md"]
@@ -193,7 +196,9 @@ def test_a_doc_without_headings_still_anchors_its_bare_name(monkeypatch):
 
 def test_citation_id_falls_back_to_the_bare_doc_when_there_are_no_headings(monkeypatch):
     monkeypatch.setattr(settings, "voyage_api_key", None)
-    plain = Doc(doc="plain.md", headings=[], text="no headings anywhere in this file")
+    # The word repeats so the doc clears KEYWORD_MIN_SCORE — this test is about the
+    # anchor/id fallback for a heading-less doc, not about the keyword gate.
+    plain = Doc(doc="plain.md", headings=[], text="no headings; headings are absent here")
     index = Index(docs=[plain], matrix=None, model=settings.voyage_model, dim=DIM)
     results, _, _, _ = retrieve(index, "headings", floor=0.55)
     assert results[0]["heading"] is None
@@ -211,6 +216,151 @@ def test_query_path_sends_input_type_query(index, kb_docs, voyage):
     assert body["output_dimension"] == DIM
     assert calls[0]["headers"]["Authorization"] == "Bearer test-key"
     assert calls[0]["timeout"] == 10.0
+
+
+# --- the keyword half's own gate (CR-04) ----------------------------------------------
+
+# Every one of these is a way a real model might ask about something the KB does not
+# cover. Under the ungated scorer, the two-word topical forms returned `[]` and the
+# natural-sentence forms returned the ENTIRE knowledge base as citable grounding —
+# so whether the agent escalated (D-03/D-04) came down to how it happened to phrase
+# itself, not to whether the answer existed.
+UNCOVERED_QUERIES = [
+    "Salesforce integration",
+    "Salesforce CRM sync",
+    "integrate with Salesforce",
+    "Do you integrate with Salesforce for our CRM pipeline?",
+    "Can you tell me if there is a Salesforce connector",
+    "is Salesforce supported",
+    "any plan to support Salesforce?",
+    "we would like to sync tickets to Salesforce",
+    "third-party CRM integrations roadmap",
+    "Does the product work on Mars?",
+    "what about Mars colonization support",
+    "kubernetes cluster autoscaling",
+    "how do I bake sourdough bread",
+]
+
+# (query, the doc that must still come back). Model-style phrasings from 03-06's
+# measured table. These ride on the keyword half alone here — no key, no vectors —
+# which is what the calibration assumed when it put the floor above `uptime SLA
+# guarantee` (0.2659) and left that case to this side of the union.
+COVERED_QUERIES = [
+    ("uptime SLA guarantee", "billing.md"),
+    ("what is your uptime SLA guarantee for Enterprise", "billing.md"),
+    ("export data", "account.md"),
+    ("API rate limits Pro plan", "api.md"),
+    ("password reset", "account.md"),
+    ("webhooks availability plan", "api.md"),
+    ("two-factor authentication lost recovery codes lockout", "account.md"),
+    ("refund policy billing charge", "billing.md"),
+    ("API key suspended", "api.md"),
+    ("downgrade plan data retention projects", "billing.md"),
+    ("SAML SSO configuration", "account.md"),
+    ("refund policy", "billing.md"),
+    ("webhook retry", "api.md"),
+]
+
+
+@pytest.fixture()
+def keyword_index(kb_docs) -> Index:
+    """The real KB with no vectors — the keyword half of the union, isolated."""
+    return Index(docs=kb_docs, matrix=None, model=settings.voyage_model, dim=DIM)
+
+
+@pytest.mark.parametrize("query", UNCOVERED_QUERIES)
+def test_an_uncovered_ask_returns_nothing_however_it_is_phrased(keyword_index, query):
+    results, _, _, _ = retrieve(keyword_index, query, key=None)
+    assert results == [], f"{query!r} returned {[r['doc'] for r in results]} to cite"
+
+
+@pytest.mark.parametrize(("query", "expected"), COVERED_QUERIES)
+def test_a_covered_ask_still_reaches_its_doc_through_the_keyword_half(
+    keyword_index, query, expected
+):
+    # The other direction of the same gate. A filter that only ever returns [] would
+    # pass the test above and destroy retrieval; 03-06's floor was calibrated on the
+    # assumption that these keep arriving.
+    results, _, _, _ = retrieve(keyword_index, query, key=None)
+    assert expected in [r["doc"] for r in results], f"{query!r} lost {expected}"
+
+
+def test_the_whole_ticket_body_form_of_an_uncovered_ask_returns_nothing_either(
+    keyword_index,
+):
+    """03-06 recorded this as the residual risk the semantic floor could not cover.
+
+    If the model passes the ticket text instead of a topical phrase, the old scorer
+    matched every doc on its phrasing words (account:6, billing:4, api:3) and the
+    union returned them regardless of the floor. `salesforce-integration` is the
+    golden case whose escalation depended on it.
+    """
+    body = (
+        "Salesforce integration? Does Lanekeep integrate with Salesforce? "
+        "We need two-way sync of tasks and contacts for our sales team."
+    )
+    results, _, _, _ = retrieve(keyword_index, body, key=None)
+    assert results == []
+
+
+def _two_doc_index(first: str, second: str = "unrelated words entirely") -> Index:
+    """Two docs so IDF is meaningful — a term in one of them is discriminating."""
+    return Index(
+        docs=[
+            Doc(doc="a.md", headings=[], text=first),
+            Doc(doc="b.md", headings=[], text=second),
+        ],
+        matrix=None,
+        model=settings.voyage_model,
+        dim=DIM,
+    )
+
+
+def test_a_term_cannot_score_inside_a_longer_word():
+    """The word-START anchor, isolated.
+
+    Unanchored, `port` counts four times inside `support` and clears the gate on IDF
+    alone. This is the same mechanism that let `and` score inside `standard` — and
+    IDF does not save you here, because the term is concentrated in one doc rather
+    than spread across the corpus.
+    """
+    index = _two_doc_index("support support support support")
+    assert retrieve(index, "port", key=None)[0] == []
+    # The anchor is a prefix, not a whole word: `refund` must keep matching `refunds`,
+    # which the hybrid union depends on.
+    assert [r["doc"] for r in retrieve(_two_doc_index("refunds " * 4), "refund", key=None)[0]] == [
+        "a.md"
+    ]
+
+
+def test_stopwords_are_dropped_even_where_idf_would_not_catch_them():
+    """The stopword list, isolated.
+
+    On the committed KB `the` sits in every doc and IDF already zeroes it, which
+    hides the fact that this gate does anything. Concentrate it in one doc and it
+    becomes a perfectly discriminating term scoring 3.47 — a query made only of
+    phrasing words would return a doc to cite.
+    """
+    index = _two_doc_index("the the the the the")
+    assert retrieve(index, "the", key=None)[0] == []
+    assert retrieve(index, "what does this have to do with that", key=None)[0] == []
+
+
+def test_the_keyword_gate_sits_between_the_measured_bands(keyword_index):
+    """CR-04's floor is a measurement, not a knob — moving it re-opens a real bug.
+
+    Measured on the committed KB: the off-topic band tops out at 1.10 (the
+    salesforce-integration ticket body) and the covered band bottoms at 2.197
+    (`uptime SLA guarantee` on billing.md, the query 03-06 deliberately left to this
+    half of the union). Below 1.11 the escalation signal leaks; above 2.19 the
+    calibrated floor starves its one dependent case.
+    """
+    assert 1.11 <= retrieval.KEYWORD_MIN_SCORE <= 2.19
+    scores = {
+        r["doc"]: r["score"]
+        for r in retrieve(keyword_index, "uptime SLA guarantee", key=None)[0]
+    }
+    assert scores["billing.md"] == pytest.approx(2.197, abs=0.01)
 
 
 # --- kb_sha256 and the index artifact -------------------------------------------------

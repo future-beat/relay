@@ -20,6 +20,7 @@ local baseline) and "Voyage was tried and failed" (RAG-05).
 import hashlib
 import json
 import logging
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,6 +43,38 @@ REQUEST_ATTEMPTS = 2  # one call plus one manual retry
 
 _HEADING_RE = re.compile(r"^##?\s+(.*)$", re.MULTILINE)
 _WORD_RE = re.compile(r"\w+")
+
+# The keyword half of the union needs a gate of its own or the union can never be
+# empty, and `[]` is the entire escalation signal (D-03/D-04). Measured against the
+# real KB with the weighting below, not guessed:
+#
+#   off-topic band, max 1.10 — every Salesforce/Mars/kubernetes phrasing tried,
+#     INCLUDING the whole-ticket-body form (`salesforce-integration` subject+body,
+#     1.10 on account.md) that 03-06 recorded as the residual risk the semantic
+#     floor could not cover. It scored account:6 billing:4 api:3 before this.
+#   covered band, min 2.197 — `uptime SLA guarantee` on billing.md, which is the
+#     binding case: at 0.2659 it is the one covered golden query measured BELOW the
+#     0.30 semantic floor, so the keyword half is the only thing returning it.
+#     `pro-pricing` subject+body is next at 2.20.
+#
+# 2.0 sits in that gap. Raising it to 2.5 starves enterprise-sla; the 03-06
+# calibration depends on that not happening, and tests/test_retrieval.py pins it.
+KEYWORD_MIN_SCORE = 2.0
+
+# Corpus-independent phrasing words. IDF below removes whatever else is ubiquitous in
+# a particular KB; this removes what is ubiquitous in English questions, which matters
+# most exactly when the KB is small and `log(N/df)` is coarse.
+_STOPWORDS = frozenset({
+    "about", "after", "all", "also", "and", "any", "are", "been", "but", "can",
+    "could", "did", "does", "doing", "done", "for", "from", "get", "getting", "had",
+    "has", "have", "her", "here", "him", "his", "how", "into", "its", "just", "like",
+    "may", "more", "most", "much", "must", "need", "not", "now", "off", "once", "one",
+    "only", "our", "out", "over", "own", "please", "said", "same", "she", "should",
+    "some", "such", "than", "that", "the", "their", "them", "then", "there", "these",
+    "they", "this", "those", "through", "too", "under", "use", "using", "very", "was",
+    "way", "were", "what", "when", "where", "which", "while", "who", "why", "will",
+    "with", "would", "you", "your",
+})
 
 # Sentinel so `key=None` can mean "no credential, use keyword search" while an
 # omitted argument still means "read whatever settings currently holds".
@@ -273,14 +306,53 @@ def _embed_query(query: str, *, key: str, model: str, dim: int) -> np.ndarray | 
     return None
 
 
-def _keyword_hits(docs: list[Doc], query: str) -> list[tuple[int, float]]:
-    """The phase-1 scorer, moved here verbatim: term counts, hits only, best first."""
+def _keyword_hits(
+    docs: list[Doc], query: str, *, min_score: float = KEYWORD_MIN_SCORE
+) -> list[tuple[int, float]]:
+    """Score every doc lexically; return the ones clearing `min_score`, best first.
+
+    The phase-1 scorer this replaces had no gate at all — any doc matching any term
+    once was a hit, and those hits entered the union without ever meeting the
+    calibrated semantic floor. Since it also kept `the`/`and`/`for` as search terms
+    and counted unanchored substrings, essentially every multi-word natural query
+    matched every document, and the `[]`-means-escalate signal (D-03/D-04) came down
+    to how the model happened to phrase itself: `Salesforce integration` returned
+    `[]`, `integrate with Salesforce` returned the whole KB, and
+    `Does the product work on Mars?` returned all three docs as citable grounding.
+
+    Three gates, in increasing order of how much they do:
+
+    1. Stopwords, so the phrasing words a natural question is made of are not terms.
+    2. A word-START anchor rather than a bare substring, so `and` stops scoring
+       inside `standard`. Deliberately not `\\b...\\b`: `refund` has to keep matching
+       `refunds` and `webhook` has to keep matching `webhooks`, which whole-word
+       matching breaks and which the hybrid union (D-05) depends on.
+    3. IDF weighting, `log(N/df)`, which is what actually kills the paraphrases.
+       A term present in every doc discriminates nothing and scores exactly 0, so
+       `product`/`work`/`support` cannot carry an off-topic query over the floor,
+       and this stays true as the KB grows instead of needing a hand-maintained
+       list of domain-generic words. On a single-doc corpus IDF is degenerate (every
+       term is in every doc), so weights fall back to raw counts — otherwise a
+       one-file KB would be permanently unsearchable.
+    """
     terms = _terms(query)
-    scored = [
-        (position, float(sum(doc.text.lower().count(term) for term in terms)))
-        for position, doc in enumerate(docs)
+    if not terms:
+        return []
+    blobs = [doc.text.lower() for doc in docs]
+    total = len(docs)
+    scored = [0.0] * total
+    for term in terms:
+        pattern = re.compile(r"\b" + re.escape(term))
+        counts = [len(pattern.findall(blob)) for blob in blobs]
+        matched = sum(1 for count in counts if count)
+        if not matched:
+            continue
+        weight = math.log(total / matched) if total > 1 else 1.0
+        for position, count in enumerate(counts):
+            scored[position] += count * weight
+    hits = [
+        (position, score) for position, score in enumerate(scored) if score >= min_score
     ]
-    hits = [(position, score) for position, score in scored if score > 0]
     hits.sort(key=lambda pair: (-pair[1], pair[0]))
     return hits
 
@@ -349,7 +421,8 @@ def _sections(text: str) -> list[tuple[str, str]]:
 
 
 def _terms(query: str) -> list[str]:
-    return [t for t in _WORD_RE.findall(query.lower()) if len(t) > 2]
+    """Search terms: words over 2 chars that are not English question scaffolding."""
+    return [t for t in _WORD_RE.findall(query.lower()) if len(t) > 2 and t not in _STOPWORDS]
 
 
 def _normalize_rows(matrix: np.ndarray) -> np.ndarray:

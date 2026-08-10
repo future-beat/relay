@@ -59,7 +59,10 @@ def test_search_docs_returns_whole_files_never_chunks(registry):
 
 
 def test_search_docs_no_match(registry):
-    result = json.loads(registry["search_docs"].execute(query="zzzzz qqqqq"))
+    # A question a real model would actually emit, not `zzzzz qqqqq` — gibberish
+    # passed this for the wrong reason while every natural phrasing of the same
+    # uncovered ask returned the whole KB (CR-04).
+    result = json.loads(registry["search_docs"].execute(query="Do you integrate with Salesforce?"))
     # Empty results are the escalation signal (D-03) — never a fabricated best guess.
     assert result["results"] == []
     assert result["retrieval_mode"] == "keyword"
