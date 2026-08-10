@@ -36,6 +36,12 @@ Replace `search_docs`'s keyword scorer with semantic retrieval over a committed 
 ### Eval acceptance
 - **D-11:** Run the **full 12-case** eval suite before and after, same model, diff per-case. This is the one phase where evals are the primary acceptance gate, not a regression guard. Real Voyage+Claude spend is approved.
 
+### Resolved after research (orchestrator decisions, 2026-08-10)
+- **D-12 — `citations` is OPTIONAL, subset-validated.** D-07 rejects a reply citing an id *not retrieved*; that is subset-validation (`cited ⊆ retrieved`), not "must cite ≥1". Making the argument optional (`default_factory=list`) keeps ~7 existing test files green (empty ⊆ retrieved always passes) and confines the SEC-04-style recoverable denial to the real failure — a hallucinated source. Requiring a citation would break those files and needlessly sharpen the `ended_without_action` eval trap. Optional it is.
+- **D-13 — citation `heading` is a best-effort lexical locator.** For a whole-file result, derive the heading by best-overlap against the doc's `##` sections, parsed once at index-build time; `id = "{doc}#{slug}"`. A keyword-only hybrid hit gets the same doc-level id with its best-fit heading. This is a locator, not a retrieval unit (consistent with D-01).
+- **D-14 — degradation surfaces as a distinct `notice` event**, not overloaded onto `guardrail`. Both are additive and zero-cost; a separate type keeps "we fell back to keyword search" semantically distinct from "a guard fired," which matters for the Phase 5/6 trace.
+- **Floor nuance (from research):** only the off-topic case (`salesforce-integration`) needs the floor to return `[]`; the other escalation cases escalate because the model reads doc text and decides a human is needed. So calibrate the floor to catch genuinely-off-topic queries **without starving** the read-then-escalate cases — D-04's calibration target is narrower than "all escalations."
+
 ### Claude's Discretion
 - Index build script location/name and `kb_sha256` mechanics (research recommends `httpx` over the heavyweight `voyageai` SDK — honor unless a blocker emerges)
 - numpy in-memory cosine (no vector DB — locked out of scope); `numpy>=2.3,<3` for the 3.11 floor
