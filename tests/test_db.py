@@ -118,6 +118,90 @@ def test_a_failed_write_does_not_leave_a_partial_row_when_another_thread_commits
     assert db.execute("SELECT status FROM tickets WHERE id = ?", (a_ticket,)).fetchone()[0] == "open"
 
 
+def _nesting_fixture(db) -> int:
+    ticket_id = db.execute(
+        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+        ("ava@acmecorp.com", "Refund", "Please refund me"),
+    ).lastrowid
+    db.commit()
+    return ticket_id
+
+
+def test_an_inner_transaction_does_not_commit_the_outer_blocks_partial_work(db):
+    # The reviewed defect, stated as data: the lock is re-entrant, so a nested
+    # transaction() is accepted silently, and an inner commit() is connection-scoped —
+    # it makes the outer block's half-finished UPDATE durable, and the outer rollback
+    # then undoes nothing. Asserted on surviving rows because the failure is silent:
+    # no exception, no log, just a ticket left 'resolved' by a unit of work that failed.
+    ticket_id = _nesting_fixture(db)
+
+    with pytest.raises(RuntimeError, match="outer unit of work fails"), db.transaction():
+        db.execute("UPDATE tickets SET status = 'resolved' WHERE id = ?", (ticket_id,))
+        with db.transaction():
+            db.execute(
+                "INSERT INTO replies (ticket_id, body) VALUES (?, ?)",
+                (ticket_id, "inner reply"),
+            )
+        raise RuntimeError("outer unit of work fails after the inner one committed")
+
+    assert db.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()[0] == "open"
+    assert db.execute("SELECT COUNT(*) FROM replies").fetchone()[0] == 0
+
+
+def test_an_inner_failure_rolls_back_only_the_inner_unit_of_work(db):
+    # The other half of nest-safety, and the half a plain depth counter gets wrong:
+    # flattening would make an inner failure roll back the connection, so the outer
+    # block's later commit would land nothing. Phase 5's run_events writer nests
+    # inside a run — a failed step event must not silently discard the run row.
+    ticket_id = _nesting_fixture(db)
+
+    with db.transaction():
+        db.execute("UPDATE tickets SET category = 'billing' WHERE id = ?", (ticket_id,))
+        with pytest.raises(sqlite3.IntegrityError), db.transaction():
+            db.execute(
+                "INSERT INTO replies (ticket_id, body) VALUES (?, ?)",
+                (ticket_id, "kept"),
+            )
+            # Violates replies.ticket_id -> tickets(id) with foreign_keys = ON.
+            db.execute(
+                "INSERT INTO replies (ticket_id, body) VALUES (?, ?)", (999, "orphan")
+            )
+
+    assert db.execute(
+        "SELECT category FROM tickets WHERE id = ?", (ticket_id,)
+    ).fetchone()[0] == "billing"
+    assert db.execute("SELECT COUNT(*) FROM replies").fetchone()[0] == 0
+
+
+def test_an_inner_block_that_opens_the_transaction_still_cannot_commit_it(db):
+    # The nesting fix rests on a transaction already being open when the inner
+    # SAVEPOINT is issued: RELEASE of the connection's *outermost* savepoint is defined
+    # by SQLite as a commit. pysqlite only auto-begins ahead of DML, so an outer block
+    # that has not written yet — as Phase 5's run_events writer will be, emitting a
+    # step event before the run row exists — leaves the inner block holding the
+    # outermost savepoint, and its RELEASE commits everything. The explicit BEGIN in
+    # transaction() is the only thing preventing that; the test above does not cover
+    # it, because its outer UPDATE fires pysqlite's implicit BEGIN first.
+    ticket_id = _nesting_fixture(db)
+
+    with pytest.raises(RuntimeError, match="outer unit of work fails"), db.transaction():
+        # No statement here: the inner block is the first thing to touch SQLite.
+        with db.transaction():
+            db.execute(
+                "INSERT INTO replies (ticket_id, body) VALUES (?, ?)",
+                (ticket_id, "inner reply"),
+            )
+        db.execute("UPDATE tickets SET status = 'resolved' WHERE id = ?", (ticket_id,))
+        raise RuntimeError("outer unit of work fails after the inner one committed")
+
+    assert db.execute("SELECT COUNT(*) FROM replies").fetchone()[0] == 0
+    assert db.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()[0] == "open"
+    # White-box, and deliberately so: a depth counter that fails to unwind has no
+    # behavioural signature — the next transaction()'s RELEASE would commit anyway, for
+    # the same reason this test exists — so the invariant is the only thing to assert.
+    assert db._depth == 0
+
+
 # --- transaction() adoption at the call sites ---
 
 

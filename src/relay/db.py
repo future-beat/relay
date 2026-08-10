@@ -123,6 +123,9 @@ class Database:
     def __init__(self, conn: sqlite3.Connection):
         self._conn = conn
         self._lock = threading.RLock()
+        # Guarded by the same lock, so it is only ever read and written by the one
+        # thread currently inside transaction(); a second thread is blocked outside.
+        self._depth = 0
 
     def _run(self, method: str, *args) -> Result:
         with self._lock:
@@ -152,20 +155,53 @@ class Database:
 
     @contextmanager
     def transaction(self):
-        """Hold the connection for one unit of work.
+        """Hold the connection for one unit of work. Safe to nest.
 
         commit() is connection-scoped, so an INSERT+UPDATE pair that releases the lock
         between statements can be committed halfway through by another request — and
         its own rollback then undoes nothing. BaseException, not Exception: a bare
         `except Exception` lets a CancelledError escape with the transaction still open.
+
+        Nesting is the same bug wearing this method's own clothes. The lock is
+        re-entrant so execute() can be called from in here, which means a nested
+        transaction() is accepted silently; if it committed, it would commit the
+        *outer* block's partial work and the outer rollback would then undo nothing.
+        So only the outermost level commits or rolls back the connection, and inner
+        levels get a SAVEPOINT — a real nested unit of work that can fail on its own
+        without taking the enclosing one down, and that an outer rollback still
+        discards. Phase 5 writes run_events from inside a run that already holds a
+        transaction; that call site is why this is not left as a documented trap.
         """
         with self._lock:
+            outermost = self._depth == 0
+            savepoint = None if outermost else f"relay_nested_{self._depth}"
+            if outermost:
+                # Explicit, because pysqlite only auto-begins ahead of DML. Without a
+                # transaction already open, an inner RELEASE would be releasing the
+                # connection's *outermost* savepoint — which SQLite defines as a
+                # commit, reintroducing exactly the bug this nesting support prevents.
+                if not self._conn.in_transaction:
+                    self._conn.execute("BEGIN")
+            else:
+                self._conn.execute(f"SAVEPOINT {savepoint}")
+            self._depth += 1
             try:
                 yield self
-                self._conn.commit()
             except BaseException:
-                self._conn.rollback()
+                if outermost:
+                    self._conn.rollback()
+                else:
+                    # ROLLBACK TO leaves the savepoint on the stack; RELEASE pops it.
+                    self._conn.execute(f"ROLLBACK TO {savepoint}")
+                    self._conn.execute(f"RELEASE {savepoint}")
                 raise
+            else:
+                if outermost:
+                    self._conn.commit()
+                else:
+                    self._conn.execute(f"RELEASE {savepoint}")
+            finally:
+                self._depth -= 1
 
 
 def connect(db_path: str | Path) -> Database:
