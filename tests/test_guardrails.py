@@ -1,9 +1,11 @@
 import asyncio
+import inspect
+import json
 from types import SimpleNamespace
 
 import pytest
 
-from relay.agent import run_ticket
+from relay.agent import _execute_guarded, bind_to_ticket, run_ticket
 from relay.guardrails import (
     RunBudget,
     SendReplyInput,
@@ -279,3 +281,61 @@ async def test_concurrent_runs_do_not_cross_bind(conn, registry):
     )
     assert [e for events in runs for e in events if e.type == "guardrail"] == []
     assert sorted(_reply_ticket_ids(conn)) == [TICKET["id"], OTHER_TICKET["id"]]
+
+
+# --- the binding cannot be dropped at the call site ---
+
+
+def test_the_agent_loop_takes_no_binding_argument_to_forget(registry):
+    # WR-04's actual fix, asserted structurally because that is what it is. The guard
+    # used to activate on `bound_ticket_id is not None` behind a `= None` default, so
+    # a caller that omitted the keyword got no protection, no error and no failing
+    # test — the phase's headline control was opt-in at the call site. A run's binding
+    # is now baked into the executor when the run starts, so there is no per-call
+    # argument left to leave out. If a future edit reintroduces one, this fails.
+    executor = bind_to_ticket(TICKET["id"])
+    params = list(inspect.signature(executor).parameters)
+    assert params == ["spec", "name", "raw_input", "policy"], (
+        "a per-call binding argument is back — it can be forgotten again"
+    )
+    # And it really is bound, rather than merely argument-free.
+    result, is_error = executor(
+        registry["send_reply"],
+        "send_reply",
+        {"ticket_id": 99, "body": INJECTED_REPLY},
+        ToolPolicy(),
+    )
+    assert is_error is True
+    assert json.loads(result)["denied_by"] == "ticket_binding"
+
+
+def test_a_run_cannot_be_bound_to_something_that_is_not_a_ticket_id():
+    # A binding built from a missing or malformed id must not silently produce an
+    # executor that compares against garbage and denies every call — or, worse, one
+    # built from None back when None meant "unbound".
+    for bad in (None, "1", 1.0, True):
+        with pytest.raises(TypeError):
+            bind_to_ticket(bad)
+
+
+def test_an_explicit_none_binding_is_refused_rather_than_treated_as_unbound():
+    # The remaining way to lose the binding: hold one and pass it through as None.
+    # UNBOUND is how the MCP path — which genuinely has no current run — says so, and
+    # it is a value a caller has to choose rather than one arrived at by accident.
+    with pytest.raises(ValueError, match="disables the ticket binding"):
+        _execute_guarded(None, "send_reply", {}, ToolPolicy(), bound_ticket_id=None)
+
+
+def test_the_unbound_path_still_executes_a_ticket_id_bearing_tool(conn, registry):
+    # D-03 keeps mcp_server.py frozen, and it calls _execute_guarded with no binding
+    # at all. That call is legitimate — there is no current run — so the default must
+    # keep working, or the fix above breaks the MCP surface it is not allowed to edit.
+    _seed_tickets(conn, TICKET)
+    result, is_error = _execute_guarded(
+        registry["send_reply"],
+        "send_reply",
+        {"ticket_id": TICKET["id"], "body": GROUNDED_REPLY},
+        ToolPolicy(),
+    )
+    assert is_error is False, result
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]

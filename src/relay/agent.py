@@ -42,6 +42,35 @@ TERMINAL_TOOLS = {"send_reply", "create_escalation"}
 logger = logging.getLogger("relay.agent")
 tracer = trace.get_tracer("relay")
 
+# "There is no current run", as a value that had to be chosen rather than one that
+# arrives by accident. None used to mean this, which made None also the value a
+# caller lands on by forgetting the keyword — so the same token meant both "the MCP
+# server has no ticket to bind to" and "SEC-04 is off because someone typo'd".
+UNBOUND = object()
+
+
+def bind_to_ticket(ticket_id: int):
+    """Return a tool executor locked to one ticket, for the length of one run.
+
+    The binding is a constructor argument here rather than a per-call keyword because
+    a keyword with a default is a control that can be forgotten: omit it and SEC-04
+    stops applying with no error, no log and no failing test. A caller of this cannot
+    forget it — there is no argument at the call site to leave out, and no executor at
+    all without a ticket id. The MCP path has no current run and so calls
+    _execute_guarded directly; that is the one legitimate unbound caller.
+    """
+    if not isinstance(ticket_id, int) or isinstance(ticket_id, bool):
+        raise TypeError(
+            f"a run must be bound to an int ticket id, got {type(ticket_id).__name__}"
+        )
+
+    def execute(
+        spec: ToolSpec | None, name: str, raw_input: dict[str, Any], policy: ToolPolicy
+    ) -> tuple[str, bool]:
+        return _execute_guarded(spec, name, raw_input, policy, bound_ticket_id=ticket_id)
+
+    return execute
+
 
 def _execute_guarded(
     spec: ToolSpec | None,
@@ -49,9 +78,21 @@ def _execute_guarded(
     raw_input: dict[str, Any],
     policy: ToolPolicy,
     *,
-    bound_ticket_id: int | None = None,
+    bound_ticket_id: int | object = UNBOUND,
 ) -> tuple[str, bool]:
-    """Run one tool call through the guardrail chain. Returns (result_json, is_error)."""
+    """Run one tool call through the guardrail chain. Returns (result_json, is_error).
+
+    Bound callers go through bind_to_ticket(); the default is for the MCP server,
+    which has no current run to bind to.
+    """
+    if bound_ticket_id is None:
+        # Fails closed rather than degrading to "unbound": None reaching here means a
+        # caller had a binding in hand and lost it, which is the fail-open case SEC-04
+        # exists to prevent. UNBOUND is how a caller says it never had one.
+        raise ValueError(
+            "bound_ticket_id=None disables the ticket binding silently;"
+            " pass UNBOUND if this call has no current run"
+        )
     if spec is None:
         return json.dumps({"error": f"unknown tool {name}"}), True
     denial = policy.denial_reason(spec.tier)
@@ -63,10 +104,10 @@ def _execute_guarded(
         return json.dumps({"error": str(exc)}), True
     # Server truth beats model output: validation first so the comparison runs on a
     # coerced int, and before execution so this is a choke point, not an audit log.
-    # bound_ticket_id is None on the MCP path, where there is no "current run".
+    # bound_ticket_id is UNBOUND on the MCP path, where there is no "current run".
     supplied_ticket_id = validated.get("ticket_id")
     if (
-        bound_ticket_id is not None
+        bound_ticket_id is not UNBOUND
         and supplied_ticket_id is not None
         and supplied_ticket_id != bound_ticket_id
     ):
@@ -112,6 +153,11 @@ async def run_ticket(
 
     resolved_via: str | None = None
     last_stop_reason: str | None = None
+
+    # Built once per run, from this run's own ticket — never stored on the registry,
+    # which is built once and shared by every live run. Every tool call below goes
+    # through this, so the binding cannot be dropped for one call and not another.
+    execute_bound = bind_to_ticket(ticket["id"])
 
     # The run span is parented explicitly (not made "current") because this is
     # a generator: execution suspends at every yield, and a current-span
@@ -190,9 +236,6 @@ async def run_ticket(
                     with tracer.start_as_current_span(
                         f"tool.{block.name}", context=run_ctx
                     ) as span:
-                        # Bound at call time from this run's own ticket — never stored on
-                        # the registry, which is built once and shared by every live run.
-                        #
                         # Offloaded because tool execution is blocking SQLite and file I/O,
                         # and every other run on this process waits behind it otherwise.
                         # to_thread copies the current context, so this span is still the
@@ -201,9 +244,7 @@ async def run_ticket(
                         # so a disconnect is not "no side effect" — the write is inside a
                         # transaction and either commits or rolls back, never lands halfway.
                         result, is_error = await asyncio.to_thread(
-                            _execute_guarded,
-                            spec, block.name, block.input, policy,
-                            bound_ticket_id=ticket["id"],
+                            execute_bound, spec, block.name, block.input, policy
                         )
                         payload = json.loads(result)
                         binding_violation = (
