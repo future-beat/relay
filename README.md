@@ -90,7 +90,11 @@ curl -N -X POST https://relay-agent.fly.dev/tickets/1/process \
 The key above is public deliberately — here and on the
 [dashboard](https://relay-agent.fly.dev/dashboard), which renders it from the
 same setting the service authenticates against, so the published value and the
-accepted value cannot drift apart. Publishing it costs nothing: it is confined
+accepted value cannot drift apart. The literal is declared once, as
+`PUBLISHED_DEMO_KEY` in [`src/relay/config.py`](src/relay/config.py); a test
+fails if this page or `scripts/demo.sh` names anything else. It is not the
+default for `RELAY_DEMO_KEY` — auth fails closed when unset, and a default
+would make every unconfigured deployment honour a key published on the internet. Publishing it costs nothing: it is confined
 to the demo tier, capped at 5 runs/hour per IP, and bounded absolutely by the
 daily spend ceiling below. Hiding it would only remove the "try it yourself"
 moment.
@@ -280,8 +284,9 @@ fly deploy
 a machine that boots without them returns `503` on every protected route — the
 live demo goes down while the deploy itself looks perfectly healthy. Use the
 demo key value published in [Security & limits](#security--limits) for
-`RELAY_DEMO_KEY`, or pick your own and update that one line so the README, the
-dashboard and the service keep agreeing.
+`RELAY_DEMO_KEY`, or pick your own and change `PUBLISHED_DEMO_KEY` in
+`src/relay/config.py` — the test that pins this page and `scripts/demo.sh` to
+that constant is what keeps the three from drifting apart.
 
 `fly.toml` also ships `RELAY_TRUST_PROXY = 'true'`, which is what makes
 `Fly-Client-IP` authoritative for rate-limit keying behind the Fly proxy. It is

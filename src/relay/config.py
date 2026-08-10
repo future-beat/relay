@@ -3,6 +3,17 @@ from pathlib import Path
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The value D-02 publishes for the hosted demo, in one place so the README, the demo
+# script and `fly secrets set RELAY_DEMO_KEY=...` cannot drift into disagreeing — the
+# README used to carry a literal that no test looked at, and a visitor running
+# scripts/demo.sh against a different one got a 401 they could not diagnose.
+#
+# Deliberately not the default for `demo_key` below. Auth fails closed when no key is
+# configured, and a default here would make every unconfigured deployment accept a key
+# published on the internet. It documents what the hosted instance is deployed with;
+# .env.example still ships empty so local dev generates its own.
+PUBLISHED_DEMO_KEY = "relay-demo-2026"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RELAY_", env_file=".env", extra="ignore")

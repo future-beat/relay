@@ -1,10 +1,14 @@
+import re
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
 
 from relay.auth import require_tier, resolve_tier
-from relay.config import settings
+from relay.config import PUBLISHED_DEMO_KEY, Settings, settings
+
+_REPO_ROOT = Path(__file__).parent.parent
 
 
 @pytest.fixture()
@@ -231,3 +235,32 @@ def test_dashboard_without_a_demo_key_does_not_render_none(client, monkeypatch):
     assert resp.status_code == 200
     assert ">None<" not in resp.text
     assert "None" not in resp.text
+
+
+def test_the_published_demo_key_agrees_across_every_file_that_names_it():
+    # WR-06. D-02 specifies one published key with one source of truth, but the value
+    # lived as a bare literal in the README that nothing looked at, while demo.sh and
+    # .env.example carried a different one. The concrete failure: a visitor runs
+    # ./scripts/demo.sh against the hosted demo, gets 401 on both calls, and
+    # `set -euo pipefail` lands it as a JSON parse crash rather than a readable error
+    # — the "try it yourself" moment that is the entire reason for publishing a key.
+    readme = (_REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    demo_sh = (_REPO_ROOT / "scripts" / "demo.sh").read_text(encoding="utf-8")
+
+    assert f'X-API-Key: {PUBLISHED_DEMO_KEY}"' in readme, (
+        "README's curl example does not use the published demo key"
+    )
+    assert f"RELAY_DEMO_KEY={PUBLISHED_DEMO_KEY}" in demo_sh, (
+        "scripts/demo.sh suggests a different key than the README publishes"
+    )
+    # No second literal anywhere: a stale one is exactly how these drifted apart, and
+    # it reads as authoritative to whoever finds it first.
+    stale = re.findall(r"(?:X-API-Key: |RELAY_DEMO_KEY=)([A-Za-z0-9._-]{4,})", readme + demo_sh)
+    assert set(stale) <= {PUBLISHED_DEMO_KEY}, f"a demo key literal disagrees: {set(stale)}"
+
+
+def test_the_published_key_is_not_a_default_the_service_would_accept(monkeypatch):
+    # Publishing the value must not mean an unconfigured deployment honours it. Auth
+    # fails closed on purpose; a default on the setting would quietly reopen it on
+    # every machine that boots without `fly secrets set RELAY_DEMO_KEY=...`.
+    assert Settings.model_fields["demo_key"].default is None
