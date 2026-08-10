@@ -16,13 +16,22 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.25",
     "mcp>=1.2",
     "limits>=5.8,<6",
+    # Semantic retrieval (phase 3). Cosine similarity over the prebuilt kb index.
+    # Floor stays at 2.3 and NOT 2.5: numpy 2.5+ declares requires-python >=3.12,
+    # which would silently strip this project of its own >=3.11 floor (no candidate
+    # resolves on 3.11). 2.3.x/2.4.x still ship >=3.11 wheels, so pip picks 2.4.x on
+    # 3.11 and 2.5.x on 3.12+ — one constraint, both interpreters.
+    "numpy>=2.3,<3",
+    # Promoted from the dev extra: the Voyage embeddings POST is runtime code now.
+    # Already in the tree transitively via anthropic (httpx<1,>=0.25.0).
+    "httpx>=0.28,<1",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
-    "httpx>=0.27",
+    # httpx moved to [project] dependencies — TestClient still gets it from there.
     "ruff>=0.5",
 ]
 

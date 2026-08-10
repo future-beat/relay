@@ -5,14 +5,14 @@ write actions behind confirmation or policy without touching the loop.
 """
 
 import json
-import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
 
+from . import retrieval
 from .db import Database
 from .guardrails import (
     CreateEscalationInput,
@@ -45,23 +45,29 @@ def lookup_customer(db: Database, email: str) -> str:
     )
 
 
-def search_docs(kb_dir: Path, query: str, max_results: int = 3) -> str:
-    """Keyword search over the markdown knowledge base.
+def search_docs(index: retrieval.Index, query: str, max_results: int = 3) -> str:
+    """Hybrid semantic + keyword search over the markdown knowledge base.
 
-    Phase 1 keeps this dependency-free; the embeddings-based retriever
-    replaces the scoring here without changing the tool contract.
+    Phase 3 swapped the phase-1 scorer for `retrieval.retrieve` and changed nothing
+    else: the envelope is still `{"results": [...]}` carrying whole files (D-01), so
+    retrieval quality is the only variable that moved. Each result gained the
+    `{doc, heading, id, text, score}` citation shape (D-06), and `retrieval_mode` /
+    `degraded` were added alongside `results` so a run can show which path served it.
+
+    `index` is loaded once by `build_registry` and captured by the closure. Sync on
+    purpose — this runs inside the phase-2 `asyncio.to_thread` seam.
     """
-    terms = [t for t in re.findall(r"\w+", query.lower()) if len(t) > 2]
-    scored = []
-    for path in sorted(kb_dir.glob("*.md")):
-        text = path.read_text(encoding="utf-8")
-        lower = text.lower()
-        score = sum(lower.count(term) for term in terms)
-        if score > 0:
-            scored.append((score, path.name, text))
-    scored.sort(reverse=True)
-    results = [{"doc": name, "content": text} for _, name, text in scored[:max_results]]
-    return json.dumps({"results": results})
+    # key/floor are left to retrieve()'s settings sentinel, so 03-06's calibrated
+    # floor lands with no change here.
+    results, mode, degraded, cause = retrieval.retrieve(index, query, max_results=max_results)
+    return json.dumps({
+        "results": results,
+        "retrieval_mode": mode,
+        "degraded": degraded,
+        # Which degradation, so the notice is actionable rather than just alarming:
+        # a stale/missing index is a deploy fix, a Voyage failure is a runtime one.
+        "degraded_cause": cause,
+    })
 
 
 def create_escalation(db: Database, ticket_id: int, reason: str, priority: str) -> str:
@@ -76,7 +82,12 @@ def create_escalation(db: Database, ticket_id: int, reason: str, priority: str) 
     return json.dumps({"escalation_id": escalation_id, "status": "escalated"})
 
 
-def send_reply(db: Database, ticket_id: int, body: str) -> str:
+def send_reply(
+    db: Database, ticket_id: int, body: str, citations: Sequence[str] = ()
+) -> str:
+    # citations is accepted and validated but not persisted this phase: it exists so the
+    # model declares its grounding, which agent.py checks against the ids search_docs
+    # actually returned. Defaulted so every pre-phase-3 call site still works (D-12).
     # Email delivery is mocked: the reply is persisted, nothing leaves the system.
     with db.transaction():
         cur = db.execute(
@@ -94,6 +105,14 @@ def set_category(db: Database, ticket_id: int, category: str) -> str:
 
 
 def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
+    # Read the embedding index once at startup and let the search_docs closure capture
+    # it, the same way the other closures capture `conn`. A per-call load would put a
+    # disk read and a full re-parse of every vector inside every tool call.
+    index = retrieval.load_index(kb_dir)
+    # Every entry point (HTTP lifespan, MCP server, eval harness) builds its registry
+    # here, so this is the one place that can state the selected retrieval mode once
+    # per process rather than three times in three files.
+    retrieval.log_mode_selected(index)
     return {
         "lookup_customer": ToolSpec(
             schema={
@@ -137,7 +156,7 @@ def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
             },
             tier="read",
             input_model=SearchDocsInput,
-            execute=lambda query: search_docs(kb_dir, query),
+            execute=lambda query: search_docs(index, query),
         ),
         "set_category": ToolSpec(
             schema={
@@ -180,6 +199,15 @@ def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
                     "properties": {
                         "ticket_id": {"type": "integer"},
                         "body": {"type": "string", "description": "The reply text"},
+                        "citations": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "The search_docs result ids this reply is grounded in,"
+                                ' e.g. "billing.md#refunds". Cite only ids that were'
+                                " returned to you — a made-up id is rejected."
+                            ),
+                        },
                     },
                     "required": ["ticket_id", "body"],
                     "additionalProperties": False,
@@ -188,7 +216,9 @@ def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
             },
             tier="write",
             input_model=SendReplyInput,
-            execute=lambda ticket_id, body: send_reply(conn, ticket_id, body),
+            execute=lambda ticket_id, body, citations=(): send_reply(
+                conn, ticket_id, body, citations
+            ),
         ),
         "create_escalation": ToolSpec(
             schema={

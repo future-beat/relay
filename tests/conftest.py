@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -57,3 +58,22 @@ def client(tmp_path, monkeypatch):
     # lives in tests/test_ratelimit.py, which sets its own tier explicitly.
     with TestClient(app, headers={"X-API-Key": "test-owner-key"}) as client:
         yield client
+
+
+@pytest.fixture(autouse=True)
+def _no_outbound_http(monkeypatch):
+    """Fail loudly on any unmocked outbound HTTP from the whole suite.
+
+    search_docs reads settings.voyage_api_key, and several suites drive it through
+    the tool registry. Without this, a developer with VOYAGE_API_KEY in .env would
+    have unit tests making real, paid Voyage calls the moment kb/index.json exists —
+    green locally, billed, and untestable in CI. Tests that need Voyage install their
+    own fake over this (monkeypatch is per-test, so a later setattr wins).
+    """
+    def _forbidden(*args, **kwargs):
+        raise AssertionError(
+            "a test attempted a real outbound HTTP call — install a fake "
+            "(see the `voyage` fixture in tests/test_retrieval.py)"
+        )
+
+    monkeypatch.setattr(httpx, "post", _forbidden)

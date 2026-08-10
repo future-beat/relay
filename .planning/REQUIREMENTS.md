@@ -22,11 +22,11 @@
 
 ### Semantic Retrieval
 
-- [ ] **RAG-01**: `search_docs` uses semantic retrieval over a precomputed `voyage-4-lite` embeddings index (heading-aware chunks, correct `input_type` at index vs query time, cosine over in-memory numpy)
-- [ ] **RAG-02**: The embeddings index is a committed offline artifact (built by a script, KB-hash-stamped, staleness-checked in CI) — no Voyage call on the cold-start or CI path
-- [ ] **RAG-03**: Retrieval results carry stable citation IDs (`{doc}#{heading}`) with doc, heading, text, and score
-- [ ] **RAG-04**: `send_reply` accepts a structured `citations` argument; the executor validates every cited id was actually retrieved during the run
-- [ ] **RAG-05**: Retrieval degrades gracefully to the keyword scorer when Voyage is unavailable, logging and surfacing the degradation in the run event stream
+- [x] **RAG-01**: `search_docs` uses semantic retrieval over a precomputed `voyage-4-lite` embeddings index (heading-aware chunks, correct `input_type` at index vs query time, cosine over in-memory numpy)
+- [x] **RAG-02**: The embeddings index is a committed offline artifact (built by a script, KB-hash-stamped, staleness-checked in CI) — no Voyage call on the cold-start or CI path
+- [x] **RAG-03**: Retrieval results carry stable citation IDs (`{doc}#{heading}`) with doc, heading, text, and score
+- [x] **RAG-04**: `send_reply` accepts a structured `citations` argument; the executor validates every cited id was actually retrieved during the run
+- [x] **RAG-05**: Retrieval degrades gracefully to the keyword scorer when Voyage is unavailable, logging and surfacing the degradation in the run event stream
 
 ### Evaluation
 
@@ -77,11 +77,11 @@ Mapped by roadmap creation 2026-08-06 — 22/22 v1 requirements, no orphans.
 | SEC-06 | Phase 1 | Complete |
 | DATA-01 | Phase 2 | Complete |
 | DATA-02 | Phase 2 | Complete |
-| RAG-01 | Phase 3 | Pending |
-| RAG-02 | Phase 3 | Pending |
-| RAG-03 | Phase 3 | Pending |
-| RAG-04 | Phase 3 | Pending |
-| RAG-05 | Phase 3 | Pending |
+| RAG-01 | Phase 3 | Complete |
+| RAG-02 | Phase 3 | Complete |
+| RAG-03 | Phase 3 | Complete |
+| RAG-04 | Phase 3 | Complete |
+| RAG-05 | Phase 3 | Complete |
 | EVAL-01 | Phase 4 | Pending |
 | EVAL-02 | Phase 4 | Pending |
 | EVAL-03 | Phase 4 | Pending |

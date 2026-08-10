@@ -102,24 +102,24 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 03-01-PLAN.md — numpy/httpx deps + Voyage config block (voyage_api_key alias, model/dim/floor) (RAG-01/05)
+- [x] 03-01-PLAN.md — numpy/httpx deps + Voyage config block (voyage_api_key alias, model/dim/floor) (RAG-01/05)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 03-02-PLAN.md — `retrieval.py`: kb_sha256, load_index, numpy cosine + floor, sync Voyage query, hybrid keyword fallback, citation-id shape; Voyage-free tests (RAG-01/03/05)
+- [x] 03-02-PLAN.md — `retrieval.py`: kb_sha256, load_index, numpy cosine + floor, sync Voyage query, hybrid keyword fallback, citation-id shape; Voyage-free tests (RAG-01/03/05)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 03-03-PLAN.md — `scripts/build_index.py` + committed `kb/index.json` + CI staleness gate (RAG-02)
-- [ ] 03-04-PLAN.md — `search_docs` semantic swap (byte-compatible envelope) + optional `send_reply` citations (RAG-01/03/04)
+- [x] 03-03-PLAN.md — `scripts/build_index.py` + committed `kb/index.json` + CI staleness gate (RAG-02)
+- [x] 03-04-PLAN.md — `search_docs` semantic swap (byte-compatible envelope) + optional `send_reply` citations (RAG-01/03/04)
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 03-05-PLAN.md — Thread `retrieved_ids`, citation guard + recovery, `notice` degradation event, prompt/model updates (RAG-04/05)
+- [x] 03-05-PLAN.md — Thread `retrieved_ids`, citation guard + recovery, `notice` degradation event, prompt/model updates (RAG-04/05)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 03-06-PLAN.md — Floor calibration + paid before/after 12-case eval diff (acceptance gate) (RAG-01/04/05)
+- [x] 03-06-PLAN.md — Floor calibration + paid before/after 12-case eval diff (acceptance gate) (RAG-01/04/05)
 
 ### Phase 4: Evaluation Coverage
 
@@ -174,7 +174,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 |-------|----------------|--------|-----------|
 | 1. Security Perimeter | 5/5 | Complete   | 2026-08-09 |
 | 2. Async-Safe Data Layer & Graceful Shutdown | 5/5 | Complete   | 2026-08-09 |
-| 3. Semantic Retrieval | 0/6 | Planned | - |
+| 3. Semantic Retrieval | 5/6 | In Progress|  |
 | 4. Evaluation Coverage | 0/TBD | Not started | - |
 | 5. Run Event Persistence & Live Feed | 0/TBD | Not started | - |
 | 6. Dashboard Experience | 0/TBD | Not started | - |
