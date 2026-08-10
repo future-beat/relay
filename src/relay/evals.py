@@ -80,13 +80,27 @@ class CaseResult:
     cost_usd: float = 0.0
     error: str | None = None
     judge_reasoning: str | None = None
+    # Observed, never graded (WR-10). `citations` is None when the model never passed
+    # the argument at all, which is a different fact from `[]` and the one that decides
+    # whether the citation guard is load-bearing or decorative.
+    citations: list[str] | None = None
+    retrieval: dict[str, Any] = field(default_factory=dict)
 
 
 def extract_outcome(events: list[AgentEvent]) -> dict[str, Any]:
-    """Pull the graded facts out of an agent run's event stream."""
+    """Pull the graded facts out of an agent run's event stream.
+
+    `citations` and `retrieval` are recorded but not graded. Without them a report
+    saying zero citation denials fired is unfalsifiable: it reads identically whether
+    the model cited three retrieved ids and the guard correctly stayed quiet, or the
+    model never cited anything and the guard could not have fired if it wanted to.
+    """
     outcome: dict[str, Any] = {
         "action": None, "category": None, "final_text": None, "cost_usd": 0.0, "error": None,
+        "citations": None,
+        "retrieval": {"mode": None, "degraded": False, "retrieved_ids": []},
     }
+    retrieved: set[str] = set()
     for event in events:
         if event.type == "tool_use":
             tool, tool_input = event.data["tool"], event.data["input"]
@@ -94,14 +108,35 @@ def extract_outcome(events: list[AgentEvent]) -> dict[str, Any]:
                 outcome["category"] = tool_input.get("category")
             elif tool == "send_reply":
                 outcome["final_text"] = tool_input.get("body")
+                # Overwritten alongside final_text, including on a denied attempt, so
+                # the two always describe the same reply. Reporting the body of one
+                # attempt beside the citations of another would be worse than silence.
+                outcome["citations"] = tool_input.get("citations")
             elif tool == "create_escalation":
                 outcome["final_text"] = tool_input.get("reason")
+        elif event.type == "tool_result":
+            if event.data["tool"] != "search_docs" or event.data["is_error"]:
+                continue
+            payload = event.data["result"]
+            outcome["retrieval"]["mode"] = payload.get("retrieval_mode")
+            # Sticky: one degraded search in a run is the fact worth keeping, and a
+            # later healthy one must not erase it.
+            outcome["retrieval"]["degraded"] |= bool(payload.get("degraded"))
+            for hit in payload.get("results", []):
+                # Mirrors the accept-set agent.py builds for the citation guard — doc
+                # name, query-located id, and every anchor the whole file licenses.
+                # Anything narrower would make a legitimately cited heading read as
+                # unretrieved in the report and manufacture a violation that the
+                # running system never saw.
+                retrieved.update(x for x in (hit.get("doc"), hit.get("id")) if x)
+                retrieved.update(a for a in hit.get("anchors") or () if a)
         elif event.type == "usage":
             outcome["cost_usd"] = event.data["cost_usd"]
         elif event.type == "resolution":
             outcome["action"] = event.data["via"]
         elif event.type == "error":
             outcome["error"] = event.data["reason"]
+    outcome["retrieval"]["retrieved_ids"] = sorted(retrieved)
     return outcome
 
 
@@ -180,6 +215,8 @@ async def run_case(client: AsyncAnthropic, case: dict[str, Any], kb_text: str) -
         category=outcome["category"],
         cost_usd=outcome["cost_usd"],
         error=outcome["error"],
+        citations=outcome["citations"],
+        retrieval=outcome["retrieval"],
     )
     result.action_ok = outcome["action"] == case["expected_action"]
     result.category_ok = outcome["category"] in case["expected_categories"]
