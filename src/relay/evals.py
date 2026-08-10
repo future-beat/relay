@@ -25,7 +25,7 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
-from .agent import run_ticket
+from .agent import TERMINAL_TOOLS, run_ticket
 from .config import settings
 from .db import connect, init_db
 from .models import AgentEvent
@@ -40,6 +40,14 @@ from .retrieval_eval import (
 from .tools import build_registry, lookup_customer
 
 GOLDEN_PATH = Path("evals/golden.jsonl")
+
+# The three answers a D-08 run can give, as a closed vocabulary. Without this the
+# artifact records `action="send_reply"` for all three and the probe cannot answer
+# the one question it exists to answer — "does the model recover from a denial?" —
+# because "recovered" and "was never asked to" serialise identically.
+NOT_DENIED = "not_denied"  # the citation guard never fired: nothing was asked of it
+RECOVERED = "recovered"  # it fired, and the run still reached a terminal action
+UNRECOVERED = "unrecovered"  # it fired, and the run died without one
 
 JUDGE_SCHEMA = {
     "type": "json_schema",
@@ -127,20 +135,34 @@ class CaseResult:
     # whether the citation guard is load-bearing or decorative.
     citations: list[str] | None = None
     retrieval: dict[str, Any] = field(default_factory=dict)
+    # Observed, never graded. `guardrails` is every guard that fired during the run;
+    # `denial_recovery` is the D-08 question answered directly rather than left to a
+    # reader joining three fields; `seeded_denial` records whether the probe was armed
+    # at all, so "no denial fired" can be read as a finding about the model on an armed
+    # run and as an unremarkable fact on an unarmed one.
+    guardrails: list[dict[str, Any]] = field(default_factory=list)
+    denial_recovery: str = NOT_DENIED
+    seeded_denial: bool = False
 
 
 def extract_outcome(events: list[AgentEvent]) -> dict[str, Any]:
     """Pull the graded facts out of an agent run's event stream.
 
-    `citations` and `retrieval` are recorded but not graded. Without them a report
-    saying zero citation denials fired is unfalsifiable: it reads identically whether
-    the model cited three retrieved ids and the guard correctly stayed quiet, or the
-    model never cited anything and the guard could not have fired if it wanted to.
+    `citations`, `retrieval` and `guardrails` are recorded but not graded. Without them
+    a report saying zero citation denials fired is unfalsifiable: it reads identically
+    whether the model cited three retrieved ids and the guard correctly stayed quiet, or
+    the model never cited anything and the guard could not have fired if it wanted to.
+
+    `guardrails` closes the same gap one level up, for the denial itself: a run that
+    recovered from a denial and a run that was never denied both end `send_reply`, so
+    without the guard events in the artifact the D-08 probe reports "recovered fine"
+    whether or not anything was ever asked of the model.
     """
     outcome: dict[str, Any] = {
         "action": None, "category": None, "final_text": None, "cost_usd": 0.0, "error": None,
         "citations": None,
         "retrieval": {"mode": None, "degraded": False, "retrieved_ids": []},
+        "guardrails": [],
     }
     retrieved: set[str] = set()
     for event in events:
@@ -172,6 +194,14 @@ def extract_outcome(events: list[AgentEvent]) -> dict[str, Any]:
                 # running system never saw.
                 retrieved.update(x for x in (hit.get("doc"), hit.get("id")) if x)
                 retrieved.update(a for a in hit.get("anchors") or () if a)
+        elif event.type == "guardrail":
+            # Every guard that fired, not just the citation one: an injection denial
+            # (SEC-04) is the same kind of observed fact and belongs in the same place.
+            outcome["guardrails"].append({
+                "guard": event.data.get("guard"),
+                "tool": event.data.get("tool"),
+                "missing_citations": event.data.get("missing_citations"),
+            })
         elif event.type == "usage":
             outcome["cost_usd"] = event.data["cost_usd"]
         elif event.type == "resolution":
@@ -179,7 +209,20 @@ def extract_outcome(events: list[AgentEvent]) -> dict[str, Any]:
         elif event.type == "error":
             outcome["error"] = event.data["reason"]
     outcome["retrieval"]["retrieved_ids"] = sorted(retrieved)
+    outcome["denial_recovery"] = denial_recovery(outcome)
     return outcome
+
+
+def denial_recovery(outcome: dict[str, Any]) -> str:
+    """Did the citation guard fire, and did the run survive it? (D-08)
+
+    Derived here rather than left implicit so the artifact states the answer instead
+    of encoding it across `guardrails`, `action` and `error` for a reader to
+    reconstruct — the reconstruction is exactly what nobody does.
+    """
+    if not any(g["guard"] == "citation" for g in outcome["guardrails"]):
+        return NOT_DENIED
+    return RECOVERED if outcome["action"] in TERMINAL_TOOLS else UNRECOVERED
 
 
 async def judge_grounding(
@@ -276,6 +319,12 @@ async def run_case(
         error=outcome["error"],
         citations=outcome["citations"],
         retrieval=outcome["retrieval"],
+        guardrails=outcome["guardrails"],
+        denial_recovery=outcome["denial_recovery"],
+        # From this call's own flag, not inferred from the events: on an armed run
+        # that produced no denial, the absence IS the finding, and a value inferred
+        # from the denial could never record it.
+        seeded_denial=seed_citation_denial,
     )
     result.action_ok = outcome["action"] == case["expected_action"]
     result.category_ok = outcome["category"] in case["expected_categories"]

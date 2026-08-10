@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from helpers import FakeClient, response, text_block, tool_use_block
+from relay import evals
 from relay.agent import run_ticket
 from relay.config import settings
 from relay.db import SEED_CUSTOMERS
@@ -761,3 +762,125 @@ async def test_seed_denial_survives_a_second_search(conn, registry, keyword_base
     assert events[-1].type == "resolution"
     assert events[-1].data["via"] == "send_reply"
     assert _reply_ticket_ids(conn) == [SEED_DENIAL_TICKET["id"]]
+
+
+# --- CR-03: the artifact must distinguish recovery from never-being-asked ---------
+#
+# All three D-08 outcomes used to serialise as `action="send_reply"`: the guard fired
+# and the model recovered; the guard never fired because the model cited the bare doc
+# name; the guard never fired because the probe disarmed itself (CR-02). A probe whose
+# report reads the same whether or not it did anything measures nothing.
+
+
+def _denied(missing, *, guard="citation"):
+    return AgentEvent(type="guardrail", data={
+        "guard": guard, "tool": "send_reply", "missing_citations": missing,
+        "retrieved_ids": ["billing.md"], "action": "denied",
+    })
+
+
+def test_artifact_distinguishes_recovered_from_never_denied_from_unrecovered():
+    # mutation: drop the `guardrail` arm from extract_outcome, or hardcode
+    # denial_recovery to NOT_DENIED / RECOVERED. All three streams below then agree,
+    # which is the defect: a seeded run reports "recovered fine" regardless.
+    searched = _search_result({
+        "results": [_hit("billing.md", "refunds", "billing.md#refunds")],
+        "retrieval_mode": "keyword", "degraded": False, "degraded_cause": None,
+    })
+    never_denied = extract_outcome([
+        searched, _reply(["billing.md"]), AgentEvent(type="resolution", data={"via": "send_reply"}),
+    ])
+    recovered = extract_outcome([
+        searched, _reply(["billing.md#store-credit"]), _denied(["billing.md#store-credit"]),
+        _reply(["billing.md"]), AgentEvent(type="resolution", data={"via": "send_reply"}),
+    ])
+    unrecovered = extract_outcome([
+        searched, _reply(["billing.md#store-credit"]), _denied(["billing.md#store-credit"]),
+        AgentEvent(type="error", data={"reason": "ended_without_action"}),
+    ])
+
+    # The ambiguity itself: two of the three are identical on every field the report
+    # carried before this. It is the guardrail record that separates them.
+    assert never_denied["action"] == recovered["action"] == "send_reply"
+    assert never_denied["citations"] == recovered["citations"] == ["billing.md"]
+
+    assert never_denied["denial_recovery"] == evals.NOT_DENIED
+    assert recovered["denial_recovery"] == evals.RECOVERED
+    assert unrecovered["denial_recovery"] == evals.UNRECOVERED
+    assert never_denied["guardrails"] == []
+    assert [g["guard"] for g in recovered["guardrails"]] == ["citation"]
+    assert recovered["guardrails"][0]["missing_citations"] == ["billing.md#store-credit"]
+
+
+def test_a_ticket_binding_denial_is_recorded_without_claiming_a_citation_denial():
+    """SEC-04's guard is the same kind of observed fact, but it is not D-08's answer."""
+    outcome = extract_outcome([
+        _denied(None, guard="ticket_binding"),
+        AgentEvent(type="resolution", data={"via": "send_reply"}),
+    ])
+    assert [g["guard"] for g in outcome["guardrails"]] == ["ticket_binding"]
+    assert outcome["denial_recovery"] == evals.NOT_DENIED
+
+
+def test_run_case_seed_denial_is_keyword_only_and_default_off():
+    # mutation: give run_case's `seed_citation_denial` a positional slot or a True
+    # default. The 12 golden cases and the pass_rate gate could then arm the probe.
+    param = inspect.signature(evals.run_case).parameters["seed_citation_denial"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default is False
+
+
+SEED_DENIAL_CASE = {
+    "id": "seeded-denial-probe",
+    "customer_email": SEED_DENIAL_TICKET["customer_email"],
+    "subject": SEED_DENIAL_TICKET["subject"],
+    "body": SEED_DENIAL_TICKET["body"],
+    "expected_action": "send_reply",
+    "expected_categories": ["technical"],
+}
+
+
+async def _run_seeded_case(monkeypatch, *, armed):
+    async def _fake_judge(*args, **kwargs):
+        return {"grounded": True, "invented_claims": [], "quality": 5, "reasoning": "ok"}
+
+    monkeypatch.setattr(evals, "judge_grounding", _fake_judge)
+    # run_case inserts into a fresh :memory: db, so the ticket is always id 1.
+    client = HookDependentRecoveringClient(1)
+    result = asdict(await evals.run_case(
+        client, SEED_DENIAL_CASE, kb_text="(kb)", seed_citation_denial=armed
+    ))
+    return client, result
+
+
+async def test_run_case_forwards_the_seed_denial_flag(monkeypatch, keyword_baseline):
+    # mutation (the CR-03 defect itself): delete `seed_citation_denial=` from the
+    # run_ticket call in evals.py::run_case. The dispatch is then permanently
+    # unarmed — no denial fires, `guardrails` is empty, `denial_recovery` reads
+    # NOT_DENIED, and the paid probe reports "recovered fine" forever. Before this
+    # test, that deletion left the whole suite green.
+    client, result = await _run_seeded_case(monkeypatch, armed=True)
+
+    assert result["seeded_denial"] is True
+    assert client.cited_first, "the client never saw a search result to cite"
+    assert [g["guard"] for g in result["guardrails"]] == ["citation"]
+    assert result["guardrails"][0]["missing_citations"] == [client.cited_first]
+    # The artifact answers D-08's question directly, rather than leaving
+    # action="send_reply" to be read as either recovery or an idle hook.
+    assert result["denial_recovery"] == evals.RECOVERED
+    assert result["action"] == "send_reply"
+
+
+async def test_an_unarmed_case_records_that_nothing_was_asked_of_the_guard(
+    monkeypatch, keyword_baseline
+):
+    """The control that makes the test above non-vacuous: same client, same case,
+    same terminal action — and the artifact still tells the two runs apart."""
+    client, result = await _run_seeded_case(monkeypatch, armed=False)
+
+    assert result["seeded_denial"] is False
+    assert result["guardrails"] == []
+    assert result["denial_recovery"] == evals.NOT_DENIED
+    # Identical on every field the report carried before CR-03 was fixed.
+    assert result["action"] == "send_reply"
+    assert result["citations"] == [client.cited_first]
