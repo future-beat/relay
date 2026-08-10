@@ -16,6 +16,8 @@ from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from helpers import (
     FakeClient,
     TicketAwareFakeClient,
@@ -29,7 +31,7 @@ from relay.db import connect
 from relay.main import app, lifespan, process_ticket
 from relay.mcp_server import build_mcp_registry
 from relay.ratelimit import reserved_usd
-from relay.runs import RunRegistry
+from relay.runs import RegistryDraining, RunRegistry
 from relay.telemetry import record_run
 from test_db import instrument_write_grouping
 
@@ -84,6 +86,25 @@ async def test_drain_times_out_rather_than_hanging_shutdown():
     assert drained is False
     assert registry.active == 1
     assert registry.draining is True
+
+
+async def test_register_refuses_once_the_drain_has_returned():
+    # "Stop admitting runs, then wait for the in-flight ones" is drain()'s stated
+    # contract, but the refusal used to live only in main.py's handler — so the
+    # registry's own guarantee was weaker than its docstring, and a caller that
+    # registered after a completed drain silently got a run against a database that
+    # was about to close. The fast path makes this the *easy* case, not a rare one:
+    # an idle registry drains in microseconds and every later register still succeeded.
+    registry = RunRegistry()
+
+    assert await registry.drain(timeout=5.0) is True
+
+    with pytest.raises(RegistryDraining):
+        registry.register(ticket_id=1)
+    assert registry.active == 0, "a run was admitted after the drain declared itself done"
+    # Still drained: the refusal must not leave the registry non-empty, which would
+    # make the second drain burn its full grace period and return False.
+    assert await registry.drain(timeout=0.05) is True
 
 
 # --- the drain as lifespan actually wires it ---
@@ -406,6 +427,43 @@ def test_a_stream_that_never_starts_registers_nothing(client):
 
     assert app.state.runs.active == 0
     assert app.state.runs.snapshot() == []
+
+
+def test_a_drain_between_the_handler_and_the_generator_refuses_the_run_in_stream(client):
+    # The gap the handler's 503 cannot cover. The `draining` check runs in the handler;
+    # the body that registers runs later, when Starlette starts sending the response.
+    # A drain landing in between saw an empty registry, took its fast path, returned
+    # True and let lifespan close the connection — and this run then started anyway.
+    # Reproduced by draining at exactly that point. The status line is already locked
+    # at 200 by then, so the refusal has to arrive as a stream event, not a 503.
+    ticket_id = _make_ticket(client)
+    # Scripted, so that a registry which fails to refuse produces a *complete* run
+    # rather than an error event from the unauthenticated real client — the mutation
+    # has to be distinguishable from the fix, not merely also broken.
+    app.state.client = FakeClient([
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id,
+            "body": "Hi Liam — your Pro plan allows 600 requests/minute per workspace.",
+        })]),
+        response([text_block("Done.")], stop_reason="end_turn"),
+    ])
+
+    async def drain_after_the_handler_but_before_the_body() -> str:
+        stream = await process_ticket(ticket_id)
+        assert await app.state.runs.drain(timeout=5.0) is True
+        return "".join([chunk async for chunk in stream.body_iterator])
+
+    try:
+        body = asyncio.run(drain_after_the_handler_but_before_the_body())
+    finally:
+        app.state.runs.draining = False
+
+    assert "shutting_down" in body, f"the run started against a draining registry: {body}"
+    assert "event: done" not in body
+    assert app.state.runs.active == 0
+    # No agent run happened, so neither the ledger nor the reservation may show one.
+    assert app.state.conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+    assert reserved_usd() == 0.0, "a refused run stranded its spend reservation"
 
 
 def test_a_failed_record_run_still_releases_the_reservation_and_the_registry(client, monkeypatch):

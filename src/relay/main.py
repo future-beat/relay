@@ -17,7 +17,7 @@ from .db import connect, init_db
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
-from .runs import RunRegistry
+from .runs import RegistryDraining, RunRegistry
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
 
@@ -53,6 +53,14 @@ app = FastAPI(title="Relay", version=__version__, lifespan=lifespan)
 # a call in an argument default (auth.py is the same pattern).
 _ANY_TIER = require_tier("owner", "demo")
 _API_KEY = Security(api_key_header)
+
+# One string for both refusals below. The handler rejects with it before the response
+# starts; the generator has to deliver the same refusal in-stream when a drain lands
+# after that check. Sharing the copy is what stops the two from drifting apart.
+_SHUTTING_DOWN_NOTE = (
+    "Relay is finishing the runs already in flight before it restarts."
+    " Retry in a few seconds — this is a deploy, not an outage."
+)
 
 
 def _gate(bucket: str, *, meter_spend: bool = False):
@@ -157,13 +165,7 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     if app.state.runs.draining:
         raise HTTPException(
             503,
-            detail={
-                "error": "shutting_down",
-                "note": (
-                    "Relay is finishing the runs already in flight before it restarts."
-                    " Retry in a few seconds — this is a deploy, not an outage."
-                ),
-            },
+            detail={"error": "shutting_down", "note": _SHUTTING_DOWN_NOTE},
             headers={"Retry-After": "5"},
         )
 
@@ -185,7 +187,21 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
         # leaving an idle server non-empty — which is what breaks scale-to-zero.
         # Inside the body, register and deregister are exactly balanced, which is why
         # this needs no TTL where the reservation above does.
-        run_token = app.state.runs.register(ticket_id=ticket.id)
+        try:
+            run_token = app.state.runs.register(ticket_id=ticket.id)
+        except RegistryDraining:
+            # The handler's 503 above ran before this generator was scheduled, and the
+            # drain landed in between — it saw an empty registry, took its fast path,
+            # and the connection is closing. Refused here rather than started, because
+            # a StreamingResponse locks its status line at 200 once the body begins:
+            # the same refusal can only be delivered as an in-stream event now.
+            # Released explicitly because the finally below belongs to a run that never
+            # started, and returning from here skips it.
+            release_run(token)
+            logger.info("run.refused_after_drain", extra={"ctx": {"ticket_id": ticket.id}})
+            refusal = {"reason": "shutting_down", "note": _SHUTTING_DOWN_NOTE}
+            yield f"event: error\ndata: {json.dumps(refusal)}\n\n"
+            return
         usage: dict = {}
         outcome = "incomplete"
         recorded = False

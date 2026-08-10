@@ -22,6 +22,12 @@ from dataclasses import dataclass
 logger = logging.getLogger("relay.runs")
 
 
+class RegistryDraining(RuntimeError):
+    """register() was called after drain() began. Raised, not returned as a sentinel,
+    because there is no correct way for a caller to proceed: the connection this run
+    would use is about to close."""
+
+
 @dataclass(frozen=True)
 class ActiveRun:
     """One streaming run. Plain fields, no validation — this never crosses the wire."""
@@ -53,7 +59,16 @@ class RunRegistry:
         self.draining = False
 
     def register(self, *, ticket_id: int) -> int:
-        """Admit one run, returning its token.
+        """Admit one run, returning its token. Raises RegistryDraining once draining.
+
+        The refusal is enforced here and not only at main.py's handler check, because
+        the two are separated by an arbitrary scheduling gap: the handler checks
+        `draining`, returns a StreamingResponse, and the generator body that calls this
+        registers later. A drain landing in that gap took its fast path against an empty
+        registry, returned True, and the connection closed — then this run started
+        against a closed database. Enforcing it where the contract is declared also
+        means phase 5's second registration site inherits it without knowing about
+        main.py.
 
         No expiry, unlike ratelimit.py's reservations. Those are claimed in the
         handler and handed back in the generator, so a stream cancelled before it
@@ -66,6 +81,8 @@ class RunRegistry:
         returns False. Before adding a TTL to paper over that, check the caller's
         finally instead; a TTL would only hide the caller regressing.
         """
+        if self.draining:
+            raise RegistryDraining("registry is draining; refusing to admit a new run")
         token = next(self._tokens)
         self._active[token] = ActiveRun(ticket_id=ticket_id, started_at=time.monotonic())
         self._idle.clear()
