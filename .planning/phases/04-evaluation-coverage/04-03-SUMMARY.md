@@ -40,7 +40,15 @@ Added the D-08 eval-only probe that forces exactly one real citation denial by d
 
 ## What Was Built
 
-**`src/relay/agent.py` — `seed_citation_denial` hook.** `run_ticket` gained a keyword-only, default-`False` param. When armed, the `search_docs` grow-step (now at `agent.py:336-355`) fires once: it discards `results[0]["id"]` from the per-run `retrieved_ids` set and injects `"__seeded_missing__"` so the set stays non-empty, then logs `guardrail.citation_denial_seeded`. A local `seed_armed` flag makes it at-most-once per run.
+**`src/relay/agent.py` — `seed_citation_denial` hook.** `run_ticket` gained a keyword-only, default-`False` param. When armed, the `search_docs` grow-step (now at `agent.py:336-355`) fires once: it discards `results[0]["id"]` from the per-run `retrieved_ids` set and injects `"__seeded_missing__"` so the set stays non-empty, then logs `guardrail.citation_denial_seeded`.
+
+> **CORRECTION (post-review, `aeeccd6`).** This originally read "a local `seed_armed` flag
+> makes it at-most-once per run." That flag no longer exists, and the mechanism it
+> described **was** the CR-02 defect: the discard survived a second *hit* but not a second
+> `search_docs` *call*, so a fake that searched twice then cited the first search's top hit
+> produced a seeded log line, zero guardrails, and a clean `send_reply` — an armed hook
+> with no signal. The drop is now a `seeded_drops` set held for the run's life and
+> subtracted after every grow.
 
 The discard is applied **after** the whole `for hit in results` grow loop, not inside it. This matters: retrieval returns whole files with an `anchors` list, so a later hit could re-add the same id as one of its anchors and silently undo an in-loop discard.
 
@@ -50,7 +58,7 @@ The citation guard (`agent.py:150-172`) and `bind_to_ticket` were not touched. `
 
 Deliberately **not** exposed as an argparse flag. A `--seed-denial` switch on `python -m relay.evals` could be passed to the gated run and turn a report-only probe into a threshold failure; the paid dispatch arms it by calling `run_case(..., seed_citation_denial=True)` directly.
 
-**`tests/test_evals.py` — three tests.** Two contract tests (hook is KEYWORD_ONLY/default-`False`; `main.py` never arms it) and the mechanism test `test_seed_denial_hook_denies_then_fake_recovers`.
+**`tests/test_evals.py` — six tests** (three at plan time; CR-02/CR-03 added three more). Two contract tests (hook is KEYWORD_ONLY/default-`False`; `main.py` never arms it) and the mechanism test `test_seed_denial_hook_denies_then_fake_recovers`.
 
 ## The Blocker That Was Avoided
 
@@ -74,7 +82,7 @@ Both named mutations were applied to `src/relay/agent.py`, run, and reverted.
 
 | Mutation | Change | Result |
 |---|---|---|
-| **B** — hook is a no-op | replaced `retrieved_ids.discard(dropped)` with `pass` | **FAILED** as required: `assert [e.data["guard"] for e in guardrails] == ["citation"]` → `assert [] == ['citation']`. The cited id stayed in the accept-set, so no denial fired. |
+| **B** — hook is a no-op | replaced the one-shot `retrieved_ids.discard(dropped)` with `pass` (**that line no longer exists as of `aeeccd6`**; the equivalent mutation now neutralises the `seeded_drops` subtraction) | **FAILED** as required: `assert [e.data["guard"] for e in guardrails] == ["citation"]` → `assert [] == ['citation']`. The cited id stayed in the accept-set, so no denial fired. |
 | **A** — denial names no valid ids | `"retrieved_ids": []` in the denial payload | **FAILED** as required: `assert client.recovered_with` → `assert []`. The fake was starved and had nothing to retry with. |
 | **A (variant)** — key deleted outright | removed `"retrieved_ids"` from the payload | Also fails, but with `KeyError: 'retrieved_ids'` at `agent.py:417` where the guardrail *event* reads the same key — it never reaches the recovery path. Recorded in the inline `# mutation:` comment so the reproducible variant is the `[]` one. |
 

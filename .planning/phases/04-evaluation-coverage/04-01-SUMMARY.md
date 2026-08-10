@@ -115,9 +115,17 @@ to the paid dispatch. **Whether that repo secret actually exists is unverified**
 not observable from this working copy, and no claim is made that it is set. If it is
 absent, GitHub injects an empty string, `settings.voyage_api_key` is falsy, and the paid
 run reports **keyword-mode** recall (~0.91) rather than semantic (~1.00). That is the
-documented fallback, not a failure: the `mode` field in the report says which one you
-got, so a keyword number can never be misread as a semantic one. Confirming or adding
-the secret is a repo-settings action outside this plan.
+documented fallback, not a failure. Confirming or adding the secret is a repo-settings
+action outside this plan.
+
+> **CORRECTION (post-review, `de65e45`).** This section originally claimed "the `mode`
+> field in the report says which one you got, so a keyword number can never be misread
+> as a semantic one." **That was false when written.** CR-01 of `04-REVIEW.md` proved
+> `mode` was derived from credential *presence* (`"semantic" if key else "keyword"`), not
+> from what `retrieve()` actually did — so a keyed run with an unusable index reported
+> keyword numbers under a `"semantic"` label, which is precisely the failure that reaches
+> CI. The claim is true only as of `de65e45`, where the label is read back out of
+> `retrieve()` and a mixed run reports `mixed` rather than silently picking one.
 
 ## Deviations from Plan
 
@@ -146,7 +154,9 @@ this is additive and keyword-only, so the planned call shape is unchanged.
 ## Cost Note (honest disclosure)
 
 The Task 2 verification command was run without pinning `key=None` and picked up a real
-`VOYAGE_API_KEY` from the local `.env`, issuing **~11 real Voyage query-embedding calls**
+`VOYAGE_API_KEY` from the local `.env`, issuing **real Voyage query-embedding calls**
+(stated here as ~11; the actual count was 33, because scoring ran one pass per metric —
+see WR-03. Single-pass scoring in `de65e45` makes ~11 correct going forward)
 (fractions of a cent). That is where the semantic numbers above come from — they are
 genuine measurements, not projections. No test suite makes such a call: all three new
 tests pin `settings.voyage_api_key = None` via a `keyword_baseline` fixture, so
