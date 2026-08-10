@@ -1,10 +1,11 @@
 ---
 phase: 3
 slug: semantic-retrieval
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: planned
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-08-10
+updated: 2026-08-10
 ---
 
 # Phase 3 — Validation Strategy
@@ -45,6 +46,8 @@ created: 2026-08-10
 | RAG-01 | cosine ranking + floor + `input_type="query"` → ranked whole-file results | unit | `pytest tests/test_retrieval.py -x` | ❌ W0 | ⬜ pending |
 | RAG-01 | `search_docs` stays sync & runs off the loop (Phase 2 seam) | unit (exists) | `pytest tests/test_lifecycle.py::test_tool_execution_runs_off_the_event_loop -x` | ✅ | ⬜ pending |
 | RAG-02 | `kb_sha256` staleness gate fails on a KB edit without rebuild | unit | `pytest tests/test_index.py::test_index_matches_kb -x` | ❌ W0 | ⬜ pending |
+| RAG-02/D-09 | index build sends `input_type="document"` (captured from the real call, not `meta`) | unit (no key) | `pytest tests/test_index.py::test_build_index_embeds_with_input_type_document -x` | ❌ W0 | ⬜ pending |
+| RAG-01/D-02 | a result's `text` equals the full `kb/*.md` file byte-for-byte (no chunking) | unit | `pytest tests/test_retrieval.py -k no_chunk -x` | ❌ W0 | ⬜ pending |
 | RAG-02 | full suite green with **no** `VOYAGE_API_KEY` (zero-Voyage CI path) | integration | `VOYAGE_API_KEY= pytest -q` | ✅ (add no-key assertion) | ⬜ pending |
 | RAG-03 | result carries `{doc, heading, id, text, score}`, `id = {doc}#{heading}` | unit | `pytest tests/test_retrieval.py -k citation_id -x` | ❌ W0 | ⬜ pending |
 | RAG-03 | off-topic query returns `{"results": []}` (floor) | unit | `pytest tests/test_retrieval.py -k empty -x` | ❌ W0 | ⬜ pending |
@@ -90,11 +93,11 @@ because the model reads doc text and decides a human is needed — the floor mus
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 10s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 10s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** covered by plans 03-01..03-06 (2026-08-10); blocker (index-side input_type) + 3 warnings from plan-check resolved in-plan.
