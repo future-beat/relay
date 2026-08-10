@@ -28,6 +28,11 @@ class SetCategoryInput(BaseModel):
 class SendReplyInput(BaseModel):
     ticket_id: int = Field(gt=0)
     body: str = Field(min_length=20, max_length=10_000)
+    # Optional on purpose (D-12): the phase-3 guard rejects a reply citing a source
+    # that was never retrieved — subset validation, not "must cite at least one".
+    # An empty list is always a subset, so a citation-less reply stays legal and the
+    # model is never pushed into ending a run without a terminal action.
+    citations: list[str] = Field(default_factory=list, max_length=20)
 
 
 class CreateEscalationInput(BaseModel):
