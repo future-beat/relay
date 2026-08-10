@@ -1,0 +1,12 @@
+{"id": "rate-limits-pro", "query": "API rate limits Pro plan", "relevant": ["api.md", "api.md#rate-limits"]}
+{"id": "refund-monthly", "query": "refund policy billing charge", "relevant": ["billing.md", "billing.md#refunds"]}
+{"id": "password-reset", "query": "password reset", "relevant": ["account.md", "account.md#password-reset"]}
+{"id": "2fa-lockout", "query": "two-factor authentication lost recovery codes lockout", "relevant": ["account.md", "account.md#two-factor-authentication"]}
+{"id": "webhooks-on-pro", "query": "webhooks availability plan", "relevant": ["api.md", "api.md#webhooks"]}
+{"id": "pro-pricing", "query": "Pro plan pricing", "relevant": ["billing.md", "billing.md#billing-and-plans"]}
+{"id": "downgrade-data-loss", "query": "downgrade plan data retention projects", "relevant": ["billing.md", "billing.md#upgrades-and-downgrades"]}
+{"id": "sso-config", "query": "SAML SSO configuration", "relevant": ["account.md", "account.md#sso-enterprise"]}
+{"id": "data-export", "query": "export data", "relevant": ["account.md", "account.md#data-export-and-deletion"]}
+{"id": "key-suspended", "query": "API key suspended", "relevant": ["api.md", "api.md#authentication"]}
+{"id": "enterprise-sla", "query": "uptime SLA guarantee", "relevant": ["billing.md"]}
+{"id": "salesforce-integration", "query": "Salesforce integration", "relevant": []}
