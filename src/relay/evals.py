@@ -201,7 +201,20 @@ async def judge_grounding(
     return json.loads(text)
 
 
-async def run_case(client: AsyncAnthropic, case: dict[str, Any], kb_text: str) -> CaseResult:
+async def run_case(
+    client: AsyncAnthropic,
+    case: dict[str, Any],
+    kb_text: str,
+    *,
+    seed_citation_denial: bool = False,
+) -> CaseResult:
+    """Run one golden case end to end and grade it.
+
+    `seed_citation_denial` forwards the D-08 probe to the agent loop. It stays off for
+    all 12 golden cases and for the `pass_rate` gate: the single armed case is a
+    report-only, manually-dispatched finding about whether a real model recovers from
+    a citation denial, not a threshold anything can fail on.
+    """
     conn = connect(":memory:")
     init_db(conn)
     cur = conn.execute(
@@ -217,7 +230,11 @@ async def run_case(client: AsyncAnthropic, case: dict[str, Any], kb_text: str) -
     }
     registry = build_registry(conn, settings.kb_dir)
 
-    events = [e async for e in run_ticket(client, registry, ticket)]
+    events = [
+        e async for e in run_ticket(
+            client, registry, ticket, seed_citation_denial=seed_citation_denial
+        )
+    ]
     outcome = extract_outcome(events)
     # Give the judge exactly what the agent could see: the lookup_customer tool
     # output (profile + ticket history) and when the ticket was filed.
