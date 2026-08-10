@@ -5,7 +5,6 @@ write actions behind confirmation or policy without touching the loop.
 """
 
 import json
-import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel
 
+from . import retrieval
 from .db import Database
 from .guardrails import (
     CreateEscalationInput,
@@ -45,23 +45,22 @@ def lookup_customer(db: Database, email: str) -> str:
     )
 
 
-def search_docs(kb_dir: Path, query: str, max_results: int = 3) -> str:
-    """Keyword search over the markdown knowledge base.
+def search_docs(index: retrieval.Index, query: str, max_results: int = 3) -> str:
+    """Hybrid semantic + keyword search over the markdown knowledge base.
 
-    Phase 1 keeps this dependency-free; the embeddings-based retriever
-    replaces the scoring here without changing the tool contract.
+    Phase 3 swapped the phase-1 scorer for `retrieval.retrieve` and changed nothing
+    else: the envelope is still `{"results": [...]}` carrying whole files (D-01), so
+    retrieval quality is the only variable that moved. Each result gained the
+    `{doc, heading, id, text, score}` citation shape (D-06), and `retrieval_mode` /
+    `degraded` were added alongside `results` so a run can show which path served it.
+
+    `index` is loaded once by `build_registry` and captured by the closure. Sync on
+    purpose — this runs inside the phase-2 `asyncio.to_thread` seam.
     """
-    terms = [t for t in re.findall(r"\w+", query.lower()) if len(t) > 2]
-    scored = []
-    for path in sorted(kb_dir.glob("*.md")):
-        text = path.read_text(encoding="utf-8")
-        lower = text.lower()
-        score = sum(lower.count(term) for term in terms)
-        if score > 0:
-            scored.append((score, path.name, text))
-    scored.sort(reverse=True)
-    results = [{"doc": name, "content": text} for _, name, text in scored[:max_results]]
-    return json.dumps({"results": results})
+    # key/floor are left to retrieve()'s settings sentinel, so 03-06's calibrated
+    # floor lands with no change here.
+    results, mode, degraded = retrieval.retrieve(index, query, max_results=max_results)
+    return json.dumps({"results": results, "retrieval_mode": mode, "degraded": degraded})
 
 
 def create_escalation(db: Database, ticket_id: int, reason: str, priority: str) -> str:
@@ -94,6 +93,10 @@ def set_category(db: Database, ticket_id: int, category: str) -> str:
 
 
 def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
+    # Read the embedding index once at startup and let the search_docs closure capture
+    # it, the same way the other closures capture `conn`. A per-call load would put a
+    # disk read and a full re-parse of every vector inside every tool call.
+    index = retrieval.load_index(kb_dir)
     return {
         "lookup_customer": ToolSpec(
             schema={
@@ -137,7 +140,7 @@ def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
             },
             tier="read",
             input_model=SearchDocsInput,
-            execute=lambda query: search_docs(kb_dir, query),
+            execute=lambda query: search_docs(index, query),
         ),
         "set_category": ToolSpec(
             schema={
