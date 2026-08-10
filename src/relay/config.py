@@ -39,6 +39,14 @@ class Settings(BaseSettings):
     owner_create_limit: str = "120/hour"
     demo_read_limit: str = "120/hour"
     owner_read_limit: str = "600/hour"
+    # Charged only by requests the daily ceiling refuses. Without it, an exhausted
+    # budget made /process an unthrottled endpoint — the tiered window below is never
+    # reached once the 503 raises, so the anon 60/minute was the only remaining cap and
+    # every one of those requests still ran a SUM over the runs table. Tier-independent
+    # and per-IP, because during an outage nobody is doing paid work: this only has to
+    # keep a refusal cheaper than a retry loop. It is a separate bucket rather than the
+    # tiered one so a global outage still does not spend the caller's own allowance.
+    outage_process_limit: str = "10/minute"
 
     # Guardrails (phase 2). Prices default to Claude Sonnet 5 per-MTok rates.
     max_run_cost_usd: float = 0.50

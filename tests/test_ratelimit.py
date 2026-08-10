@@ -439,11 +439,48 @@ def test_rate_limit_and_budget_ordering(client, monkeypatch):
     monkeypatch.setattr(settings, "demo_process_limit", "1/hour")
     _exhaust_budget(app.state.conn)
     # The budget is global, so it is checked first: an outage must not also burn
-    # the caller's per-IP allowance.
+    # the caller's per-IP allowance. Kept as-is deliberately — the ordering is the
+    # property, and the refusal is metered on its own bucket instead (below), so
+    # this assertion did not have to be traded away to throttle the 503 path.
     for _ in range(3):
         assert _process(client, DEMO).status_code == 503
 
     monkeypatch.setattr(settings, "max_daily_cost_usd", 1000.0)
+    assert _process(client, DEMO).status_code == 404
+    assert _process(client, DEMO).status_code == 429
+
+
+def test_a_budget_outage_is_still_throttled(client, monkeypatch):
+    # WR-02. The ceiling raises before the tiered window is consumed, so during an
+    # outage /process was unthrottled at its own tier: anyone holding the published
+    # demo key could hold it open at the anon 60/minute, and every one of those
+    # requests still ran the daily SUM and took Database's lock. The service was
+    # least defended exactly when it was already degraded. The refusal now charges a
+    # bucket of its own on the way out.
+    monkeypatch.setattr(settings, "outage_process_limit", "3/minute")
+    _exhaust_budget(app.state.conn)
+
+    for _ in range(3):
+        assert _process(client, DEMO).status_code == 503
+    assert _process(client, DEMO).status_code == 429, (
+        "a budget outage left /process unthrottled at its own tier"
+    )
+
+
+def test_the_outage_bucket_does_not_spend_the_callers_own_allowance(client, monkeypatch):
+    # The property the ordering exists to protect, and the reason the outage path got
+    # its own bucket rather than a swap: a global outage is not the caller's fault, so
+    # it must not cost them runs they can use once the ceiling resets at 00:00 UTC.
+    monkeypatch.setattr(settings, "demo_process_limit", "2/hour")
+    monkeypatch.setattr(settings, "outage_process_limit", "10/minute")
+    _exhaust_budget(app.state.conn)
+
+    for _ in range(5):
+        assert _process(client, DEMO).status_code == 503
+
+    monkeypatch.setattr(settings, "max_daily_cost_usd", 1000.0)
+    # Both tier units still unspent — the five refusals above charged the other bucket.
+    assert _process(client, DEMO).status_code == 404
     assert _process(client, DEMO).status_code == 404
     assert _process(client, DEMO).status_code == 429
 

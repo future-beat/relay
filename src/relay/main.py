@@ -80,6 +80,11 @@ def _gate(bucket: str, *, meter_spend: bool = False):
 
     The ceiling is checked before the tiered window because it is a global
     condition — a budget outage should not also burn the caller's per-IP allowance.
+    That ordering used to mean the 503 short-circuited throttling entirely: the
+    tiered window below is never reached once the ceiling raises, so /process
+    became an unthrottled endpoint for anyone holding the published demo key,
+    precisely when the service was least able to defend itself. The refusal now
+    charges its own bucket on the way out, which keeps both properties.
     """
 
     async def _dependency(request: Request, presented: str | None = _API_KEY) -> Tier:
@@ -93,7 +98,15 @@ def _gate(bucket: str, *, meter_spend: bool = False):
             # container HEALTHCHECK times out at 3s, so a stalled loop that cannot
             # answer /health gets the machine restarted, killing every in-flight run.
             # HTTPException raised in the thread propagates back through to_thread.
-            await asyncio.to_thread(enforce_daily_budget, app.state.conn)
+            try:
+                await asyncio.to_thread(enforce_daily_budget, app.state.conn)
+            except HTTPException:
+                # Metered after the fact, not before: the bucket must only be spent by
+                # requests the ceiling actually refused, so a healthy service never
+                # touches it. A 429 from here replaces the 503, which is the intended
+                # answer to a retry loop — the 503's copy is for a visitor, not a flood.
+                await enforce("process", "outage", request)
+                raise
         await enforce(bucket, tier, request)
         return tier
 

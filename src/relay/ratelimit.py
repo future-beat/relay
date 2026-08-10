@@ -60,6 +60,10 @@ _LIMIT_SETTINGS: dict[tuple[str, str], str] = {
     ("create", "owner"): "owner_create_limit",
     ("read", "demo"): "demo_read_limit",
     ("read", "owner"): "owner_read_limit",
+    # Charged only on the daily-ceiling refusal, so the 503 path is metered without
+    # spending the tiered allowance a global outage did not consume. Keyed by a
+    # pseudo-tier: the ceiling is global, so the caller's tier is irrelevant to it.
+    ("process", "outage"): "outage_process_limit",
 }
 
 _items: dict[tuple[str, str], RateLimitItem] = {}
