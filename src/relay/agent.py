@@ -15,6 +15,11 @@ Guardrails enforced here (phase 1, remaster):
   the model's tool arguments are therefore untrusted output, so a tool call
   naming a different ticket is denied before execution rather than rebound
 
+Guardrails enforced here (phase 3, remaster):
+- a reply may only cite source ids search_docs returned during this run: anything
+  else is denied with a retry instruction rather than silently stripped, so the
+  model's grounding claim is checked against what it was actually handed
+
 Observability (phase 4): every run is an OpenTelemetry `agent.run` span with
 one child span per model request and per tool execution, and each step emits
 a structured JSON log line.
@@ -325,6 +330,26 @@ async def run_ticket(
                                 "expected_ticket_id": payload["expected_ticket_id"],
                                 "supplied_ticket_id": payload["supplied_ticket_id"],
                                 "action": "denied",
+                            },
+                        )
+                    if block.name == "search_docs" and not is_error and payload.get("degraded"):
+                        # A notice, not a guardrail: nothing was denied, the run just
+                        # got weaker results than it asked for. Never ends the run —
+                        # keyword hits are still hits, and silence here would hide a
+                        # Voyage outage behind results that look normal (RAG-05, D-14).
+                        logger.warning("retrieval.degraded", extra={"ctx": {
+                            "ticket_id": ticket["id"],
+                            "tool": block.name,
+                            "retrieval_mode": payload.get("retrieval_mode"),
+                            "results": len(payload.get("results", [])),
+                        }})
+                        yield AgentEvent(
+                            type="notice",
+                            data={
+                                "kind": "retrieval_degraded",
+                                "tool": block.name,
+                                "retrieval_mode": payload.get("retrieval_mode"),
+                                "results": len(payload.get("results", [])),
                             },
                         )
                     if citation_violation:

@@ -3,6 +3,7 @@ import inspect
 import json
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
 from relay.agent import _execute_guarded, bind_to_ticket, run_ticket
@@ -14,6 +15,7 @@ from relay.guardrails import (
     ToolPolicy,
     validate_tool_input,
 )
+from relay.prompts import SYSTEM_PROMPT
 
 TICKET = {
     "id": 1,
@@ -512,6 +514,66 @@ def test_the_unbound_path_does_not_enforce_citations(conn, registry):
     )
     assert is_error is False, result
     assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+def test_the_system_prompt_tells_the_model_to_cite_retrieved_ids(registry):
+    # The guard above only ever fires on a model that cites at all. If the instruction
+    # is dropped the guard goes quiet and looks healthy while grounding is unchecked.
+    assert "citations" in SYSTEM_PROMPT
+    assert "search_docs result" in SYSTEM_PROMPT
+    assert "citations" in registry["send_reply"].schema["input_schema"]["properties"]
+
+
+# --- retrieval degradation (RAG-05) ---
+
+
+async def test_retrieval_degraded_emits_notice(conn, registry, monkeypatch):
+    # Voyage configured and failing is the case worth surfacing: the results still look
+    # like results, so without this event the run silently serves keyword-quality hits.
+    monkeypatch.setattr(settings, "voyage_api_key", "test-key-never-sent-anywhere")
+    monkeypatch.setattr(
+        httpx, "post", lambda *a, **kw: (_ for _ in ()).throw(httpx.TimeoutException("down"))
+    )
+    _seed_tickets(conn, TICKET)
+    client = FakeClient([
+        _response([_tool_use("search_docs", {"query": RATE_LIMIT_QUERY}, id="t1")]),
+        _response([_tool_use("send_reply", {
+            "ticket_id": TICKET["id"], "body": GROUNDED_REPLY,
+        }, id="t2")]),
+        _response([_text("Reply sent.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+
+    search = _events_of(events, "tool_result", "search_docs")[0]
+    assert search.data["result"]["degraded"] is True, "Voyage did not actually fail here"
+    notices = _events_of(events, "notice")
+    assert [n.data["kind"] for n in notices] == ["retrieval_degraded"]
+    assert notices[0].data["tool"] == "search_docs"
+    assert notices[0].data["retrieval_mode"] == "keyword"
+    assert events.index(notices[0]) < events.index(search)
+    # A notice, not an ending: the run still resolves on the fallback results.
+    assert events[-1].type == "resolution"
+    assert events[-1].data["via"] == "send_reply"
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+async def test_keyword_baseline_emits_no_notice(conn, registry, keyword_baseline):
+    # No key is the CI and local default, not a degradation — a notice on every run
+    # would make the real one unreadable.
+    _seed_tickets(conn, TICKET)
+    client = FakeClient([
+        _response([_tool_use("search_docs", {"query": RATE_LIMIT_QUERY}, id="t1")]),
+        _response([_tool_use("send_reply", {
+            "ticket_id": TICKET["id"], "body": GROUNDED_REPLY,
+        }, id="t2")]),
+        _response([_text("Reply sent.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+
+    search = _events_of(events, "tool_result", "search_docs")[0]
+    assert search.data["result"]["degraded"] is False
+    assert _events_of(events, "notice") == []
+    assert events[-1].type == "resolution"
 
 
 def test_a_reply_with_no_citations_is_not_denied(conn, registry):
