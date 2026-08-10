@@ -666,3 +666,98 @@ async def test_seed_denial_hook_denies_then_fake_recovers(conn, registry, keywor
     assert events[-1].type == "resolution"
     assert events[-1].data["via"] == "send_reply"
     assert _reply_ticket_ids(conn) == [SEED_DENIAL_TICKET["id"]]
+
+
+class TwoSearchHookDependentClient:
+    """Searches twice for the same doc, then cites the FIRST search's top hit.
+
+    The shape that silently disarmed the probe: `retrieval.anchors()` returns every
+    heading of a returned doc, so a second `search_docs` call touching the same file
+    re-adds the dropped id verbatim. A one-shot discard is undone before the model
+    ever cites — armed hook, seeding logged, zero denials, clean `send_reply`.
+
+    A real model does this routinely: refining a query, or searching once per topic
+    on a two-topic ticket. `HookDependentRecoveringClient` above cannot see it
+    because it searches exactly once.
+    """
+
+    def __init__(self, ticket_id):
+        self.ticket_id = ticket_id
+        self.searches = 0
+        self.first_top_id = None
+        self.second_search_ids: set[str] = set()
+        self.cited_first = None
+        self.recovered_with = None
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, *, messages, **kwargs):
+        payloads = _tool_result_payloads(messages)
+        if not payloads:
+            return response([tool_use_block("search_docs", {"query": "rate limits"}, id="t1")])
+        last = payloads[-1]
+        if "results" in last:
+            self.searches += 1
+            if self.searches == 1:
+                self.first_top_id = last["results"][0]["id"]
+                # Same ground, refined phrasing — the natural second call.
+                return response([tool_use_block(
+                    "search_docs", {"query": "api rate limit policy"}, id="t2"
+                )])
+            for hit in last["results"]:
+                self.second_search_ids.update(
+                    x for x in (hit.get("doc"), hit.get("id")) if x
+                )
+                self.second_search_ids.update(hit.get("anchors") or ())
+            # Cites what the FIRST search handed it — the exact id the hook dropped.
+            self.cited_first = self.first_top_id
+            return response([tool_use_block("send_reply", {
+                "ticket_id": self.ticket_id,
+                "body": GROUNDED_REPLY,
+                "citations": [self.cited_first],
+            }, id="t3")])
+        if last.get("denied_by") == "citation":
+            self.recovered_with = list(last.get("retrieved_ids") or [])
+            return response([tool_use_block("send_reply", {
+                "ticket_id": self.ticket_id,
+                "body": GROUNDED_REPLY,
+                "citations": self.recovered_with,
+            }, id="t4")])
+        return response([text_block("Reply sent.")], stop_reason="end_turn")
+
+
+async def test_seed_denial_survives_a_second_search(conn, registry, keyword_baseline):
+    # mutation (the CR-02 defect itself): make the withholding a one-shot
+    # `retrieved_ids.discard(dropped)` at arming time instead of holding
+    # `seeded_drops` and subtracting it after every grow. The second search re-adds
+    # the dropped id as one of api.md's anchors, no denial fires, and the
+    # `== ["citation"]` assertion below fails — while the run still ends in a clean
+    # send_reply, which is exactly why nothing else catches it.
+    _seed_tickets(conn, SEED_DENIAL_TICKET)
+    client = TwoSearchHookDependentClient(SEED_DENIAL_TICKET["id"])
+
+    events = [e async for e in run_ticket(
+        client, registry, SEED_DENIAL_TICKET, seed_citation_denial=True
+    )]
+
+    # The premise, asserted rather than assumed: the second search really did
+    # re-offer the dropped id. Without this the test could pass vacuously if the
+    # refined query stopped returning api.md.
+    assert client.searches == 2, "the fake did not issue two searches"
+    assert client.cited_first, "the client never saw a search result to cite"
+    assert client.cited_first in client.second_search_ids, (
+        "the second search did not re-offer the dropped id, so this test would pass"
+        " even against a one-shot discard"
+    )
+
+    # The withholding survived it: the denial still fired, once, on the real id.
+    guardrails = [e for e in events if e.type == "guardrail"]
+    assert [e.data["guard"] for e in guardrails] == ["citation"]
+    assert guardrails[0].data["missing_citations"] == [client.cited_first]
+    assert client.cited_first not in guardrails[0].data["retrieved_ids"]
+
+    # ...and it stayed recoverable to a terminal action on its own ticket.
+    assert client.recovered_with
+    assert client.cited_first not in client.recovered_with
+    assert events[-1].type == "resolution"
+    assert events[-1].data["via"] == "send_reply"
+    assert _reply_ticket_ids(conn) == [SEED_DENIAL_TICKET["id"]]

@@ -216,8 +216,12 @@ async def run_ticket(
     # executor holds the same object, so a cite is valid the moment it is retrieved.
     retrieved_ids: set[str] = set()
 
-    # Fires at most once per run, and only when armed (see seed_citation_denial).
-    seed_armed = False
+    # The ids the D-08 probe has withheld from this run's accept-set. Filled at most
+    # once (the first search that returns anything) but enforced for the LIFE of the
+    # run, because a one-shot discard is not a withholding: retrieval.anchors() hands
+    # back every heading of a returned doc, so any later search_docs call touching the
+    # same file re-adds the dropped id verbatim and silently disarms the probe.
+    seeded_drops: set[str] = set()
 
     # Built once per run, from this run's own ticket — never stored on the registry,
     # which is built once and shared by every live run. Every tool call below goes
@@ -334,24 +338,31 @@ async def run_ticket(
                                 if hit.get("id"):
                                     retrieved_ids.add(hit["id"])
                                 retrieved_ids.update(a for a in hit.get("anchors") or () if a)
-                            # Eval-only probe (D-08). Applied AFTER the grow so the
-                            # discard is not undone by a later hit re-adding the same
-                            # id as one of its anchors. Drops the top hit's located id
-                            # — the one the model is most likely to cite — so the very
+                            # Eval-only probe (D-08). Arms on the first search that
+                            # returns anything, withholding the top hit's located id —
+                            # the one the model is most likely to cite — so the very
                             # next send_reply cites something real that this run's
-                            # accept-set no longer contains, and the guard denies it
-                            # once. The dummy keeps the set non-empty, so the denial
-                            # still names ids to retry with and stays recoverable.
+                            # accept-set does not contain, and the guard denies it. The
+                            # dummy keeps the set non-empty, so the denial still names
+                            # ids to retry with and stays recoverable.
                             hits = payload.get("results") or []
-                            if seed_citation_denial and not seed_armed and hits:
+                            if seed_citation_denial and not seeded_drops and hits:
                                 dropped = hits[0].get("id")
                                 if dropped:
-                                    retrieved_ids.discard(dropped)
+                                    seeded_drops.add(dropped)
                                     retrieved_ids.add("__seeded_missing__")
-                                    seed_armed = True
                                     logger.warning("guardrail.citation_denial_seeded",
                                                    extra={"ctx": {"ticket_id": ticket["id"],
                                                                   "dropped_id": dropped}})
+                            # Re-applied after EVERY grow, not just the arming one. A
+                            # second search returning the same file re-adds the dropped
+                            # id as one of its anchors, and a probe that disarms itself
+                            # produces an armed hook, zero denials and a clean terminal
+                            # action — byte-identical in the artifact to a genuine
+                            # recovery, which is the unfalsifiability D-08 exists to
+                            # close. In place (the executor holds this exact set by
+                            # reference); rebinding it would unbind the guard.
+                            retrieved_ids.difference_update(seeded_drops)
                         span.set_attributes({
                             "relay.tool.tier": spec.tier if spec else "unknown",
                             "relay.tool.is_error": is_error,
