@@ -13,6 +13,27 @@
 | WR-03 | `transaction()` adoption was untested — stripping it from `send_reply` or `record_run` left 126/126 green | `47b1dbc` |
 | WR-06 | `enforce_daily_budget` blocked the event loop on `Database`'s RLock (measured 0.81s, bounded by `busy_timeout` 5s, exceeding the 3s container HEALTHCHECK) | `39bf266` |
 
+## STATUS: CLOSED 2026-08-10
+
+All four deferred warnings were fixed in the gap-closure pass on `phase-2-async-data-layer`:
+
+| ID | Resolution | Commit |
+|----|-----------|--------|
+| WR-01 | `transaction()` made nest-safe with savepoints (not a depth counter — an inner failure must not roll back the connection) | `977586d` |
+| WR-04 | `register()` raises `RegistryDraining`; the refusal is delivered as an in-stream `error` event since the status line is already 200 | `32d9c2f` |
+| WR-05 | The drain waiter is built on the loop that awaits it, dropped in a `finally` | `5dc3d1e` |
+| WR-07 | Both readers annotated `Database`; a pairing assertion added so the next audit cannot miss it | `cd4e284` |
+
+**Found during the fix, not by either review:** the explicit `BEGIN` in `transaction()` is
+load-bearing. pysqlite only auto-begins ahead of DML, so without it an outer block that has not
+yet written leaves the *inner* block holding the outermost savepoint — and SQLite defines
+`RELEASE` of that savepoint as a commit, reintroducing the original bug by another route. Phase 5's
+`run_events` writer emits a step event before the run row exists, which is exactly that shape.
+Independently verified: removing the `BEGIN` fails
+`test_an_inner_block_that_opens_the_transaction_still_cannot_commit_it`.
+
+The original deferral rationale is preserved below for history.
+
 ## Deferred to gap closure
 
 ### WR-01 — `transaction()` is not nest-safe — **CLOSED `977586d`**
