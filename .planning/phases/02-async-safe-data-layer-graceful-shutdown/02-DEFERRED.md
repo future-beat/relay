@@ -15,7 +15,7 @@
 
 ## Deferred to gap closure
 
-### WR-01 — `transaction()` is not nest-safe
+### WR-01 — `transaction()` is not nest-safe — **CLOSED `977586d`**
 An inner `transaction()` block commits the outer block's partial work; the outer rollback then
 undoes nothing. This reintroduces Pitfall 3 through the very API built to prevent it.
 
@@ -24,7 +24,21 @@ undoes nothing. This reintroduces Pitfall 3 through the very API built to preven
 already inside a transaction — that is exactly where someone nests. Fix before Phase 5 lands,
 not after.
 
-### WR-04 — a run can register *after* `drain()` has already returned
+**Fixed with savepoints rather than a loud error or a depth counter.** Only the outermost level
+commits or rolls back the connection; inner levels take a `SAVEPOINT`, so an inner unit of work can
+fail on its own without discarding the enclosing one, and an outer rollback still discards it. A
+plain depth counter would have flattened nesting — an inner failure would roll back the whole
+connection, so Phase 5's failed step event would silently take the run row with it.
+
+**The non-obvious half:** the outermost level now issues an explicit `BEGIN`. pysqlite only
+auto-begins ahead of DML, so an outer block that has not written yet leaves the *inner* block
+holding the connection's outermost savepoint — and SQLite defines `RELEASE` of that savepoint as a
+commit, which is the original bug by another route. Phase 5's writer emits a step event before the
+run row exists, i.e. exactly that shape. Covered by
+`test_an_inner_block_that_opens_the_transaction_still_cannot_commit_it`, which is the only one of
+the three new tests that catches a dropped `BEGIN`.
+
+### WR-04 — a run can register *after* `drain()` has already returned — **CLOSED `32d9c2f`**
 `drain()`'s docstring claims it stops admitting runs, but `RunRegistry.register()` never consults
 `self.draining`. The refusal lives ~100 lines away in `main.py`, is checked in the *handler*, while
 registration happens later in the *generator body* (correctly, per Pitfall 4) — and those two
@@ -41,7 +55,14 @@ practice. **Why it still matters:** it means the drain's own guarantee is weaker
 states, and the honest fix is either to make `register()` refuse while draining or to correct the
 docstring — currently the code and the contract disagree.
 
-### WR-05 — `RunRegistry._idle` binds to the first event loop that waits on it
+**Fixed by enforcing the contract, not by weakening it.** `register()` raises `RegistryDraining`,
+and `event_stream` delivers the same `shutting_down` copy as an in-stream `error` event — by then
+the `StreamingResponse` has locked its status line at 200, so it cannot be a 503. The reservation is
+released explicitly on that path, because returning early skips the `finally` that normally does it.
+The handler's 503 stays: it is the cheap check that keeps the common case out of the generator.
+Phase 5's second registration site inherits the refusal without knowing about `main.py`.
+
+### WR-05 — `RunRegistry._idle` binds to the first event loop that waits on it — **CLOSED `5dc3d1e`**
 `asyncio.Event` is constructed in `__init__` but bound to whichever loop first awaits it. Surfaced
 as a teardown `RuntimeError` under mutation.
 
@@ -50,10 +71,21 @@ removes the fast-path protection outright" — is now closed, because `active` r
 drain short-circuits before touching the event. The second, offloading `record_run` (Pitfall 6),
 is still live. The underlying binding defect is untouched and remains unasserted.
 
-### WR-07 — stale `sqlite3.Connection` annotations in `ratelimit.py`
+**Fixed:** `drain()` builds the `asyncio.Event` on the loop that is about to wait on it and drops it
+in a `finally`, so nothing loop-bound survives a drain. `register()` no longer needs a paired
+`clear()` — a waiter exists only while a drain is waiting, and a drain in progress now refuses new
+runs (WR-04). `test_one_registry_can_drain_on_two_different_event_loops` drains the same registry
+from two `asyncio.run` loops with a run genuinely in flight in each; under the old code it
+reproduces the reviewer's `RuntimeError: ... is bound to a different event loop` verbatim.
+
+### WR-07 — stale `sqlite3.Connection` annotations in `ratelimit.py` — **CLOSED `cd4e284`**
 `ratelimit.py:147,196` still annotate `sqlite3.Connection` though they now receive `Database`.
 Unlike `mcp_server.py`/`evals.py` (recorded as D-11), this file is **not** D-03-protected, so it
 could simply be corrected. The D-11 audit missed it.
+
+**Fixed:** both now annotate `Database`, and `import sqlite3` — which existed only to support these
+two hints — is gone. `test_the_budget_readers_annotate_what_connect_actually_returns` asserts the
+pairing, since nothing asserting it is why the audit missed the file in the first place.
 
 ### Info findings (8)
 Not itemised here. See `02-REVIEW.md` `## Info`.
