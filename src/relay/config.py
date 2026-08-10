@@ -87,10 +87,23 @@ class Settings(BaseSettings):
     # Must match the output_dimension the committed kb index was built with. Changing
     # it without rebuilding the index yields vectors of two different widths.
     voyage_dim: int = 512
-    # Placeholder. The real value is calibrated against the golden set in plan 03-06:
-    # high enough that an off-topic query retrieves nothing, low enough that the
-    # read-then-escalate cases still get their docs. Do not tune this by intuition.
-    retrieval_floor: float = 0.55
+    # Calibrated against the golden set (plan 03-06), not chosen by intuition. Measured
+    # cosines against the committed index: the uncovered topic tops out at 0.2543
+    # ("Salesforce ..." queries, 0.1951–0.2543) and unrelated control queries lower
+    # still (0.1756–0.2000), while a query about a covered topic scores 0.34–0.63 on its
+    # own doc. 0.30 sits in that gap with ~0.05 of margin on the off-topic side, so an
+    # uncovered query yields no semantic hit and — absent keyword hits — `results: []`,
+    # which is what makes the model escalate (D-03/D-04).
+    #
+    # Two covered queries measured below this ("uptime SLA guarantee" 0.2659, and
+    # sub-0.30 second-place docs): they are not starved, because the keyword half of the
+    # hybrid union still returns their doc (D-05). The floor drops the near-uniform
+    # low-similarity noise docs, not the answer.
+    #
+    # The 0.55 this shipped with as a placeholder was far too high: only one of the
+    # twelve golden queries cleared it, so the phase's semantic ranking would have been
+    # silently inert and every case keyword-ranked.
+    retrieval_floor: float = 0.30
 
 
 settings = Settings()
