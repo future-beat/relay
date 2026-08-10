@@ -47,6 +47,7 @@ python3 -m venv .venv && source .venv/bin/activate
 pip install -e ".[dev]"
 
 cp .env.example .env   # add your ANTHROPIC_API_KEY and generate the two RELAY_ keys
+                       # VOYAGE_API_KEY is optional — without it, doc search is keyword-only
 
 uvicorn relay.main:app --reload
 ```
@@ -296,8 +297,33 @@ fly launch --no-deploy
 fly volumes create relay_data --size 1
 fly secrets set ANTHROPIC_API_KEY=sk-ant-...
 fly secrets set RELAY_API_KEY=... RELAY_DEMO_KEY=...
+fly secrets set VOYAGE_API_KEY=pa-...   # omit and doc search stays keyword-only
 fly deploy
 ```
+
+**`VOYAGE_API_KEY` is the one secret whose absence is silent.** Auth fails closed
+and loudly; retrieval fails *soft* by design, because a Voyage outage must never
+end a run. So a machine that boots without the key serves keyword-only doc search
+forever, and every response looks completely normal — no `503`, no error event,
+no `notice`. That last one is deliberate: the degradation notice fires only when
+a deployment is configured for semantic retrieval and does not get it, and "no key
+configured" is the intended baseline (it is what CI runs), not a fault to alarm on.
+
+What tells the two apart is one line in the boot log, emitted once per process:
+
+```json
+{"event": "retrieval.mode_selected", "mode": "semantic", "reason": "ok"}
+```
+
+`mode` is `semantic` or `keyword`; `reason` is `ok`, `no_api_key`, `index_missing`,
+`index_stale`, `index_mismatched`, or `index_unreadable`. Check it after a deploy —
+`fly logs | grep mode_selected` — because the last four mean the key is set and
+paid for and the vectors still are not being used. `index_stale` is the one to
+expect: it means `kb/*.md` was edited without re-running
+`VOYAGE_API_KEY=... python scripts/build_index.py` and committing the
+regenerated `kb/index.json`, so the committed vectors describe
+text the service no longer serves. CI fails on that same hash mismatch; the runtime
+only degrades.
 
 **Set the two key secrets before you deploy, not after.** Auth fails closed, so
 a machine that boots without them returns `503` on every protected route — the

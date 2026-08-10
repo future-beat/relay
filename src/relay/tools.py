@@ -109,6 +109,10 @@ def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
     # it, the same way the other closures capture `conn`. A per-call load would put a
     # disk read and a full re-parse of every vector inside every tool call.
     index = retrieval.load_index(kb_dir)
+    # Every entry point (HTTP lifespan, MCP server, eval harness) builds its registry
+    # here, so this is the one place that can state the selected retrieval mode once
+    # per process rather than three times in three files.
+    retrieval.log_mode_selected(index)
     return {
         "lookup_customer": ToolSpec(
             schema={

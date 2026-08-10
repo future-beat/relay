@@ -16,6 +16,7 @@ import pytest
 from relay import retrieval
 from relay.config import settings
 from relay.retrieval import Doc, Index, headings, kb_sha256, load_index, retrieve, slug
+from relay.tools import build_registry
 
 KB_DIR = Path(__file__).parent.parent / "kb"
 DIM = 512
@@ -396,6 +397,12 @@ def _write_index(tmp_path: Path, *, model=None, dim=DIM, kb_hash=None) -> Path:
     return tmp_path
 
 
+def _malformed_index(tmp_path: Path) -> Path:
+    _write_kb(tmp_path)
+    (tmp_path / "index.json").write_text("{not json")
+    return tmp_path
+
+
 def test_kb_sha256_is_stable_hex_over_the_markdown_only(tmp_path):
     kb = _write_index(tmp_path)
     digest = kb_sha256(kb)
@@ -513,3 +520,103 @@ def test_results_return_whole_files_never_chunks(tmp_path, voyage):
     voyage(_basis([d.doc for d in index.docs].index("billing.md")))
     results, _, _, _ = retrieve(index, "refund policy", key="test-key", floor=0.55)
     assert results[0]["text"].encode("utf-8") == (KB_DIR / "billing.md").read_bytes()
+
+
+# --- WR-04: which mode did this process actually come up in? ---------------------
+#
+# VOYAGE_API_KEY is unset by default and retrieval fails soft, so a deployment can
+# serve keyword-only doc search forever while every response looks normal. The
+# per-request `notice` cannot cover it: no key is the deliberate baseline (D-14), so
+# it deliberately does not fire — leaving the one failure that reaches production
+# with no runtime signal at all.
+
+
+def test_the_reason_vocabulary_is_the_one_the_readme_and_the_log_promise():
+    """Literals, deliberately. Every other test here compares against these names, so
+    if they were only ever compared to `retrieval.X` a rename would pass the whole
+    file while silently breaking `grep mode_selected` and the documented list."""
+    assert retrieval.MODE_OK == "ok"
+    assert retrieval.NO_API_KEY == "no_api_key"
+    assert retrieval.INDEX_MISSING == "index_missing"
+    assert retrieval.INDEX_STALE == "index_stale"
+    assert retrieval.INDEX_MISMATCHED == "index_mismatched"
+    assert retrieval.INDEX_UNREADABLE == "index_unreadable"
+
+
+def test_mode_selected_is_semantic_only_when_a_key_and_a_usable_index_agree(tmp_path):
+    index = load_index(_write_index(tmp_path))
+    assert retrieval.mode_selected(index, key="test-key") == ("semantic", "ok")
+
+
+def test_mode_selected_calls_the_keyless_baseline_a_baseline_not_a_fault(tmp_path):
+    # A usable index and no key is CI's own configuration. Reporting it as a fault
+    # would make the boot line cry wolf on every keyless run, which is most of them.
+    index = load_index(_write_index(tmp_path))
+    assert retrieval.mode_selected(index, key=None) == ("keyword", "no_api_key")
+
+
+@pytest.mark.parametrize(
+    ("prepare", "expected_reason"),
+    [
+        (lambda p: _write_kb(p), "index_missing"),
+        (lambda p: _write_index(p, kb_hash="0" * 64), "index_stale"),
+        (lambda p: _write_index(p, model="voyage-2"), "index_mismatched"),
+        (lambda p: _write_index(p, dim=1024), "index_mismatched"),
+        (lambda p: _malformed_index(p), "index_unreadable"),
+    ],
+    ids=["missing", "stale", "wrong-model", "wrong-dim", "malformed"],
+)
+def test_mode_selected_names_which_way_a_paid_key_still_gets_keyword(
+    tmp_path, prepare, expected_reason
+):
+    """All five degrade identically at query time; only the reason is actionable.
+
+    `index_stale` is a rebuild-and-commit, `index_missing` is a shipping problem, and
+    `index_mismatched` is a settings change nobody re-indexed for. Collapsing them to
+    one string would put the operator back to reading code.
+    """
+    index = load_index(prepare(tmp_path))
+    assert retrieval.mode_selected(index, key="test-key") == ("keyword", expected_reason)
+
+
+def test_the_boot_log_states_the_mode_and_never_the_key(tmp_path, caplog, monkeypatch):
+    monkeypatch.setattr(settings, "voyage_api_key", "pa-not-a-real-voyage-key")
+    index = load_index(_write_index(tmp_path))
+    with caplog.at_level("INFO", logger="relay.retrieval"):
+        assert retrieval.log_mode_selected(index) == ("semantic", "ok")
+    records = [r for r in caplog.records if r.getMessage() == "retrieval.mode_selected"]
+    assert len(records) == 1, "exactly one boot line, or it is not a boot line"
+    assert records[0].ctx["mode"] == "semantic"
+    assert records[0].ctx["reason"] == "ok"
+    # The credential is not an argument to this function and must never leak into it
+    # by way of a helpfully-added context field.
+    assert "pa-not-a-real-voyage-key" not in str(records[0].__dict__)
+
+
+def test_building_the_registry_announces_the_retrieval_mode(conn, caplog):
+    """The boot line has to be on the path every entry point actually takes.
+
+    `build_registry` is where all three (HTTP lifespan, MCP server, eval harness) load
+    the index, so a correct `mode_selected` that nothing calls is worth nothing.
+    """
+    with caplog.at_level("INFO", logger="relay.retrieval"):
+        build_registry(conn, KB_DIR)
+    modes = [
+        r.ctx["mode"] for r in caplog.records if r.getMessage() == "retrieval.mode_selected"
+    ]
+    assert modes == ["keyword"] or modes == ["semantic"]
+
+
+def test_the_readme_documents_the_voyage_secret_and_how_to_read_the_boot_line():
+    """WR-04: the secret existed only in `.env.example`, which no deployer reads.
+
+    Pinned here rather than trusted, for the same reason the published demo key is
+    pinned in tests/test_auth.py: undocumented-secret drift is invisible until a
+    deploy quietly ships the wrong behaviour.
+    """
+    readme = (Path(__file__).parent.parent / "README.md").read_text(encoding="utf-8")
+    assert "fly secrets set VOYAGE_API_KEY" in readme, "no deploy step sets the secret"
+    assert "retrieval.mode_selected" in readme, "the boot line is undocumented"
+    for code in ("no_api_key", "index_missing", "index_stale", "index_mismatched",
+                 "index_unreadable"):
+        assert f"`{code}`" in readme, f"README does not explain the {code!r} reason"

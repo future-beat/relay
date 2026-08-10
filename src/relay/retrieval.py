@@ -44,6 +44,16 @@ REQUEST_ATTEMPTS = 2  # one call plus one manual retry
 _HEADING_RE = re.compile(r"^##?\s+(.*)$", re.MULTILINE)
 _WORD_RE = re.compile(r"\w+")
 
+# Why the process came up in the mode it did (see `mode_selected`). A closed
+# vocabulary, because these are grepped out of the boot log — the prose in
+# `unavailable_reason` carries the detail and is free to change with the exception.
+MODE_OK = "ok"
+NO_API_KEY = "no_api_key"
+INDEX_MISSING = "index_missing"  # kb/index.json was never built or never shipped
+INDEX_STALE = "index_stale"  # kb/*.md moved on without a rebuild — the deploy trap
+INDEX_MISMATCHED = "index_mismatched"  # built for another model/dimension
+INDEX_UNREADABLE = "index_unreadable"  # present but malformed
+
 # The keyword half of the union needs a gate of its own or the union can never be
 # empty, and `[]` is the entire escalation signal (D-03/D-04). Measured against the
 # real KB with the weighting below, not guessed:
@@ -134,6 +144,10 @@ class Index:
     to `retrieve`, which runs per call and is the only thing a run can observe. A
     boot-time WARNING is not a signal: nobody reads it, and the run stream looks
     identical to the deliberate keyless baseline without this (RAG-05, D-14).
+
+    `unavailable_code` is the same fact as a fixed vocabulary rather than prose, so
+    the boot line `mode_selected` emits can be grepped and counted across deploys
+    without matching on an error message that changes with the exception.
     """
 
     docs: list[Doc]
@@ -141,6 +155,7 @@ class Index:
     model: str
     dim: int
     unavailable_reason: str | None = None
+    unavailable_code: str | None = None
 
 
 def load_index(kb_dir: Path) -> Index:
@@ -156,8 +171,8 @@ def load_index(kb_dir: Path) -> Index:
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
         meta = raw["meta"]
-        reason = _meta_mismatch(meta, kb_dir)
-        if reason is None:
+        mismatch = _meta_mismatch(meta, kb_dir)
+        if mismatch is None:
             docs = [
                 Doc(doc=d["doc"], headings=list(d["headings"]), text=d["text"])
                 for d in raw["docs"]
@@ -165,7 +180,10 @@ def load_index(kb_dir: Path) -> Index:
             matrix = np.asarray([d["embedding"] for d in raw["docs"]], dtype=np.float32)
             expected = (len(docs), settings.voyage_dim)
             if matrix.shape != expected:
-                reason = f"embedding matrix is {matrix.shape}, expected {expected}"
+                mismatch = (
+                    INDEX_MISMATCHED,
+                    f"embedding matrix is {matrix.shape}, expected {expected}",
+                )
             else:
                 return Index(
                     docs=docs,
@@ -173,13 +191,56 @@ def load_index(kb_dir: Path) -> Index:
                     model=meta["model"],
                     dim=int(meta["output_dimension"]),
                 )
+        code, reason = mismatch
+    except FileNotFoundError as exc:
+        code, reason = INDEX_MISSING, f"{type(exc).__name__}: {exc}"
     except (OSError, ValueError, KeyError, TypeError) as exc:
-        reason = f"{type(exc).__name__}: {exc}"
+        code, reason = INDEX_UNREADABLE, f"{type(exc).__name__}: {exc}"
     logger.warning(
         "retrieval.index_unavailable",
-        extra={"ctx": {"path": str(path), "reason": reason, "mode": "keyword"}},
+        extra={"ctx": {"path": str(path), "reason": reason, "code": code, "mode": "keyword"}},
     )
-    return _keyword_index(kb_dir, unavailable_reason=reason)
+    return _keyword_index(kb_dir, unavailable_reason=reason, unavailable_code=code)
+
+
+def mode_selected(index: Index, *, key: str | None = _FROM_SETTINGS) -> tuple[str, str]:
+    """Which mode this process will actually serve, and the reason — `(mode, reason)`.
+
+    Pure: it reads the loaded index and the configured key and decides nothing else,
+    so a test can assert every arm without a process boot or a Voyage call.
+
+    `NO_API_KEY` is the deliberate baseline, not a fault; the three `index_*` codes
+    are faults on a deployment that paid for a key and will not get semantic ranking
+    from it.
+    """
+    if key is _FROM_SETTINGS:
+        key = settings.voyage_api_key
+    if not key:
+        return "keyword", NO_API_KEY
+    if index.matrix is None:
+        return "keyword", index.unavailable_code or INDEX_UNREADABLE
+    return "semantic", MODE_OK
+
+
+def log_mode_selected(index: Index) -> tuple[str, str]:
+    """Announce at boot which retrieval mode the process came up in (WR-04).
+
+    Without this, the keyless deployment is invisible: `VOYAGE_API_KEY` is unset by
+    default, so the phase's headline capability can ship off in production, and the
+    per-request `retrieval.degraded` notice deliberately does NOT fire for it (no key
+    is the baseline, not a degradation — D-14). One INFO line at startup is what makes
+    "are we actually running semantic retrieval?" answerable from the boot log instead
+    of from a code read.
+
+    The mode and the reason are logged; the credential is not an argument here and
+    must never become one.
+    """
+    mode, reason = mode_selected(index)
+    logger.info(
+        "retrieval.mode_selected",
+        extra={"ctx": {"mode": mode, "reason": reason, "docs": len(index.docs)}},
+    )
+    return mode, reason
 
 
 def retrieve(
@@ -431,20 +492,35 @@ def _normalize_rows(matrix: np.ndarray) -> np.ndarray:
     return matrix / norms
 
 
-def _meta_mismatch(meta: dict[str, Any], kb_dir: Path) -> str | None:
+def _meta_mismatch(meta: dict[str, Any], kb_dir: Path) -> tuple[str, str] | None:
+    """`(code, reason)` when the committed index does not describe what we serve."""
     if meta.get("model") != settings.voyage_model:
-        return f"index model {meta.get('model')!r} != settings {settings.voyage_model!r}"
+        return (
+            INDEX_MISMATCHED,
+            f"index model {meta.get('model')!r} != settings {settings.voyage_model!r}",
+        )
     if int(meta.get("output_dimension", 0)) != settings.voyage_dim:
         return (
-            f"index dimension {meta.get('output_dimension')!r}"
-            f" != settings {settings.voyage_dim}"
+            INDEX_MISMATCHED,
+            (
+                f"index dimension {meta.get('output_dimension')!r}"
+                f" != settings {settings.voyage_dim}"
+            ),
         )
     if meta.get("kb_sha256") != kb_sha256(kb_dir):
-        return "kb/*.md changed without rebuilding the index — vectors describe stale text"
+        return (
+            INDEX_STALE,
+            "kb/*.md changed without rebuilding the index — vectors describe stale text",
+        )
     return None
 
 
-def _keyword_index(kb_dir: Path, *, unavailable_reason: str | None = None) -> Index:
+def _keyword_index(
+    kb_dir: Path,
+    *,
+    unavailable_reason: str | None = None,
+    unavailable_code: str | None = None,
+) -> Index:
     docs = []
     for path in sorted(Path(kb_dir).glob("*.md")):
         text = path.read_text(encoding="utf-8")
@@ -455,4 +531,5 @@ def _keyword_index(kb_dir: Path, *, unavailable_reason: str | None = None) -> In
         model=settings.voyage_model,
         dim=settings.voyage_dim,
         unavailable_reason=unavailable_reason,
+        unavailable_code=unavailable_code,
     )
