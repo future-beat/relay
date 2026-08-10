@@ -53,10 +53,22 @@ def kb_sha256(kb_dir: Path) -> str:
 
     The builder stamps the index with this and the CI staleness gate recomputes it;
     both import this one function so they cannot drift (RAG-02).
+
+    Each file is framed by name and byte length before its content. Concatenating raw
+    bytes alone is blind to where one file ends and the next begins, and blind to names
+    entirely, so ordinary editorial edits collided: splitting a doc in two, renaming a
+    file, and adding an empty one all left the digest unchanged. The gate then passed
+    on an index whose vectors describe text nobody is serving any more — a stale
+    retrieval that looks healthy, which is the dangerous direction to fail in.
     """
     digest = hashlib.sha256()
     for path in sorted(Path(kb_dir).glob("*.md")):
-        digest.update(path.read_bytes())
+        body = path.read_bytes()
+        digest.update(path.name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(str(len(body)).encode("ascii"))
+        digest.update(b"\0")
+        digest.update(body)
     return digest.hexdigest()
 
 

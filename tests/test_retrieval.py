@@ -217,6 +217,7 @@ def test_query_path_sends_input_type_query(index, kb_docs, voyage):
 
 
 def _write_kb(tmp_path: Path) -> Path:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     for path in sorted(KB_DIR.glob("*.md")):
         (tmp_path / path.name).write_bytes(path.read_bytes())
     return tmp_path
@@ -253,6 +254,38 @@ def test_kb_sha256_is_stable_hex_over_the_markdown_only(tmp_path):
     assert digest == kb_sha256(KB_DIR), "index.json is not *.md, so it must not be hashed"
     (kb / "billing.md").write_text("changed")
     assert kb_sha256(kb) != digest
+
+
+def test_kb_sha256_detects_edits_that_leave_the_raw_bytes_identical(tmp_path):
+    """RAG-02's gate is only as good as the digest. These three edits are ordinary.
+
+    A digest over concatenated file bytes is blind to file boundaries and to names, so
+    all three used to hash identically to the untouched KB: `load_index` kept the old
+    vectors, the new file was invisible to semantic ranking, and CI stayed green.
+    """
+    original = kb_sha256(_write_kb(tmp_path / "original"))
+
+    split = _write_kb(tmp_path / "split")
+    body = (split / "billing.md").read_bytes()
+    (split / "billing.md").write_bytes(body[: len(body) // 2])
+    (split / "billing2.md").write_bytes(body[len(body) // 2 :])
+    assert kb_sha256(split) != original, "splitting a doc in two must change the hash"
+
+    renamed = _write_kb(tmp_path / "renamed")
+    (renamed / "api.md").rename(renamed / "apiz.md")  # sort order preserved
+    assert kb_sha256(renamed) != original, "renaming a doc must change the hash"
+
+    added = _write_kb(tmp_path / "added")
+    (added / "zzz.md").write_bytes(b"")
+    assert kb_sha256(added) != original, "adding an empty doc must change the hash"
+
+    moved = _write_kb(tmp_path / "moved")
+    tail = (moved / "api.md").read_bytes()
+    (moved / "api.md").write_bytes(tail[:-40])
+    (moved / "billing.md").write_bytes(tail[-40:] + (moved / "billing.md").read_bytes())
+    assert kb_sha256(moved) != original, (
+        "moving a trailing paragraph between two docs must change the hash"
+    )
 
 
 def test_load_index_reads_the_committed_matrix(tmp_path):
