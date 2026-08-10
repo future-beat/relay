@@ -78,12 +78,14 @@ def _gate(bucket: str, *, meter_spend: bool = False):
         await enforce("auth", "anon", request)
         tier = _ANY_TIER(presented)
         if meter_spend:
-            # The one DB read left on the event loop, and deliberately so. It sums
-            # tens of rows behind idx_runs_created_at, so contention is microseconds;
-            # offloading it would also move a read of ratelimit's in-process
-            # reservations onto a worker thread, and that state is not this phase's
-            # to disturb.
-            enforce_daily_budget(app.state.conn)
+            # Offloaded, because the cost here is acquiring Database's lock, not
+            # running the query. The SUM is microseconds behind idx_runs_created_at,
+            # but a worker thread holds that lock for a whole transaction() — a
+            # measured 0.81s loop stall, bounded only by busy_timeout (5s). The
+            # container HEALTHCHECK times out at 3s, so a stalled loop that cannot
+            # answer /health gets the machine restarted, killing every in-flight run.
+            # HTTPException raised in the thread propagates back through to_thread.
+            await asyncio.to_thread(enforce_daily_budget, app.state.conn)
         await enforce(bucket, tier, request)
         return tier
 

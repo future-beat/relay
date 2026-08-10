@@ -589,3 +589,50 @@ def test_shutdown_timeouts_nest_correctly():
     graceful_seconds = int(window.group(1))
 
     assert kill_timeout > graceful_seconds > settings.shutdown_drain_seconds
+
+
+# --- the budget read is offloaded (WR-06) ---
+
+
+async def test_the_daily_budget_read_runs_off_the_event_loop(client, monkeypatch):
+    # The cost here is acquiring Database's lock, not running the SUM: a worker
+    # thread holds that lock for a whole transaction(), so an inline read stalls the
+    # loop for as long as the write takes — measured at 0.81s, bounded only by
+    # busy_timeout (5s). The container HEALTHCHECK gives up at 3s, so a stalled loop
+    # that cannot answer /health gets the machine restarted mid-run.
+    #
+    # The signal is whether a *running loop* exists in the calling thread, not thread
+    # identity: TestClient drives the app from a portal thread, so comparing against
+    # the test's own thread id passes even when the read is inline.
+    import relay.main as main_module
+
+    on_loop: list[bool] = []
+    real = main_module.enforce_daily_budget
+
+    def recording(conn):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_loop.append(False)
+        else:
+            on_loop.append(True)
+        return real(conn)
+
+    monkeypatch.setattr(main_module, "enforce_daily_budget", recording)
+
+    ticket_id = _make_ticket(client)
+    # Drain-refusal short-circuits the handler *after* the gate dependency has run,
+    # so the spend gate is exercised without starting a real agent run.
+    app.state.runs.draining = True
+    try:
+        resp = client.post(f"/tickets/{ticket_id}/process")
+    finally:
+        app.state.runs.draining = False
+
+    assert resp.status_code == 503
+    assert on_loop, "enforce_daily_budget was never reached on a spend-metered route"
+    assert not any(on_loop), (
+        "the daily budget read ran with a live event loop in its thread, i.e. inline — "
+        "it must be offloaded, because it blocks on Database's lock for the length of "
+        "any in-flight write"
+    )
