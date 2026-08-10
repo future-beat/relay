@@ -107,6 +107,33 @@ async def test_register_refuses_once_the_drain_has_returned():
     assert await registry.drain(timeout=0.05) is True
 
 
+def test_one_registry_can_drain_on_two_different_event_loops():
+    # asyncio.Event binds to the loop that first awaits it. Held as an attribute from
+    # __init__, the second drain raised "... is bound to a different event loop" out of
+    # lifespan shutdown. Only the fast path hid it: on an empty registry drain() returns
+    # before touching the event, so every existing test took the branch that never
+    # binds. Both drains below wait for real, which is the only way this is visible.
+    # Two asyncio.run() calls and not one loop, because the binding is per-loop —
+    # nothing about this reproduces inside a single loop.
+    registry = RunRegistry()
+
+    async def drain_with_a_run_actually_in_flight() -> bool:
+        token = registry.register(ticket_id=1)
+        task = asyncio.create_task(registry.drain(timeout=5.0))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert not task.done(), "the drain took its fast path — this proves nothing"
+        registry.deregister(token)
+        return await task
+
+    assert asyncio.run(drain_with_a_run_actually_in_flight()) is True
+    # A process drains once; the registry is the primitive phase 5 reuses, and the
+    # suite already drives it from both a TestClient portal loop and asyncio.run().
+    # Cleared by hand because register() now refuses while draining.
+    registry.draining = False
+    assert asyncio.run(drain_with_a_run_actually_in_flight()) is True
+
+
 # --- the drain as lifespan actually wires it ---
 #
 # Everything above builds its own RunRegistry and calls drain() by hand, which tests the

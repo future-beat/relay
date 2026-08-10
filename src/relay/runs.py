@@ -6,11 +6,16 @@ not part of ratelimit.py: that module is scoped to burst limiting and the daily
 spend ceiling, and run-lifecycle tracking is neither of those.
 
 The registry is an instance created per app startup and stored on app.state,
-never module-level state like ratelimit.py's reservations. An asyncio.Event
-binds to the loop it is first awaited on, so a shared module-level instance
-would outlive a TestClient's loop and fail against the next one with
-"... bound to a different event loop". ratelimit.py gets away with globals only
-because MemoryStorage constructs safely outside a running loop.
+never module-level state like ratelimit.py's reservations. ratelimit.py gets
+away with globals only because MemoryStorage constructs safely outside a
+running loop.
+
+Nothing loop-bound is held between drains either: an asyncio.Event binds to the
+loop it is first awaited on, so one built in __init__ and kept as an attribute
+fails the second drain with "... bound to a different event loop". The registry
+outlives a single loop only by accident today — the eval harness and the test
+suite both run more than one — so drain() builds its waiter on the loop that is
+about to wait on it and drops it again on the way out.
 """
 
 import asyncio
@@ -52,10 +57,11 @@ class RunRegistry:
     def __init__(self) -> None:
         self._active: dict[int, ActiveRun] = {}
         self._tokens = itertools.count()
-        # Set means "nothing in flight", so a drain against an idle registry takes
-        # the fast path instead of ever suspending.
-        self._idle = asyncio.Event()
-        self._idle.set()
+        # Deliberately not an asyncio.Event built here: it would bind to whichever
+        # loop first awaited it and raise on every later one. drain() builds it, and
+        # only when it is actually going to wait — an idle registry takes the fast
+        # path and never needs a waiter at all.
+        self._idle: asyncio.Event | None = None
         self.draining = False
 
     def register(self, *, ticket_id: int) -> int:
@@ -85,13 +91,14 @@ class RunRegistry:
             raise RegistryDraining("registry is draining; refusing to admit a new run")
         token = next(self._tokens)
         self._active[token] = ActiveRun(ticket_id=ticket_id, started_at=time.monotonic())
-        self._idle.clear()
+        # No clear() to pair with deregister's set(): a waiter only exists while a
+        # drain is waiting, and a drain in progress refuses new runs above.
         return token
 
     def deregister(self, token: int) -> None:
         """Retire one run. Idempotent, and never retires another run's."""
         self._active.pop(token, None)
-        if not self._active:
+        if not self._active and self._idle is not None:
             self._idle.set()
 
     @property
@@ -111,6 +118,17 @@ class RunRegistry:
             return True
 
         logger.info("shutdown.drain_started", extra={"ctx": {"active": len(self._active)}})
+        # Built here, on the loop that is about to wait on it, and dropped again
+        # below: an asyncio.Event kept as an attribute binds to the first loop that
+        # awaits it and raises "bound to a different event loop" on every later one.
+        # Nothing but the fast path above was preventing that.
+        self._idle = asyncio.Event()
+        if not self._active:
+            # Re-checked because deregister() only signals a waiter that exists: a
+            # removal landing between the fast path and this line would otherwise
+            # wait out the full grace period against an already-empty registry.
+            self._idle = None
+            return True
         try:
             # Wakes on the event rather than polling: a poll loop would add its own
             # interval to every clean teardown for no benefit.
@@ -131,6 +149,11 @@ class RunRegistry:
                 },
             )
             return False
+        finally:
+            # Dropped whichever way this went, so no loop-bound object survives the
+            # drain that built it. A timed-out drain matters most: the registry is
+            # still non-empty, so those runs' deregisters are still to come.
+            self._idle = None
 
         logger.info("shutdown.drain_complete", extra={"ctx": {}})
         return True
