@@ -1,4 +1,22 @@
+import inspect
 import json
+from pathlib import Path
+
+import pytest
+
+from relay import retrieval
+from relay.config import settings
+from relay.tools import build_registry
+
+KB_DIR = Path(__file__).parent.parent / "kb"
+
+
+@pytest.fixture(autouse=True)
+def _keyword_baseline(monkeypatch):
+    # No key => retrieve() stays on the keyword scorer. These tests assert the tool's
+    # envelope and the phase-1 ranking baseline, not Voyage's ordering, and must never
+    # reach the network just because a developer happens to have VOYAGE_API_KEY set.
+    monkeypatch.setattr(settings, "voyage_api_key", None)
 
 
 def test_lookup_customer_found(registry):
@@ -18,9 +36,52 @@ def test_search_docs_grounds_billing_questions(registry):
     assert "billing.md" in docs
 
 
+def test_search_docs_results_carry_the_citation_shape(registry):
+    result = json.loads(registry["search_docs"].execute(query="refund policy"))
+    assert result["results"], "no hit to inspect — the assertions below would be vacuous"
+    for hit in result["results"]:
+        assert set(hit) == {"doc", "heading", "id", "text", "score"}
+        assert hit["id"].startswith(hit["doc"])
+    assert result["retrieval_mode"] == "keyword"
+    assert result["degraded"] is False
+
+
+def test_search_docs_returns_whole_files_never_chunks(registry):
+    # D-01/D-02: the envelope stays byte-compatible with phase 1 — only ranking changed.
+    result = json.loads(registry["search_docs"].execute(query="refund policy"))
+    hit = next(r for r in result["results"] if r["doc"] == "billing.md")
+    assert hit["text"] == (KB_DIR / "billing.md").read_text(encoding="utf-8")
+
+
 def test_search_docs_no_match(registry):
     result = json.loads(registry["search_docs"].execute(query="zzzzz qqqqq"))
+    # Empty results are the escalation signal (D-03) — never a fabricated best guess.
     assert result["results"] == []
+    assert result["retrieval_mode"] == "keyword"
+
+
+def test_search_docs_reads_the_index_once_not_per_call(conn, monkeypatch):
+    # The closure captures the loaded matrix; a per-call load_index would put a disk
+    # read (and a re-parse of every embedding) inside every tool call.
+    calls: list[Path] = []
+    real_load_index = retrieval.load_index
+
+    def counting_load_index(kb_dir):
+        calls.append(kb_dir)
+        return real_load_index(kb_dir)
+
+    monkeypatch.setattr(retrieval, "load_index", counting_load_index)
+    built = build_registry(conn, KB_DIR)
+    for _ in range(3):
+        built["search_docs"].execute(query="refund policy")
+
+    assert len(calls) == 1
+
+
+def test_search_docs_stays_synchronous(registry):
+    # It runs inside phase 2's asyncio.to_thread seam: a coroutine function here would
+    # hand the model an un-awaited coroutine object.
+    assert not inspect.iscoroutinefunction(registry["search_docs"].execute)
 
 
 def test_escalation_marks_ticket(conn, registry):
