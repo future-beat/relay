@@ -133,7 +133,20 @@ Plans:
   3. A prompt-injection golden case fails if the server-side `ticket_id` guard is removed
   4. A deterministic citation-faithfulness check (no LLM judge) fails if a reply cites an unretrieved chunk
 
-**Plans**: TBD
+**Plans**: 3 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 04-01-PLAN.md — Labeled retrieval set + recall@k/MRR (report-only) + VOYAGE_API_KEY on paid dispatch (EVAL-01)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 04-02-PLAN.md — Prompt-injection golden case + report-wide citation-faithfulness subset check (EVAL-02/EVAL-03)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 04-03-PLAN.md — D-08 denial-recovery seeding hook + paid arming path + free mechanism test (EVAL-03)
 
 ### Phase 5: Run Event Persistence & Live Feed
 
@@ -175,6 +188,6 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 1. Security Perimeter | 5/5 | Complete   | 2026-08-09 |
 | 2. Async-Safe Data Layer & Graceful Shutdown | 5/5 | Complete   | 2026-08-09 |
 | 3. Semantic Retrieval | 5/6 | In Progress|  |
-| 4. Evaluation Coverage | 0/TBD | Not started | - |
+| 4. Evaluation Coverage | 0/3 | Not started | - |
 | 5. Run Event Persistence & Live Feed | 0/TBD | Not started | - |
 | 6. Dashboard Experience | 0/TBD | Not started | - |
