@@ -1,9 +1,16 @@
+import json
 from dataclasses import asdict
+from pathlib import Path
+
+import pytest
 
 from helpers import FakeClient, response, text_block, tool_use_block
+from relay.config import settings
 from relay.db import SEED_CUSTOMERS
 from relay.evals import extract_outcome, load_golden
 from relay.models import AgentEvent, TicketCategory
+from relay.retrieval import load_index, slug
+from relay.retrieval_eval import load_labels, mrr, recall_at_k, scored_labels
 
 SEED_EMAILS = {c[0] for c in SEED_CUSTOMERS}
 VALID_ACTIONS = {"send_reply", "create_escalation"}
@@ -209,3 +216,76 @@ async def test_the_report_artifact_carries_citations_and_retrieval(monkeypatch):
     assert result["citations"] == ["billing.md"]
     assert "billing.md" in result["retrieval"]["retrieved_ids"]
     assert result["retrieval"]["mode"] == "keyword"
+
+
+# --- EVAL-01: labeled retrieval set + recall/MRR (report-only, D-03) -------------
+# All three pin keyword mode: with no key retrieve() cannot reach Voyage, so the
+# free suite bills nothing and conftest's _no_outbound_http guard never fires.
+
+
+@pytest.fixture()
+def keyword_baseline(monkeypatch):
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+
+
+def _index_ids() -> set[str]:
+    """Every id kb/index.json actually licenses — doc names and doc#slug anchors."""
+    raw = json.loads(Path("kb/index.json").read_text())
+    ids: set[str] = set()
+    for doc in raw["docs"]:
+        ids.add(doc["doc"])
+        ids.update(f"{doc['doc']}#{slug(h)}" for h in doc["headings"])
+    return ids
+
+
+def test_retrieval_labels_well_formed():
+    # mutation: point any `relevant` id at a doc/anchor absent from kb/index.json
+    # (e.g. "billing.md#store-credit"), or delete the `rid in known` assertion.
+    labels = load_labels()
+    known = _index_ids()
+    assert len(labels) >= 12
+    ids = [row["id"] for row in labels]
+    assert len(ids) == len(set(ids)), "duplicate label ids"
+    assert any(row["relevant"] == [] for row in labels), "missing the empty-relevant negative"
+    for row in labels:
+        assert row["query"].strip(), f"{row['id']}: empty query"
+        assert isinstance(row["relevant"], list), f"{row['id']}: relevant is not a list"
+        for rid in row["relevant"]:
+            assert rid in known, f"{row['id']}: {rid} is not in kb/index.json"
+
+
+def test_recall_and_mrr_over_labeled_set(keyword_baseline):
+    # mutation: stub relay.retrieval_eval.retrieve to return ([], "keyword", False, None)
+    # — recall@1 over the exact-match row drops to 0.0 and this fails.
+    index = load_index(Path("kb"))
+    labels = load_labels()
+    r1 = recall_at_k(index, labels, 1)
+    r3 = recall_at_k(index, labels, 3)
+    reciprocal = mrr(index, labels)
+    assert 0.0 <= r1 <= 1.0
+    assert 0.0 <= r3 <= 1.0
+    assert 0.0 <= reciprocal <= 1.0
+    assert r3 >= r1, "recall@3 cannot be below recall@1"
+
+    # A query whose relevant doc keyword-matches must rank first. This is the
+    # assertion that breaks if the metric stops consulting the shipped retriever.
+    exact = [row for row in labels if row["id"] == "password-reset"]
+    assert len(exact) == 1
+    assert recall_at_k(index, exact, 1) == 1.0
+
+    # The `relevant: []` negative is excluded from the denominator — N-1, not N.
+    # One guaranteed hit plus one negative must read 1.0; counting the negative
+    # would read 0.5 and silently understate every reported number.
+    negative = [row for row in labels if row["relevant"] == []]
+    assert len(negative) == 1
+    mixed = exact + negative
+    assert len(scored_labels(mixed)) == len(mixed) - 1
+    assert recall_at_k(index, mixed, 3) == 1.0
+    assert mrr(index, mixed) == 1.0
+
+
+def test_soft_floor_recall3_positive(keyword_baseline):
+    # mutation: make recall_at_k return 0.0 (dead retrieval) — this fails.
+    # Soft floor only (D-03): a wiring tripwire, never a numeric quality gate.
+    index = load_index(Path("kb"))
+    assert recall_at_k(index, load_labels(), 3) > 0
