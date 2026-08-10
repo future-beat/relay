@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from relay.agent import _execute_guarded, bind_to_ticket, run_ticket
+from relay.config import settings
 from relay.guardrails import (
     RunBudget,
     SendReplyInput,
@@ -332,6 +333,193 @@ def test_the_unbound_path_still_executes_a_ticket_id_bearing_tool(conn, registry
     # keep working, or the fix above breaks the MCP surface it is not allowed to edit.
     _seed_tickets(conn, TICKET)
     result, is_error = _execute_guarded(
+        registry["send_reply"],
+        "send_reply",
+        {"ticket_id": TICKET["id"], "body": GROUNDED_REPLY},
+        ToolPolicy(),
+    )
+    assert is_error is False, result
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+# --- citation guard (RAG-04) ---
+
+# A citation for a doc that is not in kb/ at all, so no retrieval this run — semantic,
+# keyword or degraded — can ever have returned it. This is the hallucinated-source case.
+FABRICATED_CITE = "refunds-2019.md#store-credit"
+
+RATE_LIMIT_QUERY = "rate limits"
+
+
+@pytest.fixture()
+def keyword_baseline(monkeypatch):
+    # The citation guard is about ids, not ranking: pin these runs to the keyword scorer
+    # so they assert the same thing on a developer machine with VOYAGE_API_KEY set as
+    # they do in CI without one.
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+
+
+def _tool_result_payloads(messages):
+    """The payloads the loop last handed back, as the model would read them."""
+    if len(messages) < 2 or not isinstance(messages[-1]["content"], list):
+        return []
+    return [
+        json.loads(block["content"])
+        for block in messages[-1]["content"]
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+
+
+def _events_of(events, type_, tool=None):
+    return [
+        e for e in events
+        if e.type == type_ and (tool is None or e.data.get("tool") == tool)
+    ]
+
+
+async def test_unretrieved_citation_is_denied(conn, registry, keyword_baseline):
+    _seed_tickets(conn, TICKET)
+    client = FakeClient([
+        _response([_tool_use("search_docs", {"query": RATE_LIMIT_QUERY}, id="t1")]),
+        _response([_tool_use("send_reply", {
+            "ticket_id": TICKET["id"],
+            "body": GROUNDED_REPLY,
+            "citations": [FABRICATED_CITE],
+        }, id="t2")]),
+        _response([_text("Understood.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+
+    search = _events_of(events, "tool_result", "search_docs")[0]
+    assert search.data["result"]["results"], (
+        "search_docs returned nothing, so the denial below would fire on an empty"
+        " retrieved set and prove nothing about subset validation"
+    )
+    reply = _events_of(events, "tool_result", "send_reply")[0]
+    assert reply.data["is_error"] is True
+    assert reply.data["result"]["denied_by"] == "citation"
+    assert reply.data["result"]["missing_citations"] == [FABRICATED_CITE]
+    # Real ids were on offer and the fabricated one still did not pass.
+    assert reply.data["result"]["retrieved_ids"]
+    assert FABRICATED_CITE not in reply.data["result"]["retrieved_ids"]
+    assert _reply_ticket_ids(conn) == []
+
+
+async def test_citation_denial_emits_guardrail_event(conn, registry, keyword_baseline):
+    _seed_tickets(conn, TICKET)
+    client = FakeClient([
+        _response([_tool_use("search_docs", {"query": RATE_LIMIT_QUERY}, id="t1")]),
+        _response([_tool_use("send_reply", {
+            "ticket_id": TICKET["id"],
+            "body": GROUNDED_REPLY,
+            "citations": [FABRICATED_CITE],
+        }, id="t2")]),
+        _response([_text("Understood.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+
+    guardrails = _events_of(events, "guardrail")
+    assert len(guardrails) == 1
+    assert guardrails[0].data["guard"] == "citation"
+    assert guardrails[0].data["tool"] == "send_reply"
+    assert guardrails[0].data["missing_citations"] == [FABRICATED_CITE]
+    assert guardrails[0].data["action"] == "denied"
+    # Cause before effect: the denial, then the result it produced.
+    guard_at = events.index(guardrails[0])
+    reply_at = events.index(_events_of(events, "tool_result", "send_reply")[0])
+    assert guard_at < reply_at
+
+
+class RecoveringFakeClient:
+    """Cites a fabricated id once, then cites what the denial handed back.
+
+    The recovery step deliberately reads `retrieved_ids` out of the denial payload
+    rather than being scripted with the right answer: if the denial stops naming the
+    valid ids, this client has nothing to retry with and the run dies without a
+    terminal action — which is exactly the regression the wording exists to prevent.
+    """
+
+    def __init__(self, ticket_id):
+        self.ticket_id = ticket_id
+        self.recovered_with = None
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, *, messages, **kwargs):
+        payloads = _tool_result_payloads(messages)
+        if not payloads:
+            return _response([_tool_use("search_docs", {"query": RATE_LIMIT_QUERY}, id="t1")])
+        last = payloads[-1]
+        if "results" in last:
+            return _response([_tool_use("send_reply", {
+                "ticket_id": self.ticket_id,
+                "body": GROUNDED_REPLY,
+                "citations": [FABRICATED_CITE],
+            }, id="t2")])
+        if last.get("denied_by") == "citation":
+            self.recovered_with = list(last.get("retrieved_ids") or [])
+            return _response([_tool_use("send_reply", {
+                "ticket_id": self.ticket_id,
+                "body": GROUNDED_REPLY,
+                "citations": self.recovered_with,
+            }, id="t3")])
+        return _response([_text("Reply sent.")], stop_reason="end_turn")
+
+
+async def test_run_recovers_after_citation_denial(conn, registry, keyword_baseline):
+    # Pitfall 1: a citation denial is is_error=True, so resolved_via stays None. If the
+    # model treats it as final the run ends `ended_without_action` and the eval gate
+    # regresses. The denial has to be a retry instruction, and this is what proves it.
+    _seed_tickets(conn, TICKET)
+    client = RecoveringFakeClient(TICKET["id"])
+    events = await collect(run_ticket(client, registry, TICKET))
+
+    assert [e.data["guard"] for e in _events_of(events, "guardrail")] == ["citation"]
+    assert client.recovered_with, (
+        "the denial named no retrieved ids, so the model had nothing to retry with"
+    )
+    assert events[-1].type == "resolution"
+    assert events[-1].data["via"] == "send_reply"
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+def test_the_citation_set_is_also_not_a_per_call_argument_to_forget(conn, registry):
+    # Same argument as the ticket binding: the run's retrieved ids are baked into the
+    # executor when the run starts, so there is no per-call keyword to omit. An empty
+    # set is a real state — "this run has retrieved nothing yet" — and must deny, not
+    # wave everything through the way an unbound MCP call does.
+    executor = bind_to_ticket(TICKET["id"], set())
+    assert list(inspect.signature(executor).parameters) == ["spec", "name", "raw_input", "policy"]
+    result, is_error = executor(
+        registry["send_reply"],
+        "send_reply",
+        {"ticket_id": TICKET["id"], "body": GROUNDED_REPLY, "citations": [FABRICATED_CITE]},
+        ToolPolicy(),
+    )
+    assert is_error is True
+    assert json.loads(result)["denied_by"] == "citation"
+    assert _reply_ticket_ids(conn) == []
+
+
+def test_the_unbound_path_does_not_enforce_citations(conn, registry):
+    # mcp_server.py is frozen (D-03) and has no run, so it has no retrieved ids to check
+    # against. Enforcing there would deny every cited reply on the MCP surface.
+    _seed_tickets(conn, TICKET)
+    result, is_error = _execute_guarded(
+        registry["send_reply"],
+        "send_reply",
+        {"ticket_id": TICKET["id"], "body": GROUNDED_REPLY, "citations": [FABRICATED_CITE]},
+        ToolPolicy(),
+    )
+    assert is_error is False, result
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+def test_a_reply_with_no_citations_is_not_denied(conn, registry):
+    # D-12: citations are optional and validation is subset — [] ⊆ retrieved always
+    # passes, which is what keeps every pre-phase-3 scripted send_reply green.
+    _seed_tickets(conn, TICKET)
+    executor = bind_to_ticket(TICKET["id"], set())
+    result, is_error = executor(
         registry["send_reply"],
         "send_reply",
         {"ticket_id": TICKET["id"], "body": GROUNDED_REPLY},
