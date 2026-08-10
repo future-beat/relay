@@ -29,6 +29,8 @@ from .agent import run_ticket
 from .config import settings
 from .db import connect, init_db
 from .models import AgentEvent
+from .retrieval import load_index
+from .retrieval_eval import load_labels, mrr, recall_at_k
 from .tools import build_registry, lookup_customer
 
 GOLDEN_PATH = Path("evals/golden.jsonl")
@@ -64,6 +66,26 @@ JUDGE_SCHEMA = {
 
 def load_golden(path: Path = GOLDEN_PATH) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def retrieval_metrics() -> dict[str, Any]:
+    """recall@1/@3 + MRR over the labeled set — report-only, never a gate (D-03).
+
+    `mode` is part of the payload because keyword and semantic recall are not
+    comparable numbers: without VOYAGE_API_KEY this measures the keyword
+    fallback, and an unlabeled figure would be read as semantic quality (D-10).
+    """
+    index = load_index(settings.kb_dir)
+    labels = load_labels()
+    key = settings.voyage_api_key
+    return {
+        "mode": "semantic" if key else "keyword",
+        "labeled_queries": len(labels),
+        "scored_queries": len([r for r in labels if r.get("relevant")]),
+        "recall@1": recall_at_k(index, labels, 1, key=key),
+        "recall@3": recall_at_k(index, labels, 3, key=key),
+        "mrr": mrr(index, labels, key=key),
+    }
 
 
 @dataclass
@@ -260,6 +282,8 @@ async def run_evals(limit: int | None, concurrency: int) -> dict[str, Any]:
         "pass_rate": round(passed / len(results), 3) if results else 0.0,
         "mean_quality": round(sum(qualities) / len(qualities), 2) if qualities else None,
         "total_cost_usd": round(sum(r.cost_usd for r in results), 4),
+        # Report-only (D-03): printed and archived, never compared to a threshold.
+        "retrieval_metrics": retrieval_metrics(),
         "results": [asdict(r) for r in results],
     }
 
@@ -282,6 +306,15 @@ def print_summary(report: dict[str, Any]) -> None:
         f" | mean quality {report['mean_quality']}"
         f" | agent cost ${report['total_cost_usd']}"
     )
+    m = report.get("retrieval_metrics")
+    if m:
+        # recall@1 and MRR lead: recall@3 saturates on a 3-doc corpus (D-09).
+        print(
+            f"retrieval ({m['mode']}) recall@1 {m['recall@1']:.2f}"
+            f" | MRR {m['mrr']:.2f}"
+            f" | recall@3 {m['recall@3']:.2f}"
+            f" over {m['scored_queries']} labeled queries — report-only, not gated"
+        )
 
 
 def main() -> None:
