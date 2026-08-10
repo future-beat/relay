@@ -223,3 +223,36 @@ accept; T-03-18 (paid overspend) held — two 12-case runs, $0.565 total agent c
 - Commit `199f822` — FOUND in `git log`
 - Eval reports written: BEFORE `/tmp/relay-baseline/eval_results/eval-20260810T065449Z.json`,
   AFTER `eval_results/eval-20260810T065817Z.json` (gitignored, kept on disk)
+
+---
+
+## Post-fix acceptance re-run (2026-08-10, HEAD `3b69e75`)
+
+The original 12-case eval ran at `199f822`, **before** CR-01..CR-04, WR-02, WR-04 and
+WR-10 landed. CR-04 rewrote the keyword half of the hybrid union that this phase's floor
+calibration depends on, so the verifier correctly ruled the old artifact stale evidence
+for the shipped code. Re-run against current HEAD:
+
+**`eval_results/eval-20260810T090955Z.json` — 12/12 (100%), mean quality 4.92, $0.2774.**
+
+Every expected action matched; `salesforce-integration` still escalates, so CR-04's
+phrasing fix did not break the empty-result signal the floor was calibrated for.
+
+### WR-10's instrumentation answered the open question on its first run
+
+The 03-05 risk — "the citation guard never fired, so we cannot tell whether the model
+recovers, or whether it ever cites at all" — is resolved:
+
+| action | cases citing valid ids |
+|---|---|
+| `send_reply` | **8/8** |
+| `create_escalation` | 0/4 (escalations send no reply, so nothing to cite) |
+
+All 12 ran `retrieval.mode: semantic`, zero degraded. So the earlier silence was the
+guard **correctly staying quiet on eight cases of valid citations**, not a decorative
+guard on a model that never cites. RAG-04 is live in production.
+
+**Still untested:** whether a real model *recovers* from an actual denial. No denial
+fired, because no citation was invalid — which is the good outcome, but it means the
+recovery wording remains proven only against fakes. Forcing a real denial needs the
+eval-only seeding hook described in 03-REVIEW.md WR-10.
