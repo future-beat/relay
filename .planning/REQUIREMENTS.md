@@ -16,8 +16,8 @@
 
 ### Data Layer
 
-- [ ] **DATA-01**: All SQLite access is async-safe (thread offload at the `_execute_guarded`/handler seam, per-connection ownership fixed, WAL + busy_timeout on file databases); the sync `ToolSpec.execute` contract is preserved for MCP and tests
-- [ ] **DATA-02**: Graceful shutdown drains in-flight SSE runs before closing the database; `record_run` persists even when a run is interrupted (moved to a `finally` path)
+- [x] **DATA-01**: All SQLite access is async-safe (thread offload at the `_execute_guarded`/handler seam, per-connection ownership fixed, WAL + busy_timeout on file databases); the sync `ToolSpec.execute` contract is preserved for MCP and tests
+- [x] **DATA-02**: Graceful shutdown drains in-flight SSE runs before closing the database; `record_run` persists even when a run is interrupted (moved to a `finally` path)
 - [ ] **DATA-03**: A `run_events` table persists per-run step events (tool calls, results, retrieval, denials, usage) written during the stream, enabling per-run drill-down
 
 ### Semantic Retrieval
@@ -75,8 +75,8 @@ Mapped by roadmap creation 2026-08-06 — 22/22 v1 requirements, no orphans.
 | SEC-04 | Phase 1 | Complete |
 | SEC-05 | Phase 1 | Complete |
 | SEC-06 | Phase 1 | Complete |
-| DATA-01 | Phase 2 | Pending |
-| DATA-02 | Phase 2 | Pending |
+| DATA-01 | Phase 2 | Complete |
+| DATA-02 | Phase 2 | Complete |
 | RAG-01 | Phase 3 | Pending |
 | RAG-02 | Phase 3 | Pending |
 | RAG-03 | Phase 3 | Pending |

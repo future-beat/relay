@@ -14,7 +14,7 @@ Relay v1 is live at https://relay-agent.fly.dev with a working agent loop, guard
 Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Security Perimeter** - API-key auth, tiered rate limits, daily spend circuit breaker, server-bound ticket_id, MCP writes off by default (completed 2026-08-09)
-- [ ] **Phase 2: Async-Safe Data Layer & Graceful Shutdown** - Thread-safe SQLite with WAL, single async offload seam, drain in-flight SSE runs before close
+- [x] **Phase 2: Async-Safe Data Layer & Graceful Shutdown** - Thread-safe SQLite with WAL, single async offload seam, drain in-flight SSE runs before close (completed 2026-08-09)
 - [ ] **Phase 3: Semantic Retrieval** - Committed Voyage embeddings index, cited replies, keyword fallback
 - [ ] **Phase 4: Evaluation Coverage** - Retrieval recall@k, prompt-injection guard case, citation-faithfulness check, no regression
 - [ ] **Phase 5: Run Event Persistence & Live Feed** - run_events table plus a public, redacted SSE feed rendering live on the dashboard
@@ -67,7 +67,22 @@ Plans:
   3. Sending SIGTERM during an in-flight run lets that run finish streaming before the database closes, instead of erroring mid-stream
   4. A run interrupted by client disconnect or shutdown still appears in `runs` with its cost and outcome recorded
 
-**Plans**: TBD
+**Plans**: 5 plans
+
+Plans:
+**Wave 1**
+
+- [x] 02-01-PLAN.md — `Database` wrapper (RLock + materialised results + `transaction()`), WAL/busy_timeout pragmas, `idx_runs_created_at`, storage tests (DATA-01)
+- [x] 02-02-PLAN.md — `runs.py` `RunRegistry`, `shutdown_drain_seconds`, drain unit tests (DATA-02)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [x] 02-03-PLAN.md — Transactions in `tools.py`/`telemetry.py`, the single `asyncio.to_thread` seam in `agent.py`, ticket-aware test double (DATA-01)
+- [x] 02-04-PLAN.md — HTTP edge: offloaded handlers, registry wiring, drain before `conn.close()`, 503-while-draining (DATA-01/DATA-02)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [x] 02-05-PLAN.md — Concurrency/contract/lifecycle integration tests plus `fly.toml` `kill_timeout` and the Dockerfile graceful-shutdown window (DATA-01/DATA-02)
 
 ### Phase 3: Semantic Retrieval
 
@@ -82,7 +97,29 @@ Plans:
   4. Cold start and CI make zero Voyage calls — the index is a committed, KB-hash-stamped artifact and CI fails when it is stale
   5. With `VOYAGE_API_KEY` unset or the API failing, runs still complete via the keyword scorer and the degradation is visible in the run stream
 
-**Plans**: TBD
+**Plans**: 6 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 03-01-PLAN.md — numpy/httpx deps + Voyage config block (voyage_api_key alias, model/dim/floor) (RAG-01/05)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 03-02-PLAN.md — `retrieval.py`: kb_sha256, load_index, numpy cosine + floor, sync Voyage query, hybrid keyword fallback, citation-id shape; Voyage-free tests (RAG-01/03/05)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 03-03-PLAN.md — `scripts/build_index.py` + committed `kb/index.json` + CI staleness gate (RAG-02)
+- [ ] 03-04-PLAN.md — `search_docs` semantic swap (byte-compatible envelope) + optional `send_reply` citations (RAG-01/03/04)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 03-05-PLAN.md — Thread `retrieved_ids`, citation guard + recovery, `notice` degradation event, prompt/model updates (RAG-04/05)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 03-06-PLAN.md — Floor calibration + paid before/after 12-case eval diff (acceptance gate) (RAG-01/04/05)
 
 ### Phase 4: Evaluation Coverage
 
@@ -136,8 +173,8 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
 | 1. Security Perimeter | 5/5 | Complete   | 2026-08-09 |
-| 2. Async-Safe Data Layer & Graceful Shutdown | 0/TBD | Not started | - |
-| 3. Semantic Retrieval | 0/TBD | Not started | - |
+| 2. Async-Safe Data Layer & Graceful Shutdown | 5/5 | Complete   | 2026-08-09 |
+| 3. Semantic Retrieval | 0/6 | Planned | - |
 | 4. Evaluation Coverage | 0/TBD | Not started | - |
 | 5. Run Event Persistence & Live Feed | 0/TBD | Not started | - |
 | 6. Dashboard Experience | 0/TBD | Not started | - |

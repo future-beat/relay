@@ -10,7 +10,6 @@
 import json
 import logging
 import os
-import sqlite3
 from datetime import UTC, datetime
 from typing import Any
 
@@ -18,6 +17,8 @@ from opentelemetry import trace
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
+
+from .db import Database
 
 
 class JsonFormatter(logging.Formatter):
@@ -54,7 +55,7 @@ def setup_tracing(service_name: str = "relay") -> None:
 
 
 def record_run(
-    conn: sqlite3.Connection,
+    conn: Database,
     *,
     ticket_id: int,
     model: str,
@@ -65,12 +66,16 @@ def record_run(
     cost_usd: float,
     outcome: str,
 ) -> None:
-    conn.execute(
-        "INSERT INTO runs (ticket_id, model, duration_ms, steps, input_tokens,"
-        " output_tokens, cost_usd, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (ticket_id, model, duration_ms, steps, input_tokens, output_tokens, cost_usd, outcome),
-    )
-    conn.commit()
+    # One statement, but the commit is what matters: a bare commit() is connection-scoped
+    # and would land another request's half-finished write alongside this row.
+    # Stays synchronous — this runs in event_stream's finally, where an extra suspension
+    # point is a risk with no measurable payoff (one INSERT, tens of microseconds).
+    with conn.transaction():
+        conn.execute(
+            "INSERT INTO runs (ticket_id, model, duration_ms, steps, input_tokens,"
+            " output_tokens, cost_usd, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (ticket_id, model, duration_ms, steps, input_tokens, output_tokens, cost_usd, outcome),
+        )
 
 
 def _percentile(sorted_values: list[int], pct: float) -> int:
@@ -80,7 +85,7 @@ def _percentile(sorted_values: list[int], pct: float) -> int:
     return sorted_values[index]
 
 
-def run_metrics(conn: sqlite3.Connection) -> dict[str, Any]:
+def run_metrics(conn: Database) -> dict[str, Any]:
     rows = [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY id").fetchall()]
     durations = sorted(r["duration_ms"] for r in rows)
     outcomes: dict[str, int] = {}

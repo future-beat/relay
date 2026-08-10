@@ -3,6 +3,17 @@ from pathlib import Path
 from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# The value D-02 publishes for the hosted demo, in one place so the README, the demo
+# script and `fly secrets set RELAY_DEMO_KEY=...` cannot drift into disagreeing — the
+# README used to carry a literal that no test looked at, and a visitor running
+# scripts/demo.sh against a different one got a 401 they could not diagnose.
+#
+# Deliberately not the default for `demo_key` below. Auth fails closed when no key is
+# configured, and a default here would make every unconfigured deployment accept a key
+# published on the internet. It documents what the hosted instance is deployed with;
+# .env.example still ships empty so local dev generates its own.
+PUBLISHED_DEMO_KEY = "relay-demo-2026"
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RELAY_", env_file=".env", extra="ignore")
@@ -39,11 +50,25 @@ class Settings(BaseSettings):
     owner_create_limit: str = "120/hour"
     demo_read_limit: str = "120/hour"
     owner_read_limit: str = "600/hour"
+    # Charged only by requests the daily ceiling refuses. Without it, an exhausted
+    # budget made /process an unthrottled endpoint — the tiered window below is never
+    # reached once the 503 raises, so the anon 60/minute was the only remaining cap and
+    # every one of those requests still ran a SUM over the runs table. Tier-independent
+    # and per-IP, because during an outage nobody is doing paid work: this only has to
+    # keep a refusal cheaper than a retry loop. It is a separate bucket rather than the
+    # tiered one so a global outage still does not spend the caller's own allowance.
+    outage_process_limit: str = "10/minute"
 
     # Guardrails (phase 2). Prices default to Claude Sonnet 5 per-MTok rates.
     max_run_cost_usd: float = 0.50
     price_in_per_mtok: float = 3.0
     price_out_per_mtok: float = 15.0
+
+    # Shutdown drain (phase 2 remaster). How long the lifespan waits for in-flight
+    # SSE runs before closing the database. Innermost of three nested windows: it
+    # nests inside uvicorn's --timeout-graceful-shutdown (20s), which nests inside
+    # fly.toml's kill_timeout (30s). Overshooting any of them means SIGKILL instead.
+    shutdown_drain_seconds: float = 5.0
 
 
 settings = Settings()

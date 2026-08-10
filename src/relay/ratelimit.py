@@ -16,7 +16,6 @@ import ipaddress
 import itertools
 import logging
 import math
-import sqlite3
 import time
 from datetime import UTC, datetime, timedelta
 
@@ -26,6 +25,7 @@ from limits.aio.storage import MemoryStorage
 from limits.aio.strategies import MovingWindowRateLimiter
 
 from .config import settings
+from .db import Database
 
 logger = logging.getLogger("relay.ratelimit")
 
@@ -60,6 +60,10 @@ _LIMIT_SETTINGS: dict[tuple[str, str], str] = {
     ("create", "owner"): "owner_create_limit",
     ("read", "demo"): "demo_read_limit",
     ("read", "owner"): "owner_read_limit",
+    # Charged only on the daily-ceiling refusal, so the 503 path is metered without
+    # spending the tiered allowance a global outage did not consume. Keyed by a
+    # pseudo-tier: the ceiling is global, so the caller's tier is irrelevant to it.
+    ("process", "outage"): "outage_process_limit",
 }
 
 _items: dict[tuple[str, str], RateLimitItem] = {}
@@ -144,7 +148,7 @@ def next_utc_midnight(now: datetime | None = None) -> datetime:
     return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def spent_today(conn: sqlite3.Connection, *, now: float | None = None) -> float:
+def spent_today(conn: Database, *, now: float | None = None) -> float:
     """Today's Claude spend in USD: rows written since UTC midnight, plus what
     currently-streaming runs could still cost.
 
@@ -193,7 +197,7 @@ def release_run(token: int | None) -> None:
         _reservations.pop(token, None)
 
 
-def enforce_daily_budget(conn: sqlite3.Connection) -> None:
+def enforce_daily_budget(conn: Database) -> None:
     """Raise 503 once today's spend reaches the configured ceiling."""
     spent = spent_today(conn)
     if spent < settings.max_daily_cost_usd:

@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import time
 from contextlib import asynccontextmanager
 from html import escape
@@ -15,8 +17,11 @@ from .db import connect, init_db
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
+from .runs import RegistryDraining, RunRegistry
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
+
+logger = logging.getLogger("relay.main")
 
 
 @asynccontextmanager
@@ -28,7 +33,15 @@ async def lifespan(app: FastAPI):
     app.state.conn = conn
     app.state.registry = build_registry(conn, settings.kb_dir)
     app.state.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+    app.state.runs = RunRegistry()
     yield
+    # Drained before the connection closes. uvicorn cancels in-flight request tasks
+    # when its graceful-shutdown window expires and then runs lifespan shutdown
+    # without awaiting those cancellations, so a stream's finally — which writes the
+    # run's cost that SEC-03's daily ceiling reads back — can still be pending here.
+    # Closing first turns that write into "Cannot operate on a closed database" and
+    # loses the row, which is spend the ceiling can never see again.
+    await app.state.runs.drain(timeout=settings.shutdown_drain_seconds)
     conn.close()
 
 
@@ -40,6 +53,14 @@ app = FastAPI(title="Relay", version=__version__, lifespan=lifespan)
 # a call in an argument default (auth.py is the same pattern).
 _ANY_TIER = require_tier("owner", "demo")
 _API_KEY = Security(api_key_header)
+
+# One string for both refusals below. The handler rejects with it before the response
+# starts; the generator has to deliver the same refusal in-stream when a drain lands
+# after that check. Sharing the copy is what stops the two from drifting apart.
+_SHUTTING_DOWN_NOTE = (
+    "Relay is finishing the runs already in flight before it restarts."
+    " Retry in a few seconds — this is a deploy, not an outage."
+)
 
 
 def _gate(bucket: str, *, meter_spend: bool = False):
@@ -59,13 +80,33 @@ def _gate(bucket: str, *, meter_spend: bool = False):
 
     The ceiling is checked before the tiered window because it is a global
     condition — a budget outage should not also burn the caller's per-IP allowance.
+    That ordering used to mean the 503 short-circuited throttling entirely: the
+    tiered window below is never reached once the ceiling raises, so /process
+    became an unthrottled endpoint for anyone holding the published demo key,
+    precisely when the service was least able to defend itself. The refusal now
+    charges its own bucket on the way out, which keeps both properties.
     """
 
     async def _dependency(request: Request, presented: str | None = _API_KEY) -> Tier:
         await enforce("auth", "anon", request)
         tier = _ANY_TIER(presented)
         if meter_spend:
-            enforce_daily_budget(app.state.conn)
+            # Offloaded, because the cost here is acquiring Database's lock, not
+            # running the query. The SUM is microseconds behind idx_runs_created_at,
+            # but a worker thread holds that lock for a whole transaction() — a
+            # measured 0.81s loop stall, bounded only by busy_timeout (5s). The
+            # container HEALTHCHECK times out at 3s, so a stalled loop that cannot
+            # answer /health gets the machine restarted, killing every in-flight run.
+            # HTTPException raised in the thread propagates back through to_thread.
+            try:
+                await asyncio.to_thread(enforce_daily_budget, app.state.conn)
+            except HTTPException:
+                # Metered after the fact, not before: the bucket must only be spent by
+                # requests the ceiling actually refused, so a healthy service never
+                # touches it. A 429 from here replaces the 503, which is the intended
+                # answer to a retry loop — the 503's copy is for a visitor, not a flood.
+                await enforce("process", "outage", request)
+                raise
         await enforce(bucket, tier, request)
         return tier
 
@@ -97,18 +138,22 @@ async def health() -> dict:
     dependencies=[Depends(create_gate)],
 )
 async def create_ticket(payload: TicketCreate) -> Ticket:
-    conn = app.state.conn
-    cur = conn.execute(
-        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
-        (payload.customer_email, payload.subject, payload.body),
-    )
-    conn.commit()
-    return _get_ticket(cur.lastrowid)
+    def _insert() -> int:
+        with app.state.conn.transaction() as db:
+            cur = db.execute(
+                "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+                (payload.customer_email, payload.subject, payload.body),
+            )
+            # Read inside the block: once the lock drops another thread's insert has
+            # already moved lastrowid, and this row's id is what the caller gets back.
+            return cur.lastrowid
+
+    return await _get_ticket(await asyncio.to_thread(_insert))
 
 
 @app.get("/tickets/{ticket_id}", response_model=Ticket, dependencies=[Depends(read_gate)])
 async def get_ticket(ticket_id: int) -> Ticket:
-    return _get_ticket(ticket_id)
+    return await _get_ticket(ticket_id)
 
 
 @app.post("/tickets/{ticket_id}/process", dependencies=[Depends(process_gate)])
@@ -119,9 +164,23 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     read data and search docs but cannot reply, escalate, or categorise.
     Every run is recorded in the runs table for /metrics.
     """
-    ticket = _get_ticket(ticket_id)
+    ticket = await _get_ticket(ticket_id)
     if ticket.status != "open":
         raise HTTPException(409, f"ticket is already {ticket.status.value}")
+
+    # Refused before the reservation below, so a rejected caller never claims spend
+    # it will not use. A run admitted mid-drain would extend the shutdown window and
+    # can outlive conn.close(). Best-effort by nature — uvicorn stops accepting
+    # connections before lifespan runs, so the window this closes is narrow, which is
+    # why it is one check and not a mechanism. The dict detail follows ratelimit.py's
+    # perimeter convention rather than the short-string domain form, and carries no
+    # active counts, ticket ids or timeouts.
+    if app.state.runs.draining:
+        raise HTTPException(
+            503,
+            detail={"error": "shutting_down", "note": _SHUTTING_DOWN_NOTE},
+            headers={"Retry-After": "5"},
+        )
 
     # Claim this run's worst-case cost now that the gate has admitted it. record_run
     # only fires once the stream ends, so without a reservation a burst of concurrent
@@ -133,6 +192,29 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
 
     async def event_stream():
         started = time.perf_counter()
+        # Registered here rather than beside reserve_run() above, and the difference
+        # is the whole point: Starlette can cancel a StreamingResponse before its
+        # generator ever starts, and a finally in a generator whose body never ran
+        # does not execute. Registering outside the body would leak an entry on every
+        # aborted request, stalling every later drain for its full grace period and
+        # leaving an idle server non-empty — which is what breaks scale-to-zero.
+        # Inside the body, register and deregister are exactly balanced, which is why
+        # this needs no TTL where the reservation above does.
+        try:
+            run_token = app.state.runs.register(ticket_id=ticket.id)
+        except RegistryDraining:
+            # The handler's 503 above ran before this generator was scheduled, and the
+            # drain landed in between — it saw an empty registry, took its fast path,
+            # and the connection is closing. Refused here rather than started, because
+            # a StreamingResponse locks its status line at 200 once the body begins:
+            # the same refusal can only be delivered as an in-stream event now.
+            # Released explicitly because the finally below belongs to a run that never
+            # started, and returning from here skips it.
+            release_run(token)
+            logger.info("run.refused_after_drain", extra={"ctx": {"ticket_id": ticket.id}})
+            refusal = {"reason": "shutting_down", "note": _SHUTTING_DOWN_NOTE}
+            yield f"event: error\ndata: {json.dumps(refusal)}\n\n"
+            return
         usage: dict = {}
         outcome = "incomplete"
         recorded = False
@@ -163,28 +245,45 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
             # "incomplete", which is also the honest value for /metrics. The flag
             # keeps a second close from writing the row twice and double-charging
             # the ledger.
-            if not recorded:
-                recorded = True
-                record_run(
-                    app.state.conn,
-                    ticket_id=ticket.id,
-                    model=settings.model,
-                    duration_ms=int((time.perf_counter() - started) * 1000),
-                    steps=usage.get("steps", 0),
-                    input_tokens=usage.get("input_tokens", 0),
-                    output_tokens=usage.get("output_tokens", 0),
-                    cost_usd=usage.get("cost_usd", 0.0),
-                    outcome=outcome,
-                )
-            # Released after the row exists, so the two are never both missing.
-            release_run(token)
+            #
+            # The write is wrapped because it is the one statement here that talks to
+            # the database, and the likeliest way it fails is the race this phase
+            # closes: a drain times out, lifespan closes the connection, and this
+            # write raises "Cannot operate on a closed database". Unguarded, that
+            # exception would skip both cleanups below — leaking the registry entry
+            # permanently, so every later drain burns its full grace period and
+            # returns False, and stranding $0.50 of the daily ceiling until its TTL.
+            # Losing one telemetry row must not cost the process its drain.
+            try:
+                if not recorded:
+                    recorded = True
+                    record_run(
+                        app.state.conn,
+                        ticket_id=ticket.id,
+                        model=settings.model,
+                        duration_ms=int((time.perf_counter() - started) * 1000),
+                        steps=usage.get("steps", 0),
+                        input_tokens=usage.get("input_tokens", 0),
+                        output_tokens=usage.get("output_tokens", 0),
+                        cost_usd=usage.get("cost_usd", 0.0),
+                        outcome=outcome,
+                    )
+            except Exception:
+                logger.exception("run.record_failed", extra={"ctx": {"ticket_id": ticket.id}})
+            finally:
+                # Released after the row exists, so the two are never both missing.
+                release_run(token)
+                # Last, so a drain waiting on this run only wakes once its row is written.
+                app.state.runs.deregister(run_token)
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
 
 @app.get("/metrics")
 async def metrics() -> dict:
-    return run_metrics(app.state.conn)
+    # run_metrics does SELECT * FROM runs, the one read here that grows unbounded:
+    # the dashboard polls this every 5s, so it is the last place to hold the loop.
+    return await asyncio.to_thread(run_metrics, app.state.conn)
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -242,10 +341,15 @@ async def dashboard() -> str:
     return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
 
 
-def _get_ticket(ticket_id: int) -> Ticket:
-    row = app.state.conn.execute(
-        "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
-    ).fetchone()
+async def _get_ticket(ticket_id: int) -> Ticket:
+    # fetchone() is called inside the offloaded callable, not after it: Database
+    # materialises rows while its lock is held, and stepping the result back on the
+    # event loop would put the read half a statement outside the thread it belongs to.
+    row = await asyncio.to_thread(
+        lambda: app.state.conn.execute(
+            "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
+        ).fetchone()
+    )
     if row is None:
         raise HTTPException(404, "ticket not found")
     return Ticket(**dict(row))

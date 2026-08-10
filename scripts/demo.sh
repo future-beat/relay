@@ -11,10 +11,14 @@ BASE="${RELAY_URL:-http://127.0.0.1:8000}"
 
 # Fail loudly rather than sending a placeholder the server will 401: a silent
 # fallback here reads as "the perimeter is broken" instead of "set your key".
+# The suggested value is the one D-02 publishes for the hosted demo, and it is
+# checked against relay.config.PUBLISHED_DEMO_KEY by tests/test_auth.py — a local
+# server needs whatever RELAY_DEMO_KEY that instance was started with instead.
 if [ -z "${RELAY_DEMO_KEY:-}" ]; then
   echo "RELAY_DEMO_KEY is not set." >&2
-  echo "Set it to the demo key shown on $BASE/dashboard (or in the README):" >&2
-  echo "  export RELAY_DEMO_KEY=..." >&2
+  echo "For the hosted demo:" >&2
+  echo "  export RELAY_DEMO_KEY=relay-demo-2026" >&2
+  echo "For your own server, use the key shown at $BASE/dashboard." >&2
   exit 1
 fi
 
