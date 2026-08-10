@@ -6,6 +6,7 @@ import pytest
 
 from relay import retrieval
 from relay.config import settings
+from relay.guardrails import SendReplyInput, ToolInputError, validate_tool_input
 from relay.tools import build_registry
 
 KB_DIR = Path(__file__).parent.parent / "kb"
@@ -110,6 +111,62 @@ def test_send_reply_resolves_ticket(conn, registry):
         registry["send_reply"].execute(ticket_id=ticket_id, body="Pro allows 600 req/min.")
     )
     assert result["status"] == "resolved"
+
+
+def test_send_reply_still_resolves_without_citations(conn, registry):
+    # D-12: citations is optional, so every pre-phase-3 scripted call keeps working.
+    # This is the back-compat contract the other six test files depend on implicitly.
+    cur = conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+        ("liam@brightco.io", "API limits", "What are the rate limits?"),
+    )
+    ticket_id = cur.lastrowid
+    validated = validate_tool_input(
+        SendReplyInput, {"ticket_id": ticket_id, "body": "Pro allows 600 requests a minute."}
+    )
+    assert validated["citations"] == []
+
+    result = json.loads(registry["send_reply"].execute(**validated))
+    assert result["status"] == "resolved"
+    status = conn.execute("SELECT status FROM tickets WHERE id = ?", (ticket_id,)).fetchone()[0]
+    assert status == "resolved"
+
+
+def test_send_reply_accepts_citations(conn, registry):
+    cur = conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+        ("ava@acmecorp.com", "Refund", "Can I get a refund?"),
+    )
+    ticket_id = cur.lastrowid
+    validated = validate_tool_input(
+        SendReplyInput,
+        {
+            "ticket_id": ticket_id,
+            "body": "Refunds are available within 30 days of purchase.",
+            "citations": ["billing.md#refunds"],
+        },
+    )
+    assert validated["citations"] == ["billing.md#refunds"]
+
+    result = json.loads(registry["send_reply"].execute(**validated))
+    assert result["status"] == "resolved"
+
+
+def test_send_reply_rejects_non_string_citations():
+    with pytest.raises(ToolInputError, match="citations"):
+        validate_tool_input(
+            SendReplyInput,
+            {"ticket_id": 1, "body": "A long enough grounded reply.", "citations": "billing.md"},
+        )
+
+
+def test_send_reply_schema_declares_citations_optional(registry):
+    schema = registry["send_reply"].schema["input_schema"]
+    assert schema["properties"]["citations"]["type"] == "array"
+    assert schema["properties"]["citations"]["items"]["type"] == "string"
+    # Not required: forcing a citation would break every citation-less call site and
+    # sharpen the ended_without_action eval trap (D-12).
+    assert schema["required"] == ["ticket_id", "body"]
 
 
 def test_all_tools_declare_permission_tier(registry):
