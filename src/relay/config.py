@@ -70,5 +70,27 @@ class Settings(BaseSettings):
     # fly.toml's kill_timeout (30s). Overshooting any of them means SIGKILL instead.
     shutdown_drain_seconds: float = 5.0
 
+    # Semantic retrieval (phase 3).
+    #
+    # Read without the RELAY_ prefix, same escape hatch as anthropic_api_key above.
+    # The prefix would rename this to RELAY_VOYAGE_API_KEY, so a correctly-named
+    # VOYAGE_API_KEY in the environment or a Fly secret would be ignored and the
+    # agent would fall back to keyword search — working, cheaper, quietly worse,
+    # and with nothing in the logs to say so.
+    #
+    # Defaults to None on purpose: unset key IS the keyword-fallback baseline, so
+    # CI and local dev run the retrieval path without a credential. Never logged,
+    # never in a span attribute, never in a query string — it leaves the process
+    # only as an Authorization header to the Voyage endpoint.
+    voyage_api_key: str | None = Field(default=None, validation_alias="VOYAGE_API_KEY")
+    voyage_model: str = "voyage-4-lite"
+    # Must match the output_dimension the committed kb index was built with. Changing
+    # it without rebuilding the index yields vectors of two different widths.
+    voyage_dim: int = 512
+    # Placeholder. The real value is calibrated against the golden set in plan 03-06:
+    # high enough that an off-topic query retrieves nothing, low enough that the
+    # read-then-escalate cases still get their docs. Do not tune this by intuition.
+    retrieval_floor: float = 0.55
+
 
 settings = Settings()
