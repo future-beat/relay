@@ -1,3 +1,4 @@
+import inspect
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -467,3 +468,27 @@ async def test_citation_faithful_cited_subset_retrieved(monkeypatch):
     # it proves nothing about the reports that pass it.
     fabricated = extract_outcome([billing, _reply(["pricing.md#enterprise"])])
     assert not _cited_subset(fabricated)
+
+
+# --- D-08: the denial-recovery seeding hook (03-REVIEW.md WR-10) ------------------
+#
+# Phase 3 could never observe the citation guard firing against a model, so in-run
+# recovery was proven only against a fake scripted with a fabricated id. The hook
+# below forces exactly one real denial by dropping one genuinely-retrieved id from
+# the run's accept-set, so a model's *natural* citation is the thing denied.
+
+
+def test_seed_denial_hook_is_keyword_only_and_default_off():
+    # mutation: give `seed_citation_denial` a positional slot or a `True` default in
+    # src/relay/agent.py::run_ticket. Either makes it a footgun the 12 golden cases
+    # and production could arm by accident, and this test fails.
+    param = inspect.signature(run_ticket).parameters["seed_citation_denial"]
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+    assert param.default is False
+
+
+def test_production_never_arms_the_seed_denial_hook():
+    # mutation: wire the flag into src/relay/main.py's run_ticket call. The eval-only
+    # hook would then narrow a live run's accept-set and deny a real customer reply.
+    main_src = (Path(__file__).parent.parent / "src" / "relay" / "main.py").read_text()
+    assert "seed_citation_denial" not in main_src
