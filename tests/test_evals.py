@@ -337,6 +337,32 @@ def test_report_mode_is_keyword_when_a_keyed_run_has_no_usable_index(monkeypatch
     assert m["recall@3"] > 0
 
 
+def test_print_summary_flags_keyword_numbers_printed_under_a_configured_key(capsys):
+    # mutation: delete the `key_configured and mode != "semantic"` branch from
+    # print_summary. The paid run then prints keyword recall with nothing to say it
+    # was meant to be semantic — the console half of the same misreading.
+    metrics = {
+        "mode": "keyword", "key_configured": True, "degraded_rows": 11,
+        "labeled_queries": 12, "scored_queries": 11,
+        "recall@1": 0.9091, "recall@3": 0.9091, "mrr": 0.9091,
+    }
+    report = {
+        "pass_rate": 1.0, "passed": 1, "cases": 1, "mean_quality": 5.0,
+        "total_cost_usd": 0.01, "results": [], "retrieval_metrics": metrics,
+    }
+    evals.print_summary(report)
+    out = capsys.readouterr().out
+    assert "retrieval (keyword)" in out
+    assert "WARNING" in out
+    assert "11 of 11 rows degraded" in out
+
+    # Control: a run that actually got what it paid for prints no warning, so the
+    # line means something when it does appear.
+    report["retrieval_metrics"] = {**metrics, "mode": "semantic", "degraded_rows": 0}
+    evals.print_summary(report)
+    assert "WARNING" not in capsys.readouterr().out
+
+
 def test_report_mode_is_mixed_when_rows_disagree(monkeypatch):
     # mutation: collapse `observed_mode` to `scores[0].mode` (or to any single
     # arm) — a per-query Voyage failure then hides behind whichever mode happened
