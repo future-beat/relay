@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import math
 import time
 from datetime import UTC, datetime, timedelta
@@ -9,6 +10,7 @@ from fastapi.testclient import TestClient
 from starlette.requests import Request
 
 from relay.config import settings
+from relay.db import Database
 from relay.main import app, process_ticket
 from relay.ratelimit import (
     RESERVATION_TTL_S,
@@ -444,3 +446,16 @@ def test_rate_limit_and_budget_ordering(client, monkeypatch):
     monkeypatch.setattr(settings, "max_daily_cost_usd", 1000.0)
     assert _process(client, DEMO).status_code == 404
     assert _process(client, DEMO).status_code == 429
+
+
+def test_the_budget_readers_annotate_what_connect_actually_returns():
+    # connect() has returned a Database since phase 2, but these two kept annotating
+    # sqlite3.Connection — and the audit that swept the other modules missed this file
+    # because nothing asserted the pairing. Cheap to keep honest, and the annotations
+    # are the only documentation of what these functions accept: a `Database` is not a
+    # `sqlite3.Connection` and has no cursor(), executescript-on-cursor or context
+    # manager, so a reader who trusts the hint writes code that does not run.
+    for fn in (spent_today, enforce_daily_budget):
+        assert inspect.get_annotations(fn)["conn"] is Database, (
+            f"{fn.__name__} does not annotate the type connect() hands it"
+        )
