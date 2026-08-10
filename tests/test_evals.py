@@ -294,6 +294,77 @@ def test_soft_floor_recall3_positive(keyword_baseline):
     assert recall_at_k(index, load_labels(), 3) > 0
 
 
+# --- CR-01: the reported mode must be the one that RAN, not the one configured ----
+#
+# `retrieve()` never raises, it degrades. So `bool(VOYAGE_API_KEY)` is not evidence
+# that semantic ranking happened: a missing/stale/mismatched kb/index.json under a
+# live secret returns keyword results, and that is the configuration CI reaches.
+
+
+def test_report_mode_is_keyword_when_a_keyed_run_has_no_usable_index(monkeypatch, tmp_path):
+    # mutation: restore `"mode": "semantic" if key else "keyword"` in
+    # relay.evals.retrieval_metrics — the block below then reads "semantic" over
+    # keyword numbers, which is the exact defect, and this fails.
+    #
+    # No network is possible on this path and the test proves it rather than
+    # assuming it: with `index.matrix is None`, retrieve() returns before
+    # `_embed_query`, and the sabotage below turns any call into an error. (conftest's
+    # autouse `_no_outbound_http` is the outer belt on top of this.)
+    from relay import evals, retrieval
+
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    for doc in sorted(Path("kb").glob("*.md")):
+        # The real docs, so the keyword numbers below are the real keyword numbers...
+        (kb_dir / doc.name).write_bytes(doc.read_bytes())
+    # ...and deliberately no index.json: the stale/missing-artifact deploy trap.
+    monkeypatch.setattr(settings, "kb_dir", kb_dir)
+    monkeypatch.setattr(settings, "voyage_api_key", "sk-not-a-real-key")
+
+    def _must_not_embed(*args, **kwargs):
+        raise AssertionError("the index-unavailable path must never call Voyage")
+
+    monkeypatch.setattr(retrieval, "_embed_query", _must_not_embed)
+
+    m = evals.retrieval_metrics()
+
+    assert m["mode"] == "keyword", "keyword numbers must never be labeled semantic"
+    assert m["key_configured"] is True
+    assert m["degraded_rows"] == m["scored_queries"] > 0
+    # The numbers are real keyword recall, not zeros — so the label is the only
+    # thing that was ever wrong, and it is what this pins.
+    assert m["recall@3"] > 0
+
+
+def test_report_mode_is_mixed_when_rows_disagree(monkeypatch):
+    # mutation: collapse `observed_mode` to `scores[0].mode` (or to any single
+    # arm) — a per-query Voyage failure then hides behind whichever mode happened
+    # to run first, and one averaged figure claims a mode half its rows never saw.
+    from relay.retrieval_eval import MIXED, UNSCORED, RowScore, observed_mode
+
+    assert observed_mode([]) == UNSCORED
+    assert observed_mode([RowScore(1, "keyword", False)]) == "keyword"
+    assert observed_mode([RowScore(1, "semantic", False)]) == "semantic"
+    assert observed_mode([
+        RowScore(1, "semantic", False), RowScore(None, "keyword", True)
+    ]) == MIXED
+
+
+def test_scored_queries_is_the_denominator_the_numbers_were_divided_by(keyword_baseline):
+    # mutation: report a denominator computed independently of the scored rows
+    # (e.g. `len(labels)`) — the reported figure and the divisor drift apart.
+    from relay import evals
+
+    m = evals.retrieval_metrics()
+    assert m["scored_queries"] == len(scored_labels(load_labels()))
+    assert m["labeled_queries"] == len(load_labels())
+    assert m["scored_queries"] < m["labeled_queries"], "the empty-relevant negative is excluded"
+    assert 0.0 <= m["recall@1"] <= m["recall@3"] <= 1.0
+    assert m["mode"] == "keyword"
+    assert m["key_configured"] is False
+    assert m["degraded_rows"] == 0
+
+
 # --- EVAL-02: the prompt-injection golden case (D-05) ----------------------------
 #
 # The attacker input is the ticket body itself: it instructs the agent to post a

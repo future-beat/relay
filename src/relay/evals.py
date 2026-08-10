@@ -30,7 +30,13 @@ from .config import settings
 from .db import connect, init_db
 from .models import AgentEvent
 from .retrieval import load_index
-from .retrieval_eval import load_labels, mrr, recall_at_k
+from .retrieval_eval import (
+    load_labels,
+    mrr_from_scores,
+    observed_mode,
+    recall_from_scores,
+    score_rows,
+)
 from .tools import build_registry, lookup_customer
 
 GOLDEN_PATH = Path("evals/golden.jsonl")
@@ -74,17 +80,31 @@ def retrieval_metrics() -> dict[str, Any]:
     `mode` is part of the payload because keyword and semantic recall are not
     comparable numbers: without VOYAGE_API_KEY this measures the keyword
     fallback, and an unlabeled figure would be read as semantic quality (D-10).
+
+    It is the mode the rows were ACTUALLY ranked in, read back out of `retrieve()`,
+    not `bool(key)`. `retrieve()` never raises — it degrades — so a configured key
+    is not evidence that semantic ranking ran: a missing/stale/mismatched
+    `kb/index.json` or a failing Voyage call returns keyword results under a live
+    secret, and that is the failure mode that reaches CI. `key_configured` and
+    `degraded_rows` carry the gap between what was paid for and what ran.
     """
     index = load_index(settings.kb_dir)
     labels = load_labels()
     key = settings.voyage_api_key
+    # One scoring pass: all three numbers and the mode label then describe the same
+    # retrieval, instead of a label borrowed from a pass the numbers didn't come from.
+    scores = score_rows(index, labels, k=3, key=key)
     return {
-        "mode": "semantic" if key else "keyword",
+        "mode": observed_mode(scores),
+        "key_configured": bool(key),
+        "degraded_rows": sum(s.degraded for s in scores),
         "labeled_queries": len(labels),
-        "scored_queries": len([r for r in labels if r.get("relevant")]),
-        "recall@1": recall_at_k(index, labels, 1, key=key),
-        "recall@3": recall_at_k(index, labels, 3, key=key),
-        "mrr": mrr(index, labels, key=key),
+        "scored_queries": len(scores),
+        # recall@1 is `rank == 1` at depth 3: `retrieve(max_results=k)` truncates one
+        # ranked list, so the top-3 prefix contains the top-1 answer exactly.
+        "recall@1": recall_from_scores(scores, 1),
+        "recall@3": recall_from_scores(scores, 3),
+        "mrr": mrr_from_scores(scores),
     }
 
 
@@ -332,6 +352,14 @@ def print_summary(report: dict[str, Any]) -> None:
             f" | recall@3 {m['recall@3']:.2f}"
             f" over {m['scored_queries']} labeled queries — report-only, not gated"
         )
+        if m.get("key_configured") and m["mode"] != "semantic":
+            # Paid for semantic ranking, did not get it. Silent here is how keyword
+            # numbers get read as semantic quality — the thing `mode` exists to stop.
+            print(
+                f"  WARNING: VOYAGE_API_KEY is set but {m['degraded_rows']} of"
+                f" {m['scored_queries']} rows degraded — these are NOT semantic numbers."
+                " Rebuild/commit kb/index.json or check Voyage."
+            )
 
 
 def main() -> None:
