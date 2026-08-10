@@ -2,6 +2,7 @@ import inspect
 import json
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -492,3 +493,105 @@ def test_production_never_arms_the_seed_denial_hook():
     # hook would then narrow a live run's accept-set and deny a real customer reply.
     main_src = (Path(__file__).parent.parent / "src" / "relay" / "main.py").read_text()
     assert "seed_citation_denial" not in main_src
+
+
+SEED_DENIAL_TICKET = {
+    "id": 1,
+    "customer_email": "ava@acmecorp.com",
+    "subject": "Rate limits",
+    "body": "What are my rate limits?",
+}
+
+
+def _tool_result_payloads(messages):
+    """The payloads the loop last handed back, as the model would read them."""
+    if len(messages) < 2 or not isinstance(messages[-1]["content"], list):
+        return []
+    return [
+        json.loads(block["content"])
+        for block in messages[-1]["content"]
+        if isinstance(block, dict) and block.get("type") == "tool_result"
+    ]
+
+
+class HookDependentRecoveringClient:
+    """Cites a genuinely-retrieved id, then cites what the denial handed back.
+
+    Deliberately NOT tests/test_guardrails.py's RecoveringFakeClient: that one cites a
+    hardcoded id absent from kb/ entirely, so it would be denied whether the seeding
+    hook is armed, a no-op, or deleted — unfalsifiable against the mechanism under
+    test. This client's first citation is `results[0]["id"]` read out of the real
+    search_docs payload: the exact id the hook drops. Armed, it is denied; unarmed, it
+    is valid and nothing is denied. That asymmetry is the whole test.
+
+    Only the recovery step mirrors RecoveringFakeClient — it reads `retrieved_ids` back
+    out of the denial rather than being scripted with the right answer, so if the
+    denial stops naming valid ids this client has nothing to retry with.
+    """
+
+    def __init__(self, ticket_id):
+        self.ticket_id = ticket_id
+        self.cited_first = None
+        self.recovered_with = None
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, *, messages, **kwargs):
+        payloads = _tool_result_payloads(messages)
+        if not payloads:
+            return response([tool_use_block("search_docs", {"query": "rate limits"}, id="t1")])
+        last = payloads[-1]
+        if "results" in last:
+            # The model's natural cite: the top hit it was just handed.
+            self.cited_first = last["results"][0]["id"]
+            return response([tool_use_block("send_reply", {
+                "ticket_id": self.ticket_id,
+                "body": GROUNDED_REPLY,
+                "citations": [self.cited_first],
+            }, id="t2")])
+        if last.get("denied_by") == "citation":
+            self.recovered_with = list(last.get("retrieved_ids") or [])
+            return response([tool_use_block("send_reply", {
+                "ticket_id": self.ticket_id,
+                "body": GROUNDED_REPLY,
+                "citations": self.recovered_with,
+            }, id="t3")])
+        return response([text_block("Reply sent.")], stop_reason="end_turn")
+
+
+async def test_seed_denial_hook_denies_then_fake_recovers(conn, registry, keyword_baseline):
+    # mutation A: stop naming valid ids in the citation denial payload built in
+    # src/relay/agent.py::_execute_guarded — set `"retrieved_ids": []`. The client
+    # then recovers with [], the `assert client.recovered_with` below fails, and the
+    # denial stops being a retry instruction — the WR-10 regression this whole hook
+    # exists to make observable. (Deleting the key outright also fails, but on a
+    # KeyError in the guardrail-event emitter before the recovery path is reached,
+    # so `[]` is the variant that exercises the property this asserts.)
+    #
+    # mutation B: make the hook a no-op (skip the `retrieved_ids.discard(dropped)`).
+    # The id the client cites is then still in the accept-set, no denial fires, and
+    # the `== ["citation"]` guardrail assertion fails. A test that survives this is
+    # citing something hook-independent and proves nothing.
+    _seed_tickets(conn, SEED_DENIAL_TICKET)
+    client = HookDependentRecoveringClient(SEED_DENIAL_TICKET["id"])
+
+    events = [e async for e in run_ticket(
+        client, registry, SEED_DENIAL_TICKET, seed_citation_denial=True
+    )]
+
+    # (a) the armed hook forced exactly one denial, of a real retrieved id
+    guardrails = [e for e in events if e.type == "guardrail"]
+    assert [e.data["guard"] for e in guardrails] == ["citation"]
+    assert client.cited_first, "the client never saw a search result to cite"
+    assert guardrails[0].data["missing_citations"] == [client.cited_first]
+
+    # (b) the denial stayed recoverable: it named ids, and none of them is the one
+    # the hook dropped — so the accept-set really was narrowed, not just reported on
+    assert client.recovered_with, (
+        "the denial named no retrieved ids, so the model had nothing to retry with"
+    )
+    assert client.cited_first not in client.recovered_with
+
+    # (c) and the run still reached a terminal action on its own ticket
+    assert events[-1].type == "resolution"
+    assert events[-1].data["via"] == "send_reply"
+    assert _reply_ticket_ids(conn) == [SEED_DENIAL_TICKET["id"]]
