@@ -1,10 +1,11 @@
 ---
 phase: 4
 slug: evaluation-coverage
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: planned
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-08-10
+updated: 2026-08-10
 ---
 
 # Phase 4 — Validation Strategy
@@ -89,11 +90,17 @@ the DB assertion, not just the event, is the honest check.
 
 ## Validation Sign-Off
 
-- [ ] All tasks have `<automated>` verify or Wave 0 dependencies
-- [ ] Sampling continuity: no 3 consecutive tasks without automated verify
-- [ ] Wave 0 covers all MISSING references
-- [ ] No watch-mode flags
-- [ ] Feedback latency < 10s
-- [ ] `nyquist_compliant: true` set in frontmatter
+- [x] All tasks have `<automated>` verify or Wave 0 dependencies
+- [x] Sampling continuity: no 3 consecutive tasks without automated verify
+- [x] Wave 0 covers all MISSING references
+- [x] No watch-mode flags
+- [x] Feedback latency < 10s
+- [x] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** covered by plans 04-01..04-03 (2026-08-10); plan-check blocker (D-08 unfalsifiable mechanism test) + 3 warnings resolved in-plan.
+
+### D-05 scope note
+EVAL-02's golden case asserts the guardrail event fires AND the victim ticket is unwritten. It does
+NOT drive a retry to prove the reply lands on the bound ticket — that stronger half of D-05 is
+already covered by `tests/test_guardrails.py::test_run_recovers_after_binding_denial`. Deliberate
+narrowing, recorded here so it isn't mistaken for a gap.
