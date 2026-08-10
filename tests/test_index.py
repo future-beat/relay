@@ -221,3 +221,50 @@ def test_build_index_surfaces_an_unknown_model_error(builder, voyage, key, tmp_p
 
     with pytest.raises(builder.BuildError, match="voyage rejected the request"):
         builder.build(tmp_path, key=key, model="voyage-does-not-exist", dim=DIM)
+
+
+# --- the calibrated floor is protected (WR-02) ---
+
+# Measured in 03-06 against the committed index with real Voyage query embeddings:
+# off-topic queries topped out at 0.2543, covered-topic queries ran 0.34-0.63.
+# The shipped floor must sit between those bands. These are the numbers the paid
+# 12-case acceptance eval was calibrated on.
+OFF_TOPIC_CEILING = 0.2543
+COVERED_TOPIC_FLOOR = 0.34
+
+
+def test_the_shipped_retrieval_floor_stays_inside_its_measured_band():
+    # Without this, the calibration is unprotected: the phase already shipped a
+    # placeholder 0.55 that cleared only 1 of 12 golden queries, so semantic ranking
+    # was silently inert while the whole suite stayed green. A value guard is the
+    # cheap half of the defence; the behavioural half is the paid eval, which nobody
+    # runs per-commit.
+    floor = settings.retrieval_floor
+    assert OFF_TOPIC_CEILING < floor < COVERED_TOPIC_FLOOR, (
+        f"retrieval_floor={floor} is outside the band measured in 03-06 "
+        f"({OFF_TOPIC_CEILING}, {COVERED_TOPIC_FLOOR}). Above it, covered topics get "
+        f"starved and semantic ranking goes inert; below it, off-topic queries stop "
+        f"returning [] and the escalation path breaks. Re-run the calibration before "
+        f"changing this."
+    )
+
+
+def test_every_committed_embedding_separates_the_two_bands():
+    # Guards the artifact rather than the constant: if a rebuild ever produced
+    # degenerate vectors (all-zero, NaN, collapsed), pairwise cosines would drift
+    # toward 1.0 and the floor would stop discriminating anything.
+    import itertools
+
+    import numpy as np
+
+    index = json.loads(INDEX_PATH.read_text(encoding="utf-8"))
+    mat = np.array([d["embedding"] for d in index["docs"]], dtype=np.float32)
+    assert np.isfinite(mat).all(), "committed index contains NaN or inf"
+    norms = np.linalg.norm(mat, axis=1)
+    assert np.allclose(norms, 1.0, atol=1e-3), f"embeddings are not unit-norm: {norms}"
+    for a, b in itertools.combinations(range(len(mat)), 2):
+        cos = float(mat[a] @ mat[b])
+        assert cos < COVERED_TOPIC_FLOOR + 0.30, (
+            f"docs {a},{b} cosine {cos:.3f} — the corpus has collapsed and the "
+            f"floor can no longer separate on-topic from off-topic"
+        )
