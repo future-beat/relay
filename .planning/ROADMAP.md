@@ -115,7 +115,7 @@ Plans:
 
 **Wave 4** *(blocked on Wave 3 completion)*
 
-- [ ] 03-05-PLAN.md — Thread `retrieved_ids`, citation guard + recovery, `notice` degradation event, prompt/model updates (RAG-04/05)
+- [x] 03-05-PLAN.md — Thread `retrieved_ids`, citation guard + recovery, `notice` degradation event, prompt/model updates (RAG-04/05)
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
@@ -174,7 +174,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 |-------|----------------|--------|-----------|
 | 1. Security Perimeter | 5/5 | Complete   | 2026-08-09 |
 | 2. Async-Safe Data Layer & Graceful Shutdown | 5/5 | Complete   | 2026-08-09 |
-| 3. Semantic Retrieval | 4/6 | In Progress|  |
+| 3. Semantic Retrieval | 5/6 | In Progress|  |
 | 4. Evaluation Coverage | 0/TBD | Not started | - |
 | 5. Run Event Persistence & Live Feed | 0/TBD | Not started | - |
 | 6. Dashboard Experience | 0/TBD | Not started | - |
