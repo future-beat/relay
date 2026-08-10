@@ -182,8 +182,18 @@ async def run_ticket(
     ticket: dict[str, Any],
     policy: ToolPolicy | None = None,
     budget: RunBudget | None = None,
+    *,
+    seed_citation_denial: bool = False,
 ) -> AsyncIterator[AgentEvent]:
-    """Run the agent on one ticket, yielding an AgentEvent per step."""
+    """Run the agent on one ticket, yielding an AgentEvent per step.
+
+    `seed_citation_denial` is an eval-only probe (D-08, closing 03-REVIEW WR-10): it
+    drops one genuinely-retrieved id from this run's accept-set so the model's own,
+    natural citation is denied exactly once, and whether it recovers to a terminal
+    action becomes observable. Keyword-only and off by default on purpose — the same
+    aversion to forgettable per-call controls as `bind_to_ticket` above, in reverse:
+    arming it narrows a live run's accept-set, so nothing but the eval harness may.
+    """
     policy = policy or ToolPolicy()
     budget = budget or RunBudget(
         settings.max_run_cost_usd, settings.price_in_per_mtok, settings.price_out_per_mtok
@@ -205,6 +215,9 @@ async def run_ticket(
     # across runs would let one run cite another's docs. Grown in place below, and the
     # executor holds the same object, so a cite is valid the moment it is retrieved.
     retrieved_ids: set[str] = set()
+
+    # Fires at most once per run, and only when armed (see seed_citation_denial).
+    seed_armed = False
 
     # Built once per run, from this run's own ticket — never stored on the registry,
     # which is built once and shared by every live run. Every tool call below goes
@@ -321,6 +334,24 @@ async def run_ticket(
                                 if hit.get("id"):
                                     retrieved_ids.add(hit["id"])
                                 retrieved_ids.update(a for a in hit.get("anchors") or () if a)
+                            # Eval-only probe (D-08). Applied AFTER the grow so the
+                            # discard is not undone by a later hit re-adding the same
+                            # id as one of its anchors. Drops the top hit's located id
+                            # — the one the model is most likely to cite — so the very
+                            # next send_reply cites something real that this run's
+                            # accept-set no longer contains, and the guard denies it
+                            # once. The dummy keeps the set non-empty, so the denial
+                            # still names ids to retry with and stays recoverable.
+                            hits = payload.get("results") or []
+                            if seed_citation_denial and not seed_armed and hits:
+                                dropped = hits[0].get("id")
+                                if dropped:
+                                    retrieved_ids.discard(dropped)
+                                    retrieved_ids.add("__seeded_missing__")
+                                    seed_armed = True
+                                    logger.warning("guardrail.citation_denial_seeded",
+                                                   extra={"ctx": {"ticket_id": ticket["id"],
+                                                                  "dropped_id": dropped}})
                         span.set_attributes({
                             "relay.tool.tier": spec.tier if spec else "unknown",
                             "relay.tool.is_error": is_error,
