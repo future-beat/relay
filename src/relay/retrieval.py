@@ -242,7 +242,7 @@ def _keyword_hits(docs: list[Doc], query: str) -> list[tuple[int, float]]:
 
 
 def _result(doc: Doc, query: str, score: float) -> dict[str, Any]:
-    """The `{doc, heading, id, text, score}` join key (D-06).
+    """The `{doc, heading, id, anchors, text, score}` join key (D-06).
 
     `text` is the WHOLE file (D-01/D-02) — slicing it here is the regression
     tests/test_retrieval.py guards against.
@@ -252,9 +252,25 @@ def _result(doc: Doc, query: str, score: float) -> dict[str, Any]:
         "doc": doc.doc,
         "heading": heading,
         "id": f"{doc.doc}#{slug(heading)}" if heading else doc.doc,
+        "anchors": anchors(doc),
         "text": doc.text,
         "score": round(score, 6),
     }
+
+
+def anchors(doc: Doc) -> list[str]:
+    """Every id this result legitimately licenses the model to cite.
+
+    `id` is derived from the QUERY (`_locate_heading` is a lexical best-effort
+    locator, D-13) but the model is handed the WHOLE FILE (D-01), with every one of
+    its headings in plain sight. So any heading of a returned doc — and the bare doc
+    name itself — is correct grounding, and a citation guard built from `id` alone
+    denies the accurate anchor while accepting whichever one the locator happened to
+    pick. What the guard exists to catch is a citation to a document that was never
+    retrieved (RAG-04); that stays caught, because a doc absent from the results
+    contributes no anchors at all.
+    """
+    return [doc.doc, *(f"{doc.doc}#{slug(h)}" for h in doc.headings)]
 
 
 def _locate_heading(doc: Doc, query: str) -> str | None:

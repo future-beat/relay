@@ -148,7 +148,13 @@ def _execute_guarded(
     # passes (D-12), a fabricated source does not. retrieved_ids is None only where
     # there is no run — the MCP path — the same way bound_ticket_id is UNBOUND there.
     if name == "send_reply" and retrieved_ids is not None:
-        missing = [c for c in (validated.get("citations") or []) if c not in retrieved_ids]
+        # Compared case- and whitespace-insensitively: every id in the set is already
+        # lowercase (a filename plus a slug), so drift in how the model retypes one it
+        # was shown is a formatting difference, not a fabricated source.
+        allowed = {i.strip().lower() for i in retrieved_ids}
+        missing = [
+            c for c in (validated.get("citations") or []) if c.strip().lower() not in allowed
+        ]
         if missing:
             # A retry instruction that names the valid ids, not a refusal. A refusal
             # leaves resolved_via None, the run ends "ended_without_action", and the
@@ -303,9 +309,18 @@ async def run_ticket(
                             # Written here, on the event loop after the offloaded call
                             # has returned, so the set the executor closes over is never
                             # mutated from the worker thread.
-                            retrieved_ids.update(
-                                hit["id"] for hit in payload.get("results", []) if "id" in hit
-                            )
+                            #
+                            # Every id a retrieved doc licenses, not just the
+                            # query-derived `id`: the model was handed the whole file,
+                            # so its bare name and any of its headings are all correct
+                            # grounding (see retrieval.anchors). Narrowing this to `id`
+                            # denies the accurate anchor and accepts the locator's guess.
+                            for hit in payload.get("results", []):
+                                if hit.get("doc"):
+                                    retrieved_ids.add(hit["doc"])
+                                if hit.get("id"):
+                                    retrieved_ids.add(hit["id"])
+                                retrieved_ids.update(a for a in hit.get("anchors") or () if a)
                         span.set_attributes({
                             "relay.tool.tier": spec.tier if spec else "unknown",
                             "relay.tool.is_error": is_error,

@@ -158,10 +158,37 @@ def test_result_carries_the_citation_id_shape(index, kb_docs, voyage):
     voyage(_basis(_doc_position(kb_docs, "billing.md")))
     results, _, _ = retrieve(index, "refund policy", key="test-key", floor=0.55)
     result = results[0]
-    assert set(result) == {"doc", "heading", "id", "text", "score"}
+    assert set(result) == {"doc", "heading", "id", "anchors", "text", "score"}
     assert result["id"] == f"{result['doc']}#{slug(result['heading'])}"
     assert result["id"] == "billing.md#refunds"
     assert re.match(r"^[^#]+\.md#", result["id"])
+
+
+def test_a_result_carries_every_anchor_of_the_whole_file_it_returns(index, kb_docs, voyage):
+    # The model is handed the entire file, so the citation guard's accept-set has to be
+    # every heading in it — not just the one the query-driven locator picked. A result
+    # that only advertises `id` makes the accurate anchor uncitable (the guard then
+    # denies `billing.md#upgrades-and-downgrades` for "upgrade my plan").
+    voyage(_basis(_doc_position(kb_docs, "billing.md")))
+    results, _, _ = retrieve(index, "upgrade my plan", key="test-key", floor=0.55)
+    billing = next(r for r in results if r["doc"] == "billing.md")
+    assert billing["anchors"] == [
+        "billing.md",
+        "billing.md#billing-and-plans",
+        "billing.md#refunds",
+        "billing.md#upgrades-and-downgrades",
+    ]
+    assert billing["id"] in billing["anchors"]
+    # Only this doc's ids: a doc that was not returned contributes nothing to cite.
+    assert all(a.split("#")[0] == "billing.md" for a in billing["anchors"])
+
+
+def test_a_doc_without_headings_still_anchors_its_bare_name(monkeypatch):
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    plain = Doc(doc="plain.md", headings=[], text="no headings anywhere in this file")
+    index = Index(docs=[plain], matrix=None, model=settings.voyage_model, dim=DIM)
+    results, _, _ = retrieve(index, "headings", floor=0.55)
+    assert results[0]["anchors"] == ["plain.md"]
 
 
 def test_citation_id_falls_back_to_the_bare_doc_when_there_are_no_headings(monkeypatch):

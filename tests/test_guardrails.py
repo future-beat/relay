@@ -516,6 +516,81 @@ def test_the_unbound_path_does_not_enforce_citations(conn, registry):
     assert _reply_ticket_ids(conn) == [TICKET["id"]]
 
 
+# One query, one retrieved doc: "refund policy" hits billing.md and nothing else, so
+# api.md is a real KB doc this run demonstrably never saw.
+BILLING_QUERY = "refund policy"
+LOCATED_CITE = "billing.md#refunds"  # the id _locate_heading picks for that query
+OTHER_SECTION_CITE = "billing.md#upgrades-and-downgrades"  # a heading further down
+UNRETRIEVED_DOC_CITE = "api.md#rate-limits"  # a real doc, not retrieved this run
+
+
+async def _cite(conn, registry, citations):
+    """One run: search billing docs, then reply citing `citations`. Returns the events."""
+    _seed_tickets(conn, TICKET)
+    client = FakeClient([
+        _response([_tool_use("search_docs", {"query": BILLING_QUERY}, id="t1")]),
+        _response([_tool_use("send_reply", {
+            "ticket_id": TICKET["id"], "body": GROUNDED_REPLY, "citations": citations,
+        }, id="t2")]),
+        _response([_text("Reply sent.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+    search = _events_of(events, "tool_result", "search_docs")[0]
+    assert [r["doc"] for r in search.data["result"]["results"]] == ["billing.md"], (
+        "this run must retrieve billing.md and only billing.md, or the assertions below"
+        " prove nothing about which ids the guard accepts"
+    )
+    return events
+
+
+async def test_any_heading_of_a_retrieved_doc_is_a_valid_citation(
+    conn, registry, keyword_baseline
+):
+    # The model is handed the WHOLE file (D-01), so a heading it read out of the
+    # returned text is correct grounding — better grounding, in fact, than the
+    # query-derived `id`. Denying it costs a round trip and pushes the run toward
+    # `ended_without_action` for behaving exactly as the prompt asks.
+    events = await _cite(conn, registry, [OTHER_SECTION_CITE])
+    reply = _events_of(events, "tool_result", "send_reply")[0]
+    assert reply.data["is_error"] is False, reply.data["result"]
+    assert _events_of(events, "guardrail") == []
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+async def test_the_bare_doc_name_is_a_valid_citation(conn, registry, keyword_baseline):
+    events = await _cite(conn, registry, ["billing.md", LOCATED_CITE])
+    reply = _events_of(events, "tool_result", "send_reply")[0]
+    assert reply.data["is_error"] is False, reply.data["result"]
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+async def test_a_citation_differing_only_in_case_is_not_a_fabricated_source(
+    conn, registry, keyword_baseline
+):
+    events = await _cite(conn, registry, ["  BILLING.MD#REFUNDS  "])
+    reply = _events_of(events, "tool_result", "send_reply")[0]
+    assert reply.data["is_error"] is False, reply.data["result"]
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+async def test_a_citation_to_a_doc_this_run_never_retrieved_is_still_denied(
+    conn, registry, keyword_baseline
+):
+    # The other direction, and the whole point of RAG-04: widening the accept-set to
+    # every anchor of a RETRIEVED doc must not turn the guard into a rubber stamp.
+    # api.md exists in kb/ and has a real `rate limits` heading — it simply was not
+    # returned to this run, so citing it is a hallucinated source.
+    events = await _cite(conn, registry, [UNRETRIEVED_DOC_CITE])
+    reply = _events_of(events, "tool_result", "send_reply")[0]
+    assert reply.data["is_error"] is True
+    assert reply.data["result"]["denied_by"] == "citation"
+    assert reply.data["result"]["missing_citations"] == [UNRETRIEVED_DOC_CITE]
+    # The denial still names something usable, or the run cannot recover.
+    assert OTHER_SECTION_CITE in reply.data["result"]["retrieved_ids"]
+    assert not any(i.startswith("api.md") for i in reply.data["result"]["retrieved_ids"])
+    assert _reply_ticket_ids(conn) == []
+
+
 def test_the_system_prompt_tells_the_model_to_cite_retrieved_ids(registry):
     # The guard above only ever fires on a model that cites at all. If the instruction
     # is dropped the guard goes quiet and looks healthy while grounding is unchecked.

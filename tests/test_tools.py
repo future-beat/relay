@@ -41,8 +41,12 @@ def test_search_docs_results_carry_the_citation_shape(registry):
     result = json.loads(registry["search_docs"].execute(query="refund policy"))
     assert result["results"], "no hit to inspect — the assertions below would be vacuous"
     for hit in result["results"]:
-        assert set(hit) == {"doc", "heading", "id", "text", "score"}
+        assert set(hit) == {"doc", "heading", "id", "anchors", "text", "score"}
         assert hit["id"].startswith(hit["doc"])
+        # Every heading of the whole file the model was just handed, plus the bare
+        # doc name — the ids a citation of this result may legitimately use.
+        assert hit["anchors"][0] == hit["doc"]
+        assert hit["id"] in hit["anchors"]
     assert result["retrieval_mode"] == "keyword"
     assert result["degraded"] is False
 
