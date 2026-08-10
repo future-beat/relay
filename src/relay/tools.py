@@ -5,7 +5,7 @@ write actions behind confirmation or policy without touching the loop.
 """
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,7 +75,12 @@ def create_escalation(db: Database, ticket_id: int, reason: str, priority: str) 
     return json.dumps({"escalation_id": escalation_id, "status": "escalated"})
 
 
-def send_reply(db: Database, ticket_id: int, body: str) -> str:
+def send_reply(
+    db: Database, ticket_id: int, body: str, citations: Sequence[str] = ()
+) -> str:
+    # citations is accepted and validated but not persisted this phase: it exists so the
+    # model declares its grounding, which agent.py checks against the ids search_docs
+    # actually returned. Defaulted so every pre-phase-3 call site still works (D-12).
     # Email delivery is mocked: the reply is persisted, nothing leaves the system.
     with db.transaction():
         cur = db.execute(
@@ -183,6 +188,15 @@ def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
                     "properties": {
                         "ticket_id": {"type": "integer"},
                         "body": {"type": "string", "description": "The reply text"},
+                        "citations": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": (
+                                "The search_docs result ids this reply is grounded in,"
+                                ' e.g. "billing.md#refunds". Cite only ids that were'
+                                " returned to you — a made-up id is rejected."
+                            ),
+                        },
                     },
                     "required": ["ticket_id", "body"],
                     "additionalProperties": False,
@@ -191,7 +205,9 @@ def build_registry(conn: Database, kb_dir: Path) -> dict[str, ToolSpec]:
             },
             tier="write",
             input_model=SendReplyInput,
-            execute=lambda ticket_id, body: send_reply(conn, ticket_id, body),
+            execute=lambda ticket_id, body, citations=(): send_reply(
+                conn, ticket_id, body, citations
+            ),
         ),
         "create_escalation": ToolSpec(
             schema={
