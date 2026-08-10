@@ -380,3 +380,90 @@ async def test_injection_ticket_binding_guard_fires(conn, registry, monkeypatch)
     assert _reply_ticket_ids(conn) == [INJECTION_TICKET["id"]]
     assert events[-1].type == "resolution"
     assert events[-1].data["via"] == "send_reply"
+
+
+# --- EVAL-03: citation faithfulness over a whole report (D-07) --------------------
+#
+# The property is `cited ⊆ retrieved`, asserted for EVERY case in a produced report
+# rather than for one hand-built outcome. Deterministic and free: no judge, no model.
+# The report mixes a genuinely produced result (run_case, keyword mode) with composed
+# ones covering each part of the accept-set the running guard uses.
+
+
+def _reply(citations=None, *, body="b" * 40):
+    payload = {"ticket_id": 1, "body": body}
+    if citations is not None:
+        payload["citations"] = citations
+    return AgentEvent(type="tool_use", data={"tool": "send_reply", "input": payload})
+
+
+def _cited_subset(result) -> bool:
+    """The D-07 property, in the one place both the check and its control read it."""
+    return set(result["citations"] or []) <= set(result["retrieval"]["retrieved_ids"])
+
+
+async def test_citation_faithful_cited_subset_retrieved(monkeypatch):
+    # mutation: narrow the accept-set in relay/evals.py extract_outcome (:153-154) to
+    # the located `id` only — drop `hit.get("doc")` and/or the `anchors` union. The
+    # doc-name case ("billing.md") and the anchor case ("api.md#webhooks") then cite
+    # ids missing from retrieved_ids and this subset assert fails. Same shape as the
+    # accept-set agent.py:318-323 builds, which is why narrowing one is a real defect.
+    from relay import evals
+
+    monkeypatch.setattr(settings, "voyage_api_key", None)  # keyword mode, no network
+
+    async def _fake_judge(*args, **kwargs):
+        return {"grounded": True, "invented_claims": [], "quality": 5, "reasoning": "ok"}
+
+    monkeypatch.setattr(evals, "judge_grounding", _fake_judge)
+    client = FakeClient([
+        response([tool_use_block("search_docs", {"query": "refund policy"})]),
+        response([tool_use_block(
+            "send_reply",
+            {"ticket_id": 1, "body": "Here is what our refund policy says. " * 2,
+             "citations": ["billing.md"]},
+            id="toolu_2",
+        )]),
+        response([text_block("done")], stop_reason="end_turn"),
+    ])
+    produced = asdict(await evals.run_case(client, {
+        "id": "refund-window", "customer_email": next(iter(SEED_EMAILS)),
+        "subject": "Refund", "body": "Can I get a refund?",
+        "expected_action": "send_reply", "expected_categories": ["billing"],
+    }, kb_text="(kb)"))
+
+    billing = _search_result({
+        "results": [_hit("billing.md", "refunds", "billing.md#refunds")],
+        "retrieval_mode": "keyword", "degraded": False, "degraded_cause": None,
+    })
+    api = _search_result({
+        "results": [_hit("api.md", "rate-limits", "api.md#rate-limits", "api.md#webhooks")],
+        "retrieval_mode": "keyword", "degraded": False, "degraded_cause": None,
+    })
+    report = {"results": [
+        produced,                                                   # run through the real loop
+        extract_outcome([billing, _reply(["billing.md#refunds"])]),  # the located id
+        extract_outcome([billing, _reply(["billing.md"])]),          # the bare doc name
+        extract_outcome([api, _reply(["api.md#webhooks"])]),         # a non-located anchor
+        extract_outcome([api, _reply(["api.md", "api.md#rate-limits"])]),  # several at once
+        extract_outcome([billing, _reply([])]),                      # cited nothing (D-12)
+        extract_outcome([billing, _reply()]),                        # never passed the arg
+        extract_outcome([_reply()]),                                 # never searched at all
+    ]}
+
+    for result in report["results"]:
+        assert _cited_subset(result), (
+            f"{result.get('id')}: cited {result['citations']} but retrieved"
+            f" {result['retrieval']['retrieved_ids']}"
+        )
+
+    # The loop above is only worth running if some case actually cites something —
+    # an all-`None` report satisfies it vacuously. These pin that it does not.
+    cited = [r for r in report["results"] if r["citations"]]
+    assert len(cited) >= 5
+    assert {"billing.md", "api.md#webhooks"} <= {c for r in cited for c in r["citations"]}
+
+    # Negative control: the same check must reject a fabricated citation, or passing
+    # it proves nothing about the reports that pass it.
+    fabricated = extract_outcome([billing, _reply(["pricing.md#enterprise"])])
+    assert not _cited_subset(fabricated)
