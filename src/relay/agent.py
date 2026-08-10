@@ -356,6 +356,7 @@ async def run_ticket(
                             "ticket_id": ticket["id"],
                             "tool": block.name,
                             "retrieval_mode": payload.get("retrieval_mode"),
+                            "cause": payload.get("degraded_cause"),
                             "results": len(payload.get("results", [])),
                         }})
                         yield AgentEvent(
@@ -364,6 +365,9 @@ async def run_ticket(
                                 "kind": "retrieval_degraded",
                                 "tool": block.name,
                                 "retrieval_mode": payload.get("retrieval_mode"),
+                                # "index_unavailable" (rebuild/commit kb/index.json)
+                                # vs "voyage_failed" (check the key and upstream).
+                                "cause": payload.get("degraded_cause"),
                                 "results": len(payload.get("results", [])),
                             },
                         )

@@ -90,9 +90,9 @@ def test_semantic_ranking_puts_the_on_topic_doc_first_and_drops_below_floor(
     index, kb_docs, voyage
 ):
     voyage(_basis(_doc_position(kb_docs, "billing.md")))
-    results, mode, degraded = retrieve(index, "refund policy", key="test-key", floor=0.55)
+    results, mode, degraded, cause = retrieve(index, "refund policy", key="test-key", floor=0.55)
     assert mode == "semantic"
-    assert degraded is False
+    assert (degraded, cause) == (False, None)
     # account.md and api.md score 0.0 against this query vector and match no keyword.
     assert [r["doc"] for r in results] == ["billing.md"]
     assert results[0]["score"] == pytest.approx(1.0)
@@ -101,35 +101,35 @@ def test_semantic_ranking_puts_the_on_topic_doc_first_and_drops_below_floor(
 def test_off_topic_query_below_the_floor_returns_empty_results(index, voyage):
     # Uniform vector: cosine 1/sqrt(512) ~= 0.044 against every doc, far below the floor.
     voyage(np.ones(DIM, dtype=np.float32))
-    results, mode, degraded = retrieve(index, "zzzzz qqqqq", key="test-key", floor=0.55)
+    results, mode, degraded, cause = retrieve(index, "zzzzz qqqqq", key="test-key", floor=0.55)
     assert results == []
     assert mode == "semantic"
-    assert degraded is False
+    assert (degraded, cause) == (False, None)
 
 
 def test_voyage_failure_degrades_to_keyword_and_never_raises(index, voyage):
     calls = voyage(error=httpx.ConnectError("voyage unreachable"))
-    results, mode, degraded = retrieve(index, "refund policy", key="test-key", floor=0.55)
+    results, mode, degraded, cause = retrieve(index, "refund policy", key="test-key", floor=0.55)
     assert mode == "keyword"
-    assert degraded is True
+    assert (degraded, cause) == (True, "voyage_failed")
     assert [r["doc"] for r in results] == ["billing.md"]
     assert len(calls) == 2, "one timeout-bounded attempt plus one manual retry"
 
 
 def test_missing_key_is_the_keyword_baseline_not_a_degradation(index, monkeypatch):
     monkeypatch.setattr(settings, "voyage_api_key", None)
-    results, mode, degraded = retrieve(index, "refund policy", floor=0.55)
+    results, mode, degraded, cause = retrieve(index, "refund policy", floor=0.55)
     assert mode == "keyword"
-    assert degraded is False
+    assert (degraded, cause) == (False, None), "no key is the baseline, not a failure"
     assert [r["doc"] for r in results] == ["billing.md"]
 
 
 def test_malformed_voyage_response_degrades_instead_of_ranking_on_garbage(index, voyage):
     # Right envelope, wrong width — the dimension drift RESEARCH pitfall 6 describes.
     voyage(payload={"data": [{"embedding": [0.1] * 16, "index": 0}]})
-    results, mode, degraded = retrieve(index, "refund policy", key="test-key", floor=0.55)
+    results, mode, degraded, cause = retrieve(index, "refund policy", key="test-key", floor=0.55)
     assert mode == "keyword"
-    assert degraded is True
+    assert (degraded, cause) == (True, "voyage_failed")
     assert [r["doc"] for r in results] == ["billing.md"]
 
 
@@ -147,7 +147,7 @@ def test_voyage_failure_never_logs_the_api_key(index, voyage, caplog):
 def test_hybrid_union_keeps_a_keyword_only_hit_the_embedding_missed(index, kb_docs, voyage):
     # Query vector points at account.md; "webhook" is a keyword hit in api.md only.
     voyage(_basis(_doc_position(kb_docs, "account.md")))
-    results, mode, _ = retrieve(index, "webhook retry", key="test-key", floor=0.55)
+    results, mode, _, _ = retrieve(index, "webhook retry", key="test-key", floor=0.55)
     docs = [r["doc"] for r in results]
     assert mode == "semantic"
     assert docs[0] == "account.md", "the above-floor semantic hit still ranks first"
@@ -156,7 +156,7 @@ def test_hybrid_union_keeps_a_keyword_only_hit_the_embedding_missed(index, kb_do
 
 def test_result_carries_the_citation_id_shape(index, kb_docs, voyage):
     voyage(_basis(_doc_position(kb_docs, "billing.md")))
-    results, _, _ = retrieve(index, "refund policy", key="test-key", floor=0.55)
+    results, _, _, _ = retrieve(index, "refund policy", key="test-key", floor=0.55)
     result = results[0]
     assert set(result) == {"doc", "heading", "id", "anchors", "text", "score"}
     assert result["id"] == f"{result['doc']}#{slug(result['heading'])}"
@@ -170,7 +170,7 @@ def test_a_result_carries_every_anchor_of_the_whole_file_it_returns(index, kb_do
     # that only advertises `id` makes the accurate anchor uncitable (the guard then
     # denies `billing.md#upgrades-and-downgrades` for "upgrade my plan").
     voyage(_basis(_doc_position(kb_docs, "billing.md")))
-    results, _, _ = retrieve(index, "upgrade my plan", key="test-key", floor=0.55)
+    results, _, _, _ = retrieve(index, "upgrade my plan", key="test-key", floor=0.55)
     billing = next(r for r in results if r["doc"] == "billing.md")
     assert billing["anchors"] == [
         "billing.md",
@@ -187,7 +187,7 @@ def test_a_doc_without_headings_still_anchors_its_bare_name(monkeypatch):
     monkeypatch.setattr(settings, "voyage_api_key", None)
     plain = Doc(doc="plain.md", headings=[], text="no headings anywhere in this file")
     index = Index(docs=[plain], matrix=None, model=settings.voyage_model, dim=DIM)
-    results, _, _ = retrieve(index, "headings", floor=0.55)
+    results, _, _, _ = retrieve(index, "headings", floor=0.55)
     assert results[0]["anchors"] == ["plain.md"]
 
 
@@ -195,7 +195,7 @@ def test_citation_id_falls_back_to_the_bare_doc_when_there_are_no_headings(monke
     monkeypatch.setattr(settings, "voyage_api_key", None)
     plain = Doc(doc="plain.md", headings=[], text="no headings anywhere in this file")
     index = Index(docs=[plain], matrix=None, model=settings.voyage_model, dim=DIM)
-    results, _, _ = retrieve(index, "headings", floor=0.55)
+    results, _, _, _ = retrieve(index, "headings", floor=0.55)
     assert results[0]["heading"] is None
     assert results[0]["id"] == "plain.md"
 
@@ -300,9 +300,42 @@ def test_load_index_missing_file_falls_back_to_keyword_mode(tmp_path):
     index = load_index(_write_kb(tmp_path))
     assert index.matrix is None
     assert [d.doc for d in index.docs] == ["account.md", "api.md", "billing.md"]
-    results, mode, degraded = retrieve(index, "refund policy", key="test-key", floor=0.55)
-    assert (mode, degraded) == ("keyword", False)
+    results, mode, degraded, cause = retrieve(index, "refund policy", key=None, floor=0.55)
+    # key=None: this is the intended keyword baseline, so it is NOT a degradation.
+    # With a key set it is — see the test immediately below, which is the case this
+    # one used to assert backwards.
+    assert (mode, degraded, cause) == ("keyword", False, None)
     assert [r["doc"] for r in results] == ["billing.md"]
+
+
+def test_a_key_with_no_usable_index_is_a_degradation_not_the_baseline(tmp_path):
+    """CR-03: the failure mode that actually reaches production.
+
+    A deployment configured for semantic retrieval whose artifact is missing or stale
+    serves keyword-quality results forever. Before this, `degraded` could only become
+    True inside the `matrix is not None` branch, so the stream, the dashboard and
+    /metrics were byte-identical to the deliberate keyless baseline and no operator
+    could tell "working as designed" from "broken". The boot-time WARNING is not a
+    substitute: it fires once, into a log nobody is reading at 3am.
+    """
+    index = load_index(_write_kb(tmp_path))
+    assert index.matrix is None
+    results, mode, degraded, cause = retrieve(index, "refund policy", key="test-key", floor=0.55)
+    assert (mode, degraded, cause) == ("keyword", True, "index_unavailable")
+    # Degraded, not dead: the keyword half still answers, the run still resolves.
+    assert [r["doc"] for r in results] == ["billing.md"]
+
+
+def test_the_reason_the_index_is_unusable_survives_to_the_query_path(tmp_path, caplog):
+    # "Something is wrong with retrieval" is not actionable; "the kb changed without a
+    # rebuild" is. load_index is the only thing that knows why, and it runs at startup.
+    index = load_index(_write_index(tmp_path, kb_hash="0" * 64))
+    assert "without rebuilding" in (index.unavailable_reason or "")
+    with caplog.at_level("WARNING", logger="relay.retrieval"):
+        retrieve(index, "refund policy", key="test-key", floor=0.55)
+    ctx = [getattr(r, "ctx", {}) for r in caplog.records]
+    assert any(c.get("cause") == "index_unavailable" for c in ctx)
+    assert any("without rebuilding" in str(c.get("reason", "")) for c in ctx)
 
 
 def test_load_index_hash_mismatch_falls_back_to_keyword_mode(tmp_path):
@@ -328,5 +361,5 @@ def test_results_return_whole_files_never_chunks(tmp_path, voyage):
     """D-02: the tool's output stays byte-compatible with the keyword scorer's."""
     index = load_index(_write_index(tmp_path))
     voyage(_basis([d.doc for d in index.docs].index("billing.md")))
-    results, _, _ = retrieve(index, "refund policy", key="test-key", floor=0.55)
+    results, _, _, _ = retrieve(index, "refund policy", key="test-key", floor=0.55)
     assert results[0]["text"].encode("utf-8") == (KB_DIR / "billing.md").read_bytes()

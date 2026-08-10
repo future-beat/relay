@@ -95,12 +95,19 @@ class Index:
 
     `matrix is None` is the keyword-only mode: the docs are still searchable, just
     lexically. Built once (`build_registry` captures it), never re-read per call.
+
+    `unavailable_reason` carries WHY the matrix is missing (stale hash, malformed
+    JSON, model drift...) from the one place that knows — `load_index`, at startup —
+    to `retrieve`, which runs per call and is the only thing a run can observe. A
+    boot-time WARNING is not a signal: nobody reads it, and the run stream looks
+    identical to the deliberate keyless baseline without this (RAG-05, D-14).
     """
 
     docs: list[Doc]
     matrix: np.ndarray | None
     model: str
     dim: int
+    unavailable_reason: str | None = None
 
 
 def load_index(kb_dir: Path) -> Index:
@@ -139,7 +146,7 @@ def load_index(kb_dir: Path) -> Index:
         "retrieval.index_unavailable",
         extra={"ctx": {"path": str(path), "reason": reason, "mode": "keyword"}},
     )
-    return _keyword_index(kb_dir)
+    return _keyword_index(kb_dir, unavailable_reason=reason)
 
 
 def retrieve(
@@ -149,13 +156,20 @@ def retrieve(
     key: str | None = _FROM_SETTINGS,
     floor: float = _FROM_SETTINGS,
     max_results: int = 3,
-) -> tuple[list[dict[str, Any]], str, bool]:
-    """Rank the KB for `query`. Returns `(results, mode, degraded)`.
+) -> tuple[list[dict[str, Any]], str, bool, str | None]:
+    """Rank the KB for `query`. Returns `(results, mode, degraded, cause)`.
 
     Hybrid by design (D-05): the union of above-floor semantic hits and keyword
     hits, deduped by doc. Semantic alone silently loses exact-term matches;
     keyword alone is what this phase is replacing. When the union is empty the
     caller gets `[]` — the same signal that makes the model escalate today (D-03).
+
+    `degraded` means "this deployment is configured for semantic retrieval and did
+    not get it". `cause` says which of the two ways that happened, because they need
+    different operator responses: `"index_unavailable"` is a build/deploy problem
+    (rebuild and commit `kb/index.json`), `"voyage_failed"` is a runtime one (check
+    the key and the upstream). No key at all is NOT a degradation — that is the
+    deliberate keyword baseline, and a notice on every run would bury the real ones.
     """
     if key is _FROM_SETTINGS:
         key = settings.voyage_api_key
@@ -167,13 +181,31 @@ def retrieve(
     cosines: np.ndarray | None = None
     mode = "keyword"
     degraded = False
+    cause: str | None = None
 
-    if key and index.matrix is not None:
+    if key and index.matrix is None:
+        # Configured for semantic retrieval and structurally unable to serve it.
+        # Gating this on `matrix is not None` (as this did) made a missing or stale
+        # artifact byte-identical to the keyless baseline in the stream, the
+        # dashboard and /metrics — the one failure mode that actually reaches
+        # production, and the one nobody could see.
+        degraded = True
+        cause = "index_unavailable"
+        logger.warning(
+            "retrieval.index_unavailable_at_query",
+            extra={"ctx": {
+                "reason": index.unavailable_reason,
+                "mode": mode,
+                "cause": cause,
+            }},
+        )
+    elif key:
         vector = _embed_query(query, key=key, model=index.model, dim=index.dim)
         if vector is None:
             # Voyage was reachable in principle and still failed: that is the
             # degradation the run event surfaces, not the keyword baseline.
             degraded = True
+            cause = "voyage_failed"
         else:
             mode = "semantic"
             cosines = index.matrix @ vector
@@ -198,7 +230,7 @@ def retrieve(
         results.append(_result(index.docs[position], query, score))
         if len(results) >= max_results:
             break
-    return results, mode, degraded
+    return results, mode, degraded, cause
 
 
 def _embed_query(query: str, *, key: str, model: str, dim: int) -> np.ndarray | None:
@@ -339,9 +371,15 @@ def _meta_mismatch(meta: dict[str, Any], kb_dir: Path) -> str | None:
     return None
 
 
-def _keyword_index(kb_dir: Path) -> Index:
+def _keyword_index(kb_dir: Path, *, unavailable_reason: str | None = None) -> Index:
     docs = []
     for path in sorted(Path(kb_dir).glob("*.md")):
         text = path.read_text(encoding="utf-8")
         docs.append(Doc(doc=path.name, headings=headings(text), text=text))
-    return Index(docs=docs, matrix=None, model=settings.voyage_model, dim=settings.voyage_dim)
+    return Index(
+        docs=docs,
+        matrix=None,
+        model=settings.voyage_model,
+        dim=settings.voyage_dim,
+        unavailable_reason=unavailable_reason,
+    )

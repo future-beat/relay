@@ -1,11 +1,14 @@
 import asyncio
 import inspect
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
+import numpy as np
 import pytest
 
+from relay import retrieval
 from relay.agent import _execute_guarded, bind_to_ticket, run_ticket
 from relay.config import settings
 from relay.guardrails import (
@@ -16,6 +19,9 @@ from relay.guardrails import (
     validate_tool_input,
 )
 from relay.prompts import SYSTEM_PROMPT
+from relay.tools import build_registry
+
+KB_DIR = Path(__file__).parent.parent / "kb"
 
 TICKET = {
     "id": 1,
@@ -602,13 +608,41 @@ def test_the_system_prompt_tells_the_model_to_cite_retrieved_ids(registry):
 # --- retrieval degradation (RAG-05) ---
 
 
-async def test_retrieval_degraded_emits_notice(conn, registry, monkeypatch):
+def _registry_with(conn, monkeypatch, *, matrix: bool, reason: str | None = None):
+    """A registry whose index state is fixed by the test, not by `kb/index.json`.
+
+    The committed artifact is a build output: it can legitimately be stale between a
+    kb edit and a rebuild. A degradation test that reads it therefore passes for
+    whichever cause happens to be true today — exactly the kind of accidental pass
+    this phase's review was about. Pin the state instead.
+    """
+    real = retrieval.load_index
+
+    def _fake(kb_dir):
+        index = real(kb_dir)
+        vectors = None
+        if matrix:
+            vectors = np.eye(len(index.docs), settings.voyage_dim, dtype=np.float32)
+        return retrieval.Index(
+            docs=index.docs,
+            matrix=vectors,
+            model=settings.voyage_model,
+            dim=settings.voyage_dim,
+            unavailable_reason=reason,
+        )
+
+    monkeypatch.setattr(retrieval, "load_index", _fake)
+    return build_registry(conn, KB_DIR)
+
+
+async def test_retrieval_degraded_emits_notice(conn, monkeypatch):
     # Voyage configured and failing is the case worth surfacing: the results still look
     # like results, so without this event the run silently serves keyword-quality hits.
     monkeypatch.setattr(settings, "voyage_api_key", "test-key-never-sent-anywhere")
     monkeypatch.setattr(
         httpx, "post", lambda *a, **kw: (_ for _ in ()).throw(httpx.TimeoutException("down"))
     )
+    registry = _registry_with(conn, monkeypatch, matrix=True)
     _seed_tickets(conn, TICKET)
     client = FakeClient([
         _response([_tool_use("search_docs", {"query": RATE_LIMIT_QUERY}, id="t1")]),
@@ -625,10 +659,45 @@ async def test_retrieval_degraded_emits_notice(conn, registry, monkeypatch):
     assert [n.data["kind"] for n in notices] == ["retrieval_degraded"]
     assert notices[0].data["tool"] == "search_docs"
     assert notices[0].data["retrieval_mode"] == "keyword"
+    assert notices[0].data["cause"] == "voyage_failed"
     assert events.index(notices[0]) < events.index(search)
     # A notice, not an ending: the run still resolves on the fallback results.
     assert events[-1].type == "resolution"
     assert events[-1].data["via"] == "send_reply"
+    assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+async def test_a_key_with_an_unusable_index_emits_the_notice_too(conn, monkeypatch):
+    """CR-03 end to end: the run — not just a boot log — has to say this.
+
+    A stale or missing `kb/index.json` on a key-configured deployment used to reach
+    the stream as `degraded: false, mode: keyword`: indistinguishable from the
+    deliberate keyless baseline. The cause is carried through so the notice says
+    which fix applies (rebuild the artifact, not "check Voyage").
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", "test-key-never-sent-anywhere")
+    registry = _registry_with(
+        conn, monkeypatch, matrix=False,
+        reason="kb/*.md changed without rebuilding the index",
+    )
+    _seed_tickets(conn, TICKET)
+    client = FakeClient([
+        _response([_tool_use("search_docs", {"query": RATE_LIMIT_QUERY}, id="t1")]),
+        _response([_tool_use("send_reply", {
+            "ticket_id": TICKET["id"], "body": GROUNDED_REPLY,
+        }, id="t2")]),
+        _response([_text("Reply sent.")], stop_reason="end_turn"),
+    ])
+    events = await collect(run_ticket(client, registry, TICKET))
+
+    search = _events_of(events, "tool_result", "search_docs")[0]
+    assert search.data["result"]["degraded"] is True
+    assert search.data["result"]["degraded_cause"] == "index_unavailable"
+    notices = _events_of(events, "notice")
+    assert [n.data["kind"] for n in notices] == ["retrieval_degraded"]
+    assert notices[0].data["cause"] == "index_unavailable"
+    # Still degraded, not dead: keyword hits are real hits and the run resolves.
+    assert events[-1].type == "resolution"
     assert _reply_ticket_ids(conn) == [TICKET["id"]]
 
 

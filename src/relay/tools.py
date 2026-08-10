@@ -59,8 +59,15 @@ def search_docs(index: retrieval.Index, query: str, max_results: int = 3) -> str
     """
     # key/floor are left to retrieve()'s settings sentinel, so 03-06's calibrated
     # floor lands with no change here.
-    results, mode, degraded = retrieval.retrieve(index, query, max_results=max_results)
-    return json.dumps({"results": results, "retrieval_mode": mode, "degraded": degraded})
+    results, mode, degraded, cause = retrieval.retrieve(index, query, max_results=max_results)
+    return json.dumps({
+        "results": results,
+        "retrieval_mode": mode,
+        "degraded": degraded,
+        # Which degradation, so the notice is actionable rather than just alarming:
+        # a stale/missing index is a deploy fix, a Voyage failure is a runtime one.
+        "degraded_cause": cause,
+    })
 
 
 def create_escalation(db: Database, ticket_id: int, reason: str, priority: str) -> str:
