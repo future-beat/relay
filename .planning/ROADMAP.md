@@ -119,7 +119,7 @@ Plans:
 
 **Wave 5** *(blocked on Wave 4 completion)*
 
-- [ ] 03-06-PLAN.md — Floor calibration + paid before/after 12-case eval diff (acceptance gate) (RAG-01/04/05)
+- [x] 03-06-PLAN.md — Floor calibration + paid before/after 12-case eval diff (acceptance gate) (RAG-01/04/05)
 
 ### Phase 4: Evaluation Coverage
 
