@@ -15,6 +15,11 @@ Guardrails enforced here (phase 1, remaster):
   the model's tool arguments are therefore untrusted output, so a tool call
   naming a different ticket is denied before execution rather than rebound
 
+Guardrails enforced here (phase 3, remaster):
+- a reply may only cite source ids search_docs returned during this run: anything
+  else is denied with a retry instruction rather than silently stripped, so the
+  model's grounding claim is checked against what it was actually handed
+
 Observability (phase 4): every run is an OpenTelemetry `agent.run` span with
 one child span per model request and per tool execution, and each step emits
 a structured JSON log line.
@@ -49,7 +54,7 @@ tracer = trace.get_tracer("relay")
 UNBOUND = object()
 
 
-def bind_to_ticket(ticket_id: int):
+def bind_to_ticket(ticket_id: int, retrieved_ids: set[str] | None = None):
     """Return a tool executor locked to one ticket, for the length of one run.
 
     The binding is a constructor argument here rather than a per-call keyword because
@@ -58,6 +63,13 @@ def bind_to_ticket(ticket_id: int):
     forget it — there is no argument at the call site to leave out, and no executor at
     all without a ticket id. The MCP path has no current run and so calls
     _execute_guarded directly; that is the one legitimate unbound caller.
+
+    `retrieved_ids` is injected the same way and for the same reason: it is the set of
+    citation ids search_docs returned during THIS run, held by reference so the loop can
+    grow it as the run proceeds. Per-run and never on the shared registry, or one run
+    could cite another's docs. None means "no run to check against" (the MCP path) and
+    skips the check entirely; an empty set means "this run has retrieved nothing", so
+    any citation is denied.
     """
     if not isinstance(ticket_id, int) or isinstance(ticket_id, bool):
         raise TypeError(
@@ -67,7 +79,14 @@ def bind_to_ticket(ticket_id: int):
     def execute(
         spec: ToolSpec | None, name: str, raw_input: dict[str, Any], policy: ToolPolicy
     ) -> tuple[str, bool]:
-        return _execute_guarded(spec, name, raw_input, policy, bound_ticket_id=ticket_id)
+        return _execute_guarded(
+            spec,
+            name,
+            raw_input,
+            policy,
+            bound_ticket_id=ticket_id,
+            retrieved_ids=retrieved_ids,
+        )
 
     return execute
 
@@ -79,11 +98,12 @@ def _execute_guarded(
     policy: ToolPolicy,
     *,
     bound_ticket_id: int | object = UNBOUND,
+    retrieved_ids: set[str] | None = None,
 ) -> tuple[str, bool]:
     """Run one tool call through the guardrail chain. Returns (result_json, is_error).
 
-    Bound callers go through bind_to_ticket(); the default is for the MCP server,
-    which has no current run to bind to.
+    Bound callers go through bind_to_ticket(); the defaults are for the MCP server,
+    which has no current run to bind to and nothing retrieved to cite.
     """
     if bound_ticket_id is None:
         # Fails closed rather than degrading to "unbound": None reaching here means a
@@ -123,6 +143,33 @@ def _execute_guarded(
             "expected_ticket_id": bound_ticket_id,
             "supplied_ticket_id": supplied_ticket_id,
         }), True
+    # The model's grounding claim, checked against what this run was actually handed
+    # (RAG-04). Subset, not "at least one": no citations is the pre-phase-3 call and
+    # passes (D-12), a fabricated source does not. retrieved_ids is None only where
+    # there is no run — the MCP path — the same way bound_ticket_id is UNBOUND there.
+    if name == "send_reply" and retrieved_ids is not None:
+        # Compared case- and whitespace-insensitively: every id in the set is already
+        # lowercase (a filename plus a slug), so drift in how the model retypes one it
+        # was shown is a formatting difference, not a fabricated source.
+        allowed = {i.strip().lower() for i in retrieved_ids}
+        missing = [
+            c for c in (validated.get("citations") or []) if c.strip().lower() not in allowed
+        ]
+        if missing:
+            # A retry instruction that names the valid ids, not a refusal. A refusal
+            # leaves resolved_via None, the run ends "ended_without_action", and the
+            # eval gate regresses — so the denial has to be recoverable in-run.
+            available = ", ".join(sorted(retrieved_ids)) or "nothing yet"
+            return json.dumps({
+                "error": (
+                    f"citation(s) {missing} were not retrieved in this run and cannot"
+                    f" be cited. Retrieved so far: {available}."
+                    " Retry send_reply citing only those ids, or search_docs first."
+                ),
+                "denied_by": "citation",
+                "missing_citations": missing,
+                "retrieved_ids": sorted(retrieved_ids),
+            }), True
     try:
         return spec.execute(**validated), False
     except Exception as exc:  # noqa: BLE001 — surfaced to the model, not swallowed
@@ -154,10 +201,15 @@ async def run_ticket(
     resolved_via: str | None = None
     last_stop_reason: str | None = None
 
+    # Every citation id search_docs hands this run, and only this run: a set shared
+    # across runs would let one run cite another's docs. Grown in place below, and the
+    # executor holds the same object, so a cite is valid the moment it is retrieved.
+    retrieved_ids: set[str] = set()
+
     # Built once per run, from this run's own ticket — never stored on the registry,
     # which is built once and shared by every live run. Every tool call below goes
     # through this, so the binding cannot be dropped for one call and not another.
-    execute_bound = bind_to_ticket(ticket["id"])
+    execute_bound = bind_to_ticket(ticket["id"], retrieved_ids)
 
     # The run span is parented explicitly (not made "current") because this is
     # a generator: execution suspends at every yield, and a current-span
@@ -250,10 +302,30 @@ async def run_ticket(
                         binding_violation = (
                             is_error and payload.get("denied_by") == "ticket_binding"
                         )
+                        citation_violation = (
+                            is_error and payload.get("denied_by") == "citation"
+                        )
+                        if block.name == "search_docs" and not is_error:
+                            # Written here, on the event loop after the offloaded call
+                            # has returned, so the set the executor closes over is never
+                            # mutated from the worker thread.
+                            #
+                            # Every id a retrieved doc licenses, not just the
+                            # query-derived `id`: the model was handed the whole file,
+                            # so its bare name and any of its headings are all correct
+                            # grounding (see retrieval.anchors). Narrowing this to `id`
+                            # denies the accurate anchor and accepts the locator's guess.
+                            for hit in payload.get("results", []):
+                                if hit.get("doc"):
+                                    retrieved_ids.add(hit["doc"])
+                                if hit.get("id"):
+                                    retrieved_ids.add(hit["id"])
+                                retrieved_ids.update(a for a in hit.get("anchors") or () if a)
                         span.set_attributes({
                             "relay.tool.tier": spec.tier if spec else "unknown",
                             "relay.tool.is_error": is_error,
                             "relay.tool.binding_violation": binding_violation,
+                            "relay.tool.citation_violation": citation_violation,
                         })
                     logger.info("tool.executed", extra={"ctx": {
                         "ticket_id": ticket["id"], "tool": block.name, "is_error": is_error,
@@ -272,6 +344,46 @@ async def run_ticket(
                                 "tool": block.name,
                                 "expected_ticket_id": payload["expected_ticket_id"],
                                 "supplied_ticket_id": payload["supplied_ticket_id"],
+                                "action": "denied",
+                            },
+                        )
+                    if block.name == "search_docs" and not is_error and payload.get("degraded"):
+                        # A notice, not a guardrail: nothing was denied, the run just
+                        # got weaker results than it asked for. Never ends the run —
+                        # keyword hits are still hits, and silence here would hide a
+                        # Voyage outage behind results that look normal (RAG-05, D-14).
+                        logger.warning("retrieval.degraded", extra={"ctx": {
+                            "ticket_id": ticket["id"],
+                            "tool": block.name,
+                            "retrieval_mode": payload.get("retrieval_mode"),
+                            "cause": payload.get("degraded_cause"),
+                            "results": len(payload.get("results", [])),
+                        }})
+                        yield AgentEvent(
+                            type="notice",
+                            data={
+                                "kind": "retrieval_degraded",
+                                "tool": block.name,
+                                "retrieval_mode": payload.get("retrieval_mode"),
+                                # "index_unavailable" (rebuild/commit kb/index.json)
+                                # vs "voyage_failed" (check the key and upstream).
+                                "cause": payload.get("degraded_cause"),
+                                "results": len(payload.get("results", [])),
+                            },
+                        )
+                    if citation_violation:
+                        logger.warning("guardrail.citation_unretrieved", extra={"ctx": {
+                            "ticket_id": ticket["id"],
+                            "tool": block.name,
+                            "missing_citations": payload["missing_citations"],
+                        }})
+                        yield AgentEvent(
+                            type="guardrail",
+                            data={
+                                "guard": "citation",
+                                "tool": block.name,
+                                "missing_citations": payload["missing_citations"],
+                                "retrieved_ids": payload["retrieved_ids"],
                                 "action": "denied",
                             },
                         )

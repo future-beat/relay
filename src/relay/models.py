@@ -38,6 +38,9 @@ class Ticket(BaseModel):
 class AgentEvent(BaseModel):
     """One step in an agent run, streamed to the client as SSE."""
 
-    # "text" | "tool_use" | "tool_result" | "guardrail" | "usage" | "resolution" | "error"
+    # "text" | "tool_use" | "tool_result" | "guardrail" | "notice" | "usage"
+    # | "resolution" | "error"
+    # "notice" is degraded-but-continuing news for the viewer (retrieval fell back to
+    # keyword search); "guardrail" is a control that fired and denied something.
     type: str
     data: dict[str, Any]
