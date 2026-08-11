@@ -342,15 +342,25 @@ async def run_ticket(
                             # returns anything, withholding the top hit's located id —
                             # the one the model is most likely to cite — so the very
                             # next send_reply cites something real that this run's
-                            # accept-set does not contain, and the guard denies it. The
-                            # dummy keeps the set non-empty, so the denial still names
-                            # ids to retry with and stays recoverable.
+                            # accept-set does not contain, and the guard denies it.
+                            #
+                            # Nothing fabricated is added to keep the set non-empty. A
+                            # placeholder id flows straight into the denial's
+                            # `available` list and its `retrieved_ids` — the guard
+                            # would be telling the model it may cite a source that was
+                            # never retrieved, and then accepting it. That inverts
+                            # RAG-04's property on the one path built to test it, and
+                            # writes a citation into the artifact that the running
+                            # system never served. Instead the probe declines to arm
+                            # when withholding would empty the set: an empty accept-set
+                            # denies everything with nothing to retry with, which is a
+                            # different (unrecoverable) experiment. Only a single hit
+                            # whose doc has no headings can reach that branch.
                             hits = payload.get("results") or []
                             if seed_citation_denial and not seeded_drops and hits:
                                 dropped = hits[0].get("id")
-                                if dropped:
+                                if dropped and retrieved_ids - {dropped}:
                                     seeded_drops.add(dropped)
-                                    retrieved_ids.add("__seeded_missing__")
                                     logger.warning("guardrail.citation_denial_seeded",
                                                    extra={"ctx": {"ticket_id": ticket["id"],
                                                                   "dropped_id": dropped}})

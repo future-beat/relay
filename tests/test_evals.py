@@ -790,6 +790,117 @@ async def test_seed_denial_survives_a_second_search(conn, registry, keyword_base
     assert _reply_ticket_ids(conn) == [SEED_DENIAL_TICKET["id"]]
 
 
+# --- WR-05: the probe must not manufacture a citable source -----------------------
+#
+# The arming step used to inject `__seeded_missing__` into the accept-set "to keep it
+# non-empty". That id reaches the model twice — in the denial's `available` sentence
+# and in its `retrieved_ids` list — so the guard was inviting a citation of a source
+# no search ever returned, and then passing it on the subset check. Two things break:
+# RAG-04's property ("a fabricated source is denied") is inverted on the one path
+# built to test it, and a seeded paid run in which the model takes the invitation
+# records a citation-faithfulness violation the running system never served, since
+# extract_outcome builds retrieved_ids from the tool payloads (which never contain it).
+
+SEEDING_SENTINEL = "__seeded_missing__"
+
+
+class SentinelCitingClient:
+    """Cites the old placeholder id, then recovers with whatever the denial names.
+
+    Also records every id the search actually offered, so the denial payload can be
+    checked against the retrieval rather than against itself.
+    """
+
+    def __init__(self, ticket_id, citation=SEEDING_SENTINEL):
+        self.ticket_id = ticket_id
+        self.citation = citation
+        self.offered_ids: set[str] = set()
+        self.denied_with_ids = None
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, *, messages, **kwargs):
+        payloads = _tool_result_payloads(messages)
+        if not payloads:
+            return response([tool_use_block("search_docs", {"query": "rate limits"}, id="t1")])
+        last = payloads[-1]
+        if "results" in last:
+            for hit in last["results"]:
+                self.offered_ids.update(x for x in (hit.get("doc"), hit.get("id")) if x)
+                self.offered_ids.update(hit.get("anchors") or ())
+            return response([tool_use_block("send_reply", {
+                "ticket_id": self.ticket_id,
+                "body": GROUNDED_REPLY,
+                "citations": [self.citation],
+            }, id="t2")])
+        if last.get("denied_by") == "citation":
+            self.denied_with_ids = list(last.get("retrieved_ids") or [])
+            return response([tool_use_block("send_reply", {
+                "ticket_id": self.ticket_id,
+                "body": GROUNDED_REPLY,
+                "citations": self.denied_with_ids,
+            }, id="t3")])
+        return response([text_block("Reply sent.")], stop_reason="end_turn")
+
+
+async def test_seeded_run_never_offers_or_accepts_a_source_it_did_not_retrieve(
+    conn, registry, keyword_baseline
+):
+    # mutation (the WR-05 defect itself): restore
+    # `retrieved_ids.add("__seeded_missing__")` in the arming block of
+    # src/relay/agent.py::run_ticket. The sentinel is then in the accept-set, the
+    # citation below passes the subset check, no denial fires, and the
+    # `== ["citation"]` assertion fails — a model that cited a fabricated source
+    # would have been graded as correctly grounded.
+    _seed_tickets(conn, SEED_DENIAL_TICKET)
+    client = SentinelCitingClient(SEED_DENIAL_TICKET["id"])
+
+    events = [e async for e in run_ticket(
+        client, registry, SEED_DENIAL_TICKET, seed_citation_denial=True
+    )]
+
+    # (a) citing the placeholder is DENIED, on an armed run, exactly like any other
+    # source the run never retrieved.
+    guardrails = [e for e in events if e.type == "guardrail"]
+    assert [e.data["guard"] for e in guardrails] == ["citation"]
+    assert guardrails[0].data["missing_citations"] == [SEEDING_SENTINEL]
+
+    # (b) and the denial never offers it back. Checked against what search_docs
+    # actually returned, not against a hardcoded list: every id the guard names has
+    # to be one the running system served, or the artifact records a violation that
+    # never happened.
+    assert client.offered_ids, "the client never saw a search result"
+    assert SEEDING_SENTINEL not in guardrails[0].data["retrieved_ids"]
+    assert client.denied_with_ids, "the denial named nothing to retry with"
+    assert set(client.denied_with_ids) <= client.offered_ids
+    assert set(client.denied_with_ids) < client.offered_ids, "nothing was withheld"
+
+    assert events[-1].type == "resolution"
+    assert events[-1].data["via"] == "send_reply"
+    assert _reply_ticket_ids(conn) == [SEED_DENIAL_TICKET["id"]]
+
+
+async def test_seeded_denial_names_only_genuinely_retrieved_ids(
+    conn, registry, keyword_baseline
+):
+    """The same property on the recovery path the shipped mechanism test drives.
+
+    Its `recovered_with` used to read
+    `['__seeded_missing__', 'api.md', 'api.md#api-access', ...]` — the fabricated id
+    first in the list the model is told to cite from.
+    """
+    _seed_tickets(conn, SEED_DENIAL_TICKET)
+    client = HookDependentRecoveringClient(SEED_DENIAL_TICKET["id"])
+
+    events = [e async for e in run_ticket(
+        client, registry, SEED_DENIAL_TICKET, seed_citation_denial=True
+    )]
+
+    assert client.recovered_with
+    assert SEEDING_SENTINEL not in client.recovered_with
+    assert all("__" not in cited for cited in client.recovered_with)
+    assert events[-1].data["via"] == "send_reply"
+
+
 # --- CR-03: the artifact must distinguish recovery from never-being-asked ---------
 #
 # All three D-08 outcomes used to serialise as `action="send_reply"`: the guard fired
