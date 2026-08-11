@@ -19,3 +19,7 @@ should escalate them.
 Plan changes take effect immediately; charges are pro-rated. Downgrading below
 your current usage (e.g. more than 3 projects on Free) locks the excess projects
 read-only rather than deleting them.
+
+Read-only projects are never deleted and are not subject to a retention clock.
+Upgrading again restores full write access to all of them immediately and
+automatically.
