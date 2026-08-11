@@ -62,9 +62,29 @@ CREATE TABLE IF NOT EXISTS replies (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- One row per agent step, written during the stream (the `runs` row above is a single
+-- end-of-run summary and cannot answer "what did it do"). payload holds the RAW
+-- event data as JSON: the DB is private and is the source of truth, so redaction
+-- happens only at the public /events boundary, never here. run_uid is a soft join key,
+-- not a foreign key — the runs row is inserted at end of stream, long after the first
+-- event row, so a real FK would fail on every insert.
+CREATE TABLE IF NOT EXISTS run_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_uid    TEXT NOT NULL,
+    ticket_id  INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- spent_today() sums today's runs on the event loop for every gated request; without
 -- this it is a full table scan that grows for the life of the Fly volume.
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at);
+
+-- Phase 6's per-run drill-down selects every event for one run_uid; without this it is
+-- a full scan of a table that grows by ~10 rows per run for the life of the volume.
+CREATE INDEX IF NOT EXISTS idx_run_events_run_uid ON run_events(run_uid);
 """
 
 SEED_CUSTOMERS = [
@@ -219,6 +239,15 @@ def connect(db_path: str | Path) -> Database:
 
 def init_db(conn: Database) -> None:
     conn.executescript(SCHEMA)
+    # `runs` already exists on the live Fly volume, and CREATE TABLE IF NOT EXISTS does
+    # not add columns to a table it declines to create — adding run_uid to the DDL above
+    # would be a silent no-op in production only: no error, no signal, and every event
+    # join returning NULL. So the column is added explicitly. ALTER TABLE is not
+    # idempotent (a second one raises "duplicate column name"), and init_db runs on every
+    # boot, so the PRAGMA guard is what makes the re-run safe. Legacy rows keep NULL.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if "run_uid" not in cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN run_uid TEXT")
     existing = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
     if existing == 0:
         conn.executemany(
