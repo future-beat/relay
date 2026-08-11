@@ -15,11 +15,21 @@ allowlist redaction, and the load-bearing D-04 atomicity test.
 import asyncio
 import inspect
 import json
+import sqlite3
+from pathlib import Path
 
+import pytest
+
+from relay.agent import bind_to_ticket
+from relay.config import settings
 from relay.db import connect, init_db
-from relay.events import _CLOSE_SENTINEL, RunEventBroker, project
+from relay.events import _CLOSE_SENTINEL, RunEventBroker, RunRecorder, project
+from relay.guardrails import ToolPolicy
 from relay.models import AgentEvent
 from relay.telemetry import record_run
+from relay.tools import build_registry
+
+KB_DIR = Path(__file__).parent.parent / "kb"
 
 
 def test_run_uid_migration_is_idempotent(tmp_path):
@@ -298,3 +308,107 @@ def test_project_keeps_the_cost_and_outcome_the_dashboard_runs_on():
         "kind": "retrieval_degraded", "tool": "search_docs",
         "retrieval_mode": "keyword", "cause": "voyage_failed", "results": 3,
     }))["cause"] == "voyage_failed"
+
+
+def _seed_ticket(db) -> int:
+    with db.transaction():
+        cur = db.execute(
+            "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+            ("ava@acmecorp.com", "Refund", "I was charged twice for March."),
+        )
+        return cur.lastrowid
+
+
+def test_a_recorder_writes_one_row_per_event(conn):
+    recorder = RunRecorder(conn, run_uid="u1", ticket_id=7)
+
+    recorder.record(AgentEvent(type="usage", data={"steps": 1}))
+    recorder.record(AgentEvent(type="text", data={"text": "thinking"}))
+    recorder.record(AgentEvent(type="tool_use", data={"tool": "search_docs"}))
+
+    rows = conn.execute(
+        "SELECT seq, type, payload FROM run_events WHERE run_uid = ? ORDER BY seq", ("u1",)
+    ).fetchall()
+
+    assert [r["seq"] for r in rows] == [1, 2, 3], "seq must be monotonic per run"
+    assert [r["type"] for r in rows] == ["usage", "text", "tool_use"]
+    # RAW, not projected: phase 6's drill-down needs the tool inputs and retrieved text
+    # that project() strips. Redaction is a publish-time transform, not a write-time one.
+    assert json.loads(rows[1]["payload"]) == {"text": "thinking"}
+    assert conn.execute(
+        "SELECT ticket_id FROM run_events WHERE run_uid = ?", ("u1",)
+    ).fetchone()["ticket_id"] == 7
+
+
+def test_send_reply_and_its_event_row_commit_atomically(db, tmp_path, monkeypatch):
+    """A write tool and the record of that write commit or roll back TOGETHER (D-04).
+
+    MUTATION that must turn this red: in execute_and_record, move the `_insert_event`
+    call out of the `with self.conn.transaction():` block so the event is persisted in
+    a second, separate transaction after the tool's own has committed. The forced
+    failure below then leaves COUNT(*) FROM replies == 1 — a reply sent to a customer
+    with no record that the agent sent it, which is the exact repudiation gap D-04
+    exists to close.
+
+    The rollback half is the whole point. A version of this test that only checks both
+    rows exist on the happy path passes under that mutation and proves nothing.
+    """
+    # Keyword mode pinned: build_registry loads the retrieval index, and an unpinned
+    # key in a developer's .env turns a free unit test into a paid Voyage call.
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    registry = build_registry(db, KB_DIR)
+    ticket_id = _seed_ticket(db)
+    execute_bound = bind_to_ticket(ticket_id)
+    recorder = RunRecorder(db, run_uid="u1", ticket_id=ticket_id)
+    call = dict(
+        spec=registry["send_reply"],
+        name="send_reply",
+        raw_input={"ticket_id": ticket_id, "body": "Refunded — it lands in 3-5 days."},
+        policy=ToolPolicy(),
+        event_type="tool_result",
+    )
+
+    def insert_against_a_closed_database(self, *args, **kwargs):
+        # The realistic failure: lifespan closed the connection under an in-flight run.
+        raise sqlite3.OperationalError("database is locked")
+
+    with pytest.MonkeyPatch.context() as forced_failure:
+        forced_failure.setattr(RunRecorder, "_insert_event", insert_against_a_closed_database)
+        with pytest.raises(sqlite3.OperationalError):
+            recorder.execute_and_record(execute_bound, **call)
+
+    assert db.execute("SELECT COUNT(*) FROM replies").fetchone()[0] == 0, (
+        "the reply survived its failed event insert — the two are not in one transaction"
+    )
+    assert db.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == 0
+    # The tool's other write in the same transaction went back too, or the ticket reads
+    # resolved with nothing that resolved it.
+    assert db.execute(
+        "SELECT status FROM tickets WHERE id = ?", (ticket_id,)
+    ).fetchone()["status"] == "open"
+
+    # Case 1, the same call unmutated: both rows land and both survive a reconnect.
+    result, is_error = recorder.execute_and_record(execute_bound, **call)
+
+    assert is_error is False
+    assert json.loads(result)["status"] == "resolved"
+
+    reopened = connect(tmp_path / "relay.db")
+    try:
+        assert reopened.execute("SELECT COUNT(*) FROM replies").fetchone()[0] == 1
+        row = reopened.execute("SELECT seq, type, payload FROM run_events").fetchone()
+        assert (row["seq"], row["type"]) == (1, "tool_result")
+        payload = json.loads(row["payload"])
+        assert payload["tool"] == "send_reply"
+        assert payload["is_error"] is False
+        assert payload["result"]["status"] == "resolved"
+    finally:
+        reopened.close()
+
+
+def test_recorder_is_synchronous():
+    # It runs inside asyncio.to_thread (plan 03) and must hold the tool's transaction on
+    # that one worker thread: transaction() re-entrancy is per-thread, so an await in
+    # here would let the loop resume the run elsewhere with the transaction still open.
+    for name in ("record", "execute_and_record", "_insert_event"):
+        assert inspect.iscoroutinefunction(getattr(RunRecorder, name)) is False
