@@ -65,6 +65,9 @@ def record_run(
     output_tokens: int,
     cost_usd: float,
     outcome: str,
+    # Optional so every pre-phase-5 caller (evals, the MCP path, direct test callers)
+    # keeps working; legacy rows and un-stamped runs simply store NULL.
+    run_uid: str | None = None,
 ) -> None:
     # One statement, but the commit is what matters: a bare commit() is connection-scoped
     # and would land another request's half-finished write alongside this row.
@@ -73,8 +76,18 @@ def record_run(
     with conn.transaction():
         conn.execute(
             "INSERT INTO runs (ticket_id, model, duration_ms, steps, input_tokens,"
-            " output_tokens, cost_usd, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ticket_id, model, duration_ms, steps, input_tokens, output_tokens, cost_usd, outcome),
+            " output_tokens, cost_usd, outcome, run_uid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticket_id,
+                model,
+                duration_ms,
+                steps,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                outcome,
+                run_uid,
+            ),
         )
 
 
