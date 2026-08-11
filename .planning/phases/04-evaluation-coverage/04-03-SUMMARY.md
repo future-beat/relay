@@ -172,3 +172,36 @@ None. The hook adds no network surface, no schema change, and no new trust bound
 - `src/relay/evals.py` — FOUND, contains `seed_citation_denial=seed_citation_denial`
 - `tests/test_evals.py` — FOUND, contains `test_seed_denial_hook_denies_then_fake_recovers`
 - Commits dd60065, f8f4b19, d1bec46, 5d5ec26 — all FOUND in `git log`
+
+---
+
+## Paid real-model recovery probe — RUN 2026-08-11, the WR-10 question is CLOSED
+
+Phase 3 left this open (`03-REVIEW.md` WR-10): the citation guard had never fired against a
+real model, so in-run recovery was proven only against fakes. Armed via
+`run_case(..., seed_citation_denial=True)` on the `password-reset` golden case:
+
+```
+guardrail.citation_denial_seeded     <- hook withheld account.md#password-reset
+guardrail.citation_unretrieved       <- the real model cited it; the guard denied
+denial_recovery: recovered
+action: send_reply | grounded: True | quality: 5 | error: None
+citations: ['account.md']
+guardrails: [{"guard":"citation","tool":"send_reply",
+              "missing_citations":["account.md#password-reset"]}]
+```
+
+**A real Claude model recovers.** It cited the withheld id, was denied, read `retrieved_ids`
+back out of the denial payload, and retried with a valid citation — reaching a terminal
+`send_reply` with grounding intact. No `ended_without_action`. The denial wording is
+recoverable in production, not merely against a scripted fake.
+
+Note the recorded `citations` are the **recovery** citations (`['account.md']`), not the denied
+attempt — `extract_outcome` overwrites on each `send_reply`. What was actually denied is
+preserved in `guardrails[].missing_citations`. Read those two fields together.
+
+**First attempt hit `api_connection_error`** before reaching the model. The instrumentation
+handled it correctly — `seeded_denial: True`, `denial_recovery: not_denied`, with `error`
+beside it to disambiguate — but it illustrates the caveat already logged: an errored run and a
+run the guard was never asked about both read `not_denied`. The `error` field is what separates
+them.
