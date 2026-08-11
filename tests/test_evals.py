@@ -1,5 +1,6 @@
 import inspect
 import json
+import logging
 from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
@@ -908,11 +909,34 @@ def test_seed_denial_hook_is_keyword_only_and_default_off():
     assert param.default is False
 
 
-def test_production_never_arms_the_seed_denial_hook():
-    # mutation: wire the flag into src/relay/main.py's run_ticket call. The eval-only
-    # hook would then narrow a live run's accept-set and deny a real customer reply.
-    main_src = (Path(__file__).parent.parent / "src" / "relay" / "main.py").read_text()
-    assert "seed_citation_denial" not in main_src
+def test_no_production_module_references_the_seed_denial_hook():
+    # mutation: wire the flag into src/relay/main.py's (or mcp_server.py's, or any
+    # future entry point's) run_ticket call. The eval-only hook would then narrow a
+    # live run's accept-set and deny a real customer reply.
+    #
+    # Over the whole package, not one hand-named file: the previous version read
+    # main.py alone, so a second production caller — or a new one — was unconstrained.
+    # agent.py (which defines the parameter) and evals.py (the single sanctioned
+    # caller, D-08) are the only modules allowed to name it, and excluding exactly
+    # those two is what stops this from being a substring grep that passes trivially
+    # because the string exists somewhere in the package.
+    package = Path(__file__).parent.parent / "src" / "relay"
+    owners = {"agent.py", "evals.py"}
+    modules = sorted(package.rglob("*.py"))
+    assert len(modules) > 5, "the package glob found almost nothing; the path is wrong"
+
+    armed = sorted(
+        path.name for path in modules
+        if path.name not in owners and "seed_citation_denial" in path.read_text()
+    )
+    assert armed == [], f"non-eval modules reference the eval-only hook: {armed}"
+
+    # The exclusions are exclusions, not blind spots: both owners really do name it,
+    # so this test fails loudly if the hook is renamed rather than passing vacuously.
+    for owner in owners:
+        assert "seed_citation_denial" in (package / owner).read_text(), (
+            f"{owner} no longer mentions the hook — the exclusion list is stale"
+        )
 
 
 SEED_DENIAL_TICKET = {
@@ -1110,6 +1134,34 @@ async def test_seed_denial_survives_a_second_search(conn, registry, keyword_base
     assert events[-1].type == "resolution"
     assert events[-1].data["via"] == "send_reply"
     assert _reply_ticket_ids(conn) == [SEED_DENIAL_TICKET["id"]]
+
+
+async def test_an_unarmed_run_never_seeds_a_citation_denial(
+    conn, registry, keyword_baseline, caplog
+):
+    """The runtime half of the containment claim, next to the two static halves.
+
+    The signature test pins the default and the package grep pins the callers, but
+    both assert spellings. This asserts the property: an ordinary run, driven by the
+    one client whose citation the armed hook is guaranteed to deny, is not denied.
+    """
+    # mutation: flip run_ticket's `seed_citation_denial` default to True, or arm the
+    # probe off settings/env instead of the parameter. The signature test catches the
+    # first and nothing catches the second; this catches both.
+    _seed_tickets(conn, SEED_DENIAL_TICKET)
+    client = HookDependentRecoveringClient(SEED_DENIAL_TICKET["id"])
+
+    with caplog.at_level(logging.INFO, logger="relay.agent"):
+        events = [e async for e in run_ticket(client, registry, SEED_DENIAL_TICKET)]
+
+    assert "guardrail.citation_denial_seeded" not in [r.message for r in caplog.records]
+    assert [e for e in events if e.type == "guardrail"] == []
+    # Non-vacuous: the client DID cite the exact id an armed run would withhold, so a
+    # silently-armed hook would have produced a denial here.
+    assert client.cited_first, "the client never cited anything, so nothing was tested"
+    assert client.recovered_with is None, "an unarmed run should have nothing to recover from"
+    assert events[-1].type == "resolution"
+    assert events[-1].data["via"] == "send_reply"
 
 
 # --- WR-05: the probe must not manufacture a citable source -----------------------
