@@ -160,8 +160,26 @@ Plans:
   3. The public feed contains no ticket bodies, customer data, or API keys — only redacted projections
   4. A slow or abandoned browser tab never stalls or delays a paid agent run, and streams are capped so the machine can still scale to zero
 
-**Plans**: TBD
-**UI hint**: yes
+**Plans**: 4 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 05-01-PLAN.md — `run_events` DDL + guarded idempotent `ALTER TABLE runs ADD run_uid` + `record_run` run_uid + live-feed config settings (DATA-03)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 05-02-PLAN.md — `events.py`: `RunEventBroker` (bounded drop-oldest), `project()` allowlist redaction, `RunRecorder` + the load-bearing atomicity test (DATA-03/DASH-01)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 05-03-PLAN.md — Wire optional `recorder` into `agent.py`; `event_stream` persist/publish (post-commit) + `run_uid`; lifespan broker; end-to-end persistence + the load-bearing redaction leak test (DATA-03/DASH-01)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 05-04-PLAN.md — Public `GET /events` (heartbeat + idle-close + D-14 snapshot) + lifespan `broker.close()`; live smoke, unsubscribe, heartbeat/idle, viewer-not-a-run tests (DASH-01)
+
+**UI hint**: yes — scoped to the thinnest `/events` smoke that proves SC-2; the designed dashboard is Phase 6
 
 ### Phase 6: Dashboard Experience
 
@@ -189,5 +207,5 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 2. Async-Safe Data Layer & Graceful Shutdown | 5/5 | Complete   | 2026-08-09 |
 | 3. Semantic Retrieval | 5/6 | In Progress|  |
 | 4. Evaluation Coverage | 0/3 | Not started | - |
-| 5. Run Event Persistence & Live Feed | 0/TBD | Not started | - |
+| 5. Run Event Persistence & Live Feed | 0/4 | Not started | - |
 | 6. Dashboard Experience | 0/TBD | Not started | - |
