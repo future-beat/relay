@@ -489,6 +489,82 @@ async def test_run_evals_report_carries_the_retrieval_metrics_block(
     assert "report-only, not gated" in out
 
 
+# --- WR-08: the secret must not silently change what the 0.8 gate is judging -----
+#
+# VOYAGE_API_KEY does not only feed retrieval_metrics — it feeds every search_docs
+# call in all 12 golden runs. Putting it in the graded step flips the whole suite
+# from keyword to semantic ranking, so `pass_rate < 0.8` (D-04, unchanged) would be
+# evaluating a configuration nobody has ever run, in either direction.
+
+EVALS_WORKFLOW = Path(__file__).parent.parent / ".github" / "workflows" / "evals.yml"
+
+
+def _workflow_steps(text: str) -> list[str]:
+    """Each `- name:`/`- uses:` step as its own block. No yaml dependency in CI."""
+    steps: list[list[str]] = []
+    for line in text.splitlines():
+        if line.startswith("      - "):
+            steps.append([line])
+        elif steps:
+            steps[-1].append(line)
+    return ["\n".join(step) for step in steps]
+
+
+def test_the_gated_eval_step_does_not_receive_the_voyage_key():
+    # mutation (the WR-08 defect itself): move `VOYAGE_API_KEY` back into the
+    # `python -m relay.evals --threshold ...` step's env. All 12 graded runs then
+    # retrieve semantically, and the 0.8 gate starts judging a retrieval mode it was
+    # never calibrated against — a gate failure would be unattributable to any code
+    # change. This test fails.
+    steps = _workflow_steps(EVALS_WORKFLOW.read_text())
+
+    gated = [s for s in steps if "--threshold" in s]
+    assert len(gated) == 1, "expected exactly one threshold-gated step"
+    assert "VOYAGE_API_KEY" not in gated[0], (
+        "the gated suite must stay in the retrieval mode its 0.8 baseline was measured in"
+    )
+
+    # ...and the number is still reported, out of band, where it cannot gate.
+    report_only = [s for s in steps if "relay.retrieval_report" in s]
+    assert len(report_only) == 1, "the report-only retrieval step is missing"
+    assert "VOYAGE_API_KEY" in report_only[0]
+    assert "continue-on-error: true" in report_only[0]
+    assert "--threshold" not in report_only[0]
+
+
+def test_the_standalone_retrieval_report_cannot_fail_a_job(
+    monkeypatch, tmp_path, capsys, keyword_baseline
+):
+    # mutation: have retrieval_report call `retrieval_metrics()` instead of
+    # `safe_retrieval_metrics()`. The sabotage below then raises out of main() and
+    # the report-only step exits non-zero — which `continue-on-error` masks in CI,
+    # so nothing but this test would notice the artifact had stopped being written.
+    from relay import retrieval_report
+
+    def _boom():
+        raise OSError("evals/retrieval.jsonl: No such file or directory")
+
+    monkeypatch.setattr(evals, "retrieval_metrics", _boom)
+    monkeypatch.setattr("sys.argv", ["relay.retrieval_report", "--output", str(tmp_path)])
+
+    retrieval_report.main()
+
+    written = list(tmp_path.glob("retrieval-*.json"))
+    assert len(written) == 1
+    payload = json.loads(written[0].read_text())
+    assert payload["retrieval_metrics"]["error"].startswith("OSError:")
+    assert "retrieval metrics unavailable" in capsys.readouterr().out
+
+
+def test_the_standalone_retrieval_report_carries_the_real_numbers(keyword_baseline):
+    from relay import retrieval_report
+
+    m = retrieval_report.build_report()["retrieval_metrics"]
+    assert m["mode"] == "keyword"
+    assert m["scored_queries"] == len(scored_labels(load_labels()))
+    assert m["recall@3"] > 0
+
+
 # --- EVAL-02: the prompt-injection golden case (D-05) ----------------------------
 #
 # The attacker input is the ticket body itself: it instructs the agent to post a
