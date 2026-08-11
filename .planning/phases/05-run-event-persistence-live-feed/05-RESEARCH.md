@@ -453,17 +453,20 @@ record_run(app.state.conn, ..., run_uid=run_uid)     # in the existing finally
 | A3 | Default intervals: broker queue `maxsize≈256`, heartbeat `≈15s`, idle ceiling `≈5min`. | Pattern 3/4 | Wrong values are a tuning issue, not a correctness one; all configurable. CONTEXT leaves exact values to discretion. |
 | A4 | Touching `agent.py` (optional `recorder` arg) is acceptable in Phase 5. Phase 2's "don't touch agent.py/evals/mcp" (D-03) was Phase-2-scoped; the recorder defaults `None` so evals/mcp behaviour is unchanged. | Pattern 2 | If a reviewer treats Phase 2 D-03 as global, the seam must move — but then D-04 atomicity is unachievable (Pitfall 1). Surface at plan-check. |
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> All three closed on 2026-08-11: Q1 and Q2 by CONTEXT.md's D-04-correction / D-14 addendum and enforced in the plans; Q3 deferred to v2.
+
 
 1. **Exact `agent.py` recorder call-site count.**
    - Known: the write-tool offload must wrap tool-exec + event-insert in one transaction; publish must be post-commit.
    - Unclear: whether non-write events are persisted from within `run_ticket` (one `record` per yield) or the planner prefers a thinner touch.
-   - Recommendation: persist all events via the recorder in `agent.py` (write-tool one inside its txn); publish projections from `main.py`. Gate with the atomicity test (DATA-03-b).
+   - **RESOLVED (D-04 correction):** persist all events via the recorder in `agent.py` (write-tool one inside its txn); publish projections from `main.py`. Gated by the atomicity test (05-02 Task 3).
 
 2. **Does `/events` send an initial snapshot of currently-running runs?**
-   - D-03 forbids *history* replay but a live snapshot of `RunRegistry.snapshot()` (projected) helps a fresh tab. Recommendation: send one projected snapshot frame on connect; it's live state, not history.
+   - D-03 forbids *history* replay but a live snapshot of `RunRegistry.snapshot()` (projected) helps a fresh tab. **RESOLVED (D-14, now MANDATORY):** send one projected snapshot frame on connect; live state, not history. Enforced by `test_events_sends_initial_snapshot_on_connect` (05-04 Task 2).
 
-3. **`run_events` retention.** Unbounded growth on the Fly volume over months. Not in scope this phase (corpus is tiny, runs are ~$0.02 and rate-limited), but note it as a v2 filler (a `DELETE WHERE created_at < ...` on startup).
+3. **`run_events` retention.** Unbounded growth on the Fly volume over months. **RESOLVED (deferred to v2):** not in scope this phase (corpus is tiny, runs are ~$0.02 and rate-limited); v2 filler is a `DELETE WHERE created_at < ...` on startup.
 
 ## Environment Availability
 
