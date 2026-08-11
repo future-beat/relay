@@ -360,13 +360,13 @@ def test_send_reply_and_its_event_row_commit_atomically(db, tmp_path, monkeypatc
     ticket_id = _seed_ticket(db)
     execute_bound = bind_to_ticket(ticket_id)
     recorder = RunRecorder(db, run_uid="u1", ticket_id=ticket_id)
-    call = dict(
-        spec=registry["send_reply"],
-        name="send_reply",
-        raw_input={"ticket_id": ticket_id, "body": "Refunded — it lands in 3-5 days."},
-        policy=ToolPolicy(),
-        event_type="tool_result",
-    )
+    call = {
+        "spec": registry["send_reply"],
+        "name": "send_reply",
+        "raw_input": {"ticket_id": ticket_id, "body": "Refunded — it lands in 3-5 days."},
+        "policy": ToolPolicy(),
+        "event_type": "tool_result",
+    }
 
     def insert_against_a_closed_database(self, *args, **kwargs):
         # The realistic failure: lifespan closed the connection under an in-flight run.

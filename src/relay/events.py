@@ -20,10 +20,12 @@ broker is built in `lifespan` and held on `app.state`, like `RunRegistry`.
 """
 
 import asyncio
+import json
 import logging
 from typing import Any
 
 from .config import settings
+from .db import Database
 from .models import AgentEvent
 
 logger = logging.getLogger("relay.events")
@@ -197,3 +199,78 @@ def project(event: AgentEvent) -> dict | None:
         # whatever the model just read, which includes the customer's own details.
         return {"type": t}
     return None
+
+
+class RunRecorder:
+    """Writes one `run_events` row per step of one run. Synchronous, on purpose.
+
+    Synchronous because `Database.transaction()` is re-entrant *per thread*: the
+    write-tool path below has to open the outer transaction, run the tool's own
+    nested one, and insert the event row without ever leaving the worker thread
+    `asyncio.to_thread` put it on. An `await` in here would hand control back to the
+    loop with the transaction open and the lock held.
+
+    One instance per run, holding the run's uid, its ticket and its own `seq`
+    counter — the counter is what makes phase 6's drill-down renderable in order
+    without trusting `created_at` to break ties between two rows in the same
+    millisecond.
+    """
+
+    def __init__(self, conn: Database, *, run_uid: str, ticket_id: int) -> None:
+        self.conn = conn
+        self.run_uid = run_uid
+        self.ticket_id = ticket_id
+        self._seq = 0
+
+    def _insert_event(self, type: str, data: dict) -> None:
+        """One INSERT. Assumes a transaction is already open — see both callers.
+
+        `data` is stored RAW. The private table is the full-fidelity record phase 6's
+        drill-down reads; `project()` is the transform on the way out to the public
+        feed. Redacting here instead would leave nothing to drill into.
+        """
+        self._seq += 1
+        self.conn.execute(
+            "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload)"
+            " VALUES (?, ?, ?, ?, ?)",
+            # default=str so a stray datetime or Decimal in an event cannot take down
+            # the run it was only meant to describe.
+            (self.run_uid, self.ticket_id, self._seq, type, json.dumps(data, default=str)),
+        )
+
+    def record(self, event: AgentEvent) -> None:
+        """Persist one event that has no sibling write to share a transaction with.
+
+        Read tools, model text, usage and resolution: nothing else is being written,
+        so this is its own single-statement unit of work. Through transaction()
+        rather than execute() + commit(), because commit() is connection-scoped and
+        would commit whatever else happened to be open (telemetry.py L69-72).
+        """
+        with self.conn.transaction():
+            self._insert_event(event.type, event.data)
+
+    def execute_and_record(
+        self, execute_bound, spec, name: str, raw_input: dict, policy, *, event_type: str
+    ) -> tuple[str, bool]:
+        """Run one WRITE-tier tool and record it in the same transaction (D-04).
+
+        This is the seam the whole atomicity guarantee rests on. The tool's executor
+        opens its own `transaction()`, which nests as a SAVEPOINT inside this one; the
+        event INSERT joins it; the commit happens once, here, at the `with` exit. So a
+        reply row and the record of that reply can only exist together — a failed
+        event insert takes the reply back with it rather than leaving a customer
+        emailed with nothing to show it happened.
+
+        Do NOT move the insert below the `with` "to keep the tool's transaction
+        short". That is a second top-level transaction and it silently converts this
+        into best-effort logging.
+        """
+        with self.conn.transaction():
+            result, is_error = execute_bound(spec, name, raw_input, policy)
+            self._insert_event(
+                event_type,
+                # json.loads to match agent.py's own tool_result event, which carries
+                # the parsed payload rather than the wire string.
+                {"tool": name, "result": json.loads(result), "is_error": is_error},
+            )
+        return result, is_error
