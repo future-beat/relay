@@ -224,3 +224,41 @@ recall as semantic.
 - `src/relay/retrieval_eval.py` — FOUND
 - `.planning/phases/04-evaluation-coverage/04-01-SUMMARY.md` — FOUND
 - Commits `42b9e47`, `55b9bd8`, `7e1b91c` — FOUND in `git log`
+
+---
+
+## Paid runs 2026-08-11 — measured numbers, and one finding
+
+### Keyword vs semantic, side by side (curated queries, document-level)
+
+| | recall@1 | MRR | recall@3 | locator@1 |
+|---|---|---|---|---|
+| keyword | 0.909 | 0.909 | 0.909 | 0.70 |
+| **semantic** | **1.00** | **1.00** | **1.00** | **0.80** |
+
+Ticket-derived queries score 1.00 recall@1 and 1.00 locator@1 in semantic mode. This is the
+keyword-vs-semantic comparison deferred as a v2 item — now with real numbers rather than an
+assertion. Report: `eval_results/retrieval-20260811T020114Z.json`.
+
+Read `recall@1` as *the right document ranked first* (see the WR-01 correction — the metric is
+document-level by design); `locator@1` is the anchor-sensitive one.
+
+### 12-case suite: 11/12 (92%), above the 0.8 gate
+
+`eval_results/eval-20260811T020257Z.json`, $0.2778. **This local run used semantic retrieval**
+because `.env` supplies `VOYAGE_API_KEY`; the WR-08 decoupling applies to the CI workflow, where
+the gated step gets `ANTHROPIC_API_KEY` only and therefore runs keyword mode. Local and CI are
+*not* the same configuration — check the report's `mode` field before comparing runs.
+
+### The one failure is a KB content gap, not a code defect
+
+`downgrade-data-loss` failed on `grounded`. Retrieval was correct and undegraded, and
+`billing.md#upgrades-and-downgrades` *was* retrieved; the model cited a valid id but invented:
+
+> "You'd regain full access to them if you upgrade back to Pro later"
+
+Phase 3's before-run failure (`pro-pricing`) was the same invention in the same direction. The KB
+documents what happens on **downgrade** and is silent on whether data is restored on
+**re-upgrade**, so the model fills the silence — landing on a different case each run, which is
+why it has read as judge noise. **Fixing this is a `kb/billing.md` edit, not a retrieval change**
+— and it would require rebuilding `kb/index.json` (the hash gate will catch it if not).
