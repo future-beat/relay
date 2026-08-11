@@ -138,15 +138,15 @@ Plans:
 Plans:
 **Wave 1**
 
-- [ ] 04-01-PLAN.md — Labeled retrieval set + recall@k/MRR (report-only) + VOYAGE_API_KEY on paid dispatch (EVAL-01)
+- [x] 04-01-PLAN.md — Labeled retrieval set + recall@k/MRR (report-only) + VOYAGE_API_KEY on paid dispatch (EVAL-01)
 
 **Wave 2** *(blocked on Wave 1 completion)*
 
-- [ ] 04-02-PLAN.md — Prompt-injection golden case + report-wide citation-faithfulness subset check (EVAL-02/EVAL-03)
+- [x] 04-02-PLAN.md — Prompt-injection golden case + report-wide citation-faithfulness subset check (EVAL-02/EVAL-03)
 
 **Wave 3** *(blocked on Wave 2 completion)*
 
-- [ ] 04-03-PLAN.md — D-08 denial-recovery seeding hook + paid arming path + free mechanism test (EVAL-03)
+- [x] 04-03-PLAN.md — D-08 denial-recovery seeding hook + paid arming path + free mechanism test (EVAL-03)
 
 ### Phase 5: Run Event Persistence & Live Feed
 
