@@ -82,6 +82,23 @@ signal, while recall@1/MRR separate keyword (0.91) from semantic (1.00).
 Report-only per D-03. The only hard gate remains `pass_rate < args.threshold` at
 `evals.py:302-304`, verified unchanged.
 
+> **CORRECTION (post-review, `5612d90`).** These figures are **document-level recall
+> over a three-document corpus**, not chunk-level. WR-01 showed the `#anchor` half of
+> every label is inert to them: `_accept_set` unions doc + located id + every anchor
+> (mirroring the citation guard), so a result matches iff the *document* does, and
+> pointing all ten anchors at the wrong section leaves 0.9091 untouched. "recall@1
+> 0.91" reads "did retrieve() put the right one of three files first". The payload now
+> carries `granularity: "document"` and a `locator_precision@1` figure — the one metric
+> the anchors move, and the only measurement of `_locate_heading`, which picks the id
+> the model is told to cite. Keyword mode: **0.70** curated, **1.00** ticket-derived.
+>
+> The numbers are also **query-source dependent, by about ±0.18** (WR-02): the label
+> `query` strings are hand-authored, keyword-friendly rewrites of the golden tickets,
+> not the text the agent composes and sends. Same labels, same retriever, keyword mode:
+> golden `subject` alone 0.8182, these curated queries 0.9091, `subject + body` 1.0000.
+> The report now names its `query_source` and carries a `ticket_derived` block beside
+> the curated one, so the gap is on the page instead of assumed away.
+
 ## Mutation Verification
 
 Every test was run under its named falsifying mutation; all four failed as required,
@@ -117,6 +134,17 @@ absent, GitHub injects an empty string, `settings.voyage_api_key` is falsy, and 
 run reports **keyword-mode** recall (~0.91) rather than semantic (~1.00). That is the
 documented fallback, not a failure. Confirming or adding the secret is a repo-settings
 action outside this plan.
+
+> **CORRECTION (post-review, `f4361a6`).** The secret is **no longer passed to the paid
+> dispatch**, and passing it there was WR-08. It does not only feed
+> `retrieval_metrics` — the same key feeds every `search_docs` call in all 12 golden
+> runs, flipping the whole graded suite from keyword to semantic ranking. The
+> `pass_rate < 0.8` gate (D-04, "unchanged") would then have been judging a retrieval
+> configuration that has never been run, so neither a pass nor a failure could be
+> attributed to any code change. The graded step now carries `ANTHROPIC_API_KEY` only,
+> keeping the retrieval mode its 0.8 baseline was actually observed in. Semantic recall
+> is still measured, by a new `python -m relay.retrieval_report` step in its own
+> process — `continue-on-error`, no Anthropic spend, and unable to fail the job (D-03).
 
 > **CORRECTION (post-review, `de65e45`).** This section originally claimed "the `mode`
 > field in the report says which one you got, so a keyword number can never be misread
@@ -181,6 +209,14 @@ deliberately not gated by this plan: it should confirm the 12-case suite stays �
 record semantic recall@1/MRR into the artifact. If the Voyage secret is missing, that
 artifact will read `"mode": "keyword"` — check that field before reporting the run's
 recall as semantic.
+
+> **CORRECTION (post-review, `f4361a6`).** After WR-08 the paid dispatch produces **two**
+> artifacts, and the semantic numbers are in the second one. `eval-*.json` comes from
+> the graded run, which is keyword by design (`key_configured: false`) — that is the
+> configuration its 0.8 threshold was measured under. `retrieval-*.json` comes from the
+> separate report-only step and is where semantic recall lands, when and only when the
+> repo secret exists. Read `mode` on each; do not read the graded artifact's recall as
+> semantic, and do not read the report-only step's failure as a suite failure.
 
 ## Self-Check: PASSED
 

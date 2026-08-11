@@ -50,6 +50,22 @@ Added the D-08 eval-only probe that forces exactly one real citation denial by d
 > with no signal. The drop is now a `seeded_drops` set held for the run's life and
 > subtracted after every grow.
 
+> **CORRECTION (post-review, `f0f8049`).** "injects `"__seeded_missing__"` so the set
+> stays non-empty" **no longer describes the code, and the behaviour it described was
+> WR-05.** The sentinel reached the model twice — in the denial's `available` sentence
+> and in its `retrieved_ids` list — and any citation of it then passed the subset
+> check, so on the one path built to test RAG-04 ("a fabricated source is denied") the
+> guard invited a fabrication and accepted it. The shipped mechanism test's own
+> `recovered_with` read `['__seeded_missing__', 'api.md', ...]`. Nothing is injected
+> now: the probe declines to arm when withholding would empty the accept-set (only a
+> single hit whose doc has no headings can reach that branch).
+
+> **CORRECTION (post-review, `f649388`).** "`main.py` has no reference to the flag" was
+> true but was the *whole* of the containment test (WR-09) — a substring grep over one
+> hand-named file. It is now a package-wide `rglob` excluding only `agent.py` and
+> `evals.py`, plus a runtime test that an unarmed `run_ticket` emits no
+> `guardrail.citation_denial_seeded` record.
+
 The discard is applied **after** the whole `for hit in results` grow loop, not inside it. This matters: retrieval returns whole files with an `anchors` list, so a later hit could re-add the same id as one of its anchors and silently undo an in-loop discard.
 
 The citation guard (`agent.py:150-172`) and `bind_to_ticket` were not touched. `main.py` has no reference to the flag.
