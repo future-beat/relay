@@ -15,7 +15,7 @@ from .agent import run_ticket
 from .auth import Tier, api_key_header, require_tier
 from .config import settings
 from .db import connect, init_db
-from .events import RunEventBroker, RunRecorder, project
+from .events import _CLOSE_SENTINEL, RunEventBroker, RunRecorder, project
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
@@ -49,6 +49,17 @@ async def lifespan(app: FastAPI):
     # Closing first turns that write into "Cannot operate on a closed database" and
     # loses the row, which is spend the ceiling can never see again.
     await app.state.runs.drain(timeout=settings.shutdown_drain_seconds)
+    # Beside the drain, never inside it: the drain waits for paid runs to finish, and a
+    # watching browser is not work to wait for (D-12). Closing here wakes every open
+    # /events generator with the sentinel so it returns now rather than sitting out its
+    # idle ceiling — an open SSE stream is an in-flight connection uvicorn holds the
+    # graceful-shutdown window open for, and one Fly's proxy counts when deciding
+    # whether the machine may autostop.
+    #
+    # After the drain (a run still streaming must keep publishing to its subscribers)
+    # and before conn.close() (a generator woken here may still touch nothing, but the
+    # ordering matches the drain's own close-last discipline above).
+    app.state.broker.close()
     conn.close()
 
 
@@ -315,6 +326,89 @@ async def metrics() -> dict:
     # run_metrics does SELECT * FROM runs, the one read here that grows unbounded:
     # the dashboard polls this every 5s, so it is the last place to hold the loop.
     return await asyncio.to_thread(run_metrics, app.state.conn)
+
+
+def _snapshot_frame() -> str:
+    """The one frame a new subscriber gets before any live event (D-14).
+
+    Without it a tab opened mid-run shows an empty feed until the next step happens,
+    which on a quiet demo can be minutes — the visitor concludes nothing is running.
+
+    Built field by field from ActiveRun, for the same reason project() is: this is a
+    public boundary, and `asdict()` here would publish whatever field someone adds to
+    ActiveRun later. There are exactly two fields today and neither is a secret —
+    ticket_id is already public on /metrics (last_runs), and started_at is deliberately
+    NOT published raw: it is a monotonic clock reading, meaningless off this process,
+    so it is rendered as the elapsed time a viewer can actually use.
+
+    Not routed through project(): that function's input is an AgentEvent, and this is
+    registry state, not a run event. It is still an allowlist, written out below.
+    """
+    now = time.monotonic()
+    runs = [
+        {"ticket_id": run.ticket_id, "running_for_ms": int((now - run.started_at) * 1000)}
+        for run in app.state.runs.snapshot()
+    ]
+    return f"event: snapshot\ndata: {json.dumps({'type': 'snapshot', 'runs': runs})}\n\n"
+
+
+@app.get("/events")
+async def events() -> StreamingResponse:
+    """The public live feed: every run's redacted steps, as they happen (D-11, SC-2).
+
+    No gate, deliberately — it joins /metrics and /dashboard as a public surface. Its
+    safety is content control, not access control: every frame here was built by
+    project()'s allowlist before it reached the broker, so there is nothing to
+    authorise. Do not add a second serialisation path around that.
+    """
+
+    async def stream():
+        # First statement of the body, and the reason is event_stream's L200-209 note:
+        # Starlette can cancel a StreamingResponse before its generator ever starts, and
+        # a finally in a body that never ran does not execute. Subscribing one line
+        # higher (in the handler) would leak a queue on every aborted connection, and a
+        # leaked subscriber is worse than a leaked registry entry — publish keeps
+        # writing to a queue nobody reads for the life of the process (CR-02).
+        q = app.state.broker.subscribe()
+        # A viewer is NOT registered in RunRegistry (D-12). The phase-2 drain waits for
+        # `active == 0`; a counted viewer would hold shutdown open for its full grace
+        # period and pin the machine awake — the opposite of what this route's idle
+        # ceiling exists to guarantee.
+        try:
+            idle_deadline = time.monotonic() + settings.events_idle_seconds
+            yield _snapshot_frame()
+            while True:
+                try:
+                    frame = await asyncio.wait_for(
+                        q.get(), timeout=settings.events_heartbeat_seconds
+                    )
+                except TimeoutError:
+                    # The idle ceiling measures RUN activity, and this branch is the
+                    # absence of it. Fly autostops on active connections, not container
+                    # load, so a forgotten tab holds the machine awake until the app
+                    # itself lets go — closing here is the whole of that guarantee, and
+                    # EventSource reconnects on its own when the viewer comes back.
+                    if time.monotonic() >= idle_deadline:
+                        logger.info("events.idle_closed", extra={"ctx": {}})
+                        return
+                    # A comment, not an event: it keeps proxies and EventSource from
+                    # timing a quiet stream out. It must NEVER touch idle_deadline —
+                    # a keep-alive that renews its own deadline is a stream that can
+                    # never idle-close, which silently defeats min_machines_running=0.
+                    yield ": keep-alive\n\n"
+                    continue
+                if frame is _CLOSE_SENTINEL:
+                    return  # lifespan called broker.close(); end before conn.close()
+                # Reset on a real frame only — see above.
+                idle_deadline = time.monotonic() + settings.events_idle_seconds
+                yield f"event: {frame['type']}\ndata: {json.dumps(frame)}\n\n"
+        finally:
+            # Every exit path lands here: client disconnect (cancellation at a yield),
+            # idle close, the shutdown sentinel, or an exception. Idempotent, so the
+            # double-unsubscribe a close() plus a disconnect can produce is harmless.
+            app.state.broker.unsubscribe(q)
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 DASHBOARD_HTML = """<!doctype html>
