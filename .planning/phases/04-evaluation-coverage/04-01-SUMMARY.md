@@ -262,3 +262,28 @@ documents what happens on **downgrade** and is silent on whether data is restore
 **re-upgrade**, so the model fills the silence — landing on a different case each run, which is
 why it has read as judge noise. **Fixing this is a `kb/billing.md` edit, not a retrieval change**
 — and it would require rebuilding `kb/index.json` (the hash gate will catch it if not).
+
+### KB gap closed — re-run confirms the diagnosis
+
+`kb/billing.md` gained two sentences stating that read-only projects are never deleted and that
+upgrading restores write access automatically. Index rebuilt (`c77e0dca`). Re-run:
+
+**12/12 (100%), mean quality 5.0, $0.2877** — `eval_results/eval-20260811T071058Z.json`.
+`downgrade-data-loss` now grounds. `locator@1` rose 0.80 → 0.90 (the new text gives the locator a
+better-matching section for upgrade questions).
+
+That settles it: the failure was a **content gap, not judge noise and not a code defect**. Two
+phases had read it as nondeterminism because it surfaced on a different case each run.
+
+**The first wording broke the escalation signal, and the CR-04 test caught it.** The draft ended
+"with no support request needed" — the word *support* keyword-matched off-topic queries
+("any plan to support Salesforce?", "Mars colonization support"), so they stopped returning `[]`
+and stopped escalating. Two `test_an_uncovered_ask_returns_nothing_however_it_is_phrased` cases
+failed. Reworded to "immediately and automatically". Worth recording: **the empty-result
+escalation signal is sensitive to ordinary KB vocabulary**, and on a 3-doc corpus one common word
+is enough to move it. That test is the thing standing between a KB edit and a silent escalation
+regression.
+
+Policy note: filling the gap meant *choosing* the re-upgrade policy for a fictional product. The
+stated policy (restore on upgrade) is what the existing "locks read-only rather than deleting
+them" already implies — it was not chosen to match the model's guess, though it does.
