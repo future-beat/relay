@@ -20,10 +20,31 @@ jobs:
           cache: pip
       - name: Install
         run: pip install -e .
+      # The GATED step. Deliberately no VOYAGE_API_KEY: the same key feeds every
+      # search_docs call in all 12 golden runs, not just the metric block, so wiring
+      # it here flips the graded suite from keyword to semantic ranking. The
+      # `pass_rate < 0.8` gate (D-04, unchanged) would then be judging a retrieval
+      # configuration it has never been measured under, and a failure could not be
+      # attributed to any code change. Keyword is the mode the 0.8 baseline was
+      # actually observed in; the graded run stays there until a semantic baseline
+      # has been measured. Semantic recall is still reported, one step down.
       - name: Run eval suite
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-        run: python -m relay.evals --concurrency 4 --threshold "${{ inputs.threshold }}"
+          # Passed through the environment, never interpolated into the shell: a
+          # workflow_dispatch input lands in `run:` as raw text, so a crafted
+          # threshold would execute as a command with the Anthropic secret in scope.
+          THRESHOLD: ${{ inputs.threshold }}
+        run: python -m relay.evals --concurrency 4 --threshold "$THRESHOLD"
+      # Report-only, in its own process so the secret cannot reach the graded run
+      # above. No Anthropic spend; ~2 dozen Voyage query embeddings. `continue-on-error`
+      # plus the module's own guard mean this can never fail the job (D-03).
+      - name: Retrieval metrics (semantic, report-only)
+        if: always()
+        continue-on-error: true
+        env:
+          VOYAGE_API_KEY: ${{ secrets.VOYAGE_API_KEY }}
+        run: python -m relay.retrieval_report
       - name: Upload report
         if: always()
         uses: actions/upload-artifact@v4

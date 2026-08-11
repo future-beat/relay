@@ -25,13 +25,31 @@ from typing import Any
 
 from anthropic import AsyncAnthropic
 
-from .agent import run_ticket
+from .agent import TERMINAL_TOOLS, run_ticket
 from .config import settings
 from .db import connect, init_db
 from .models import AgentEvent
+from .retrieval import Index, load_index
+from .retrieval_eval import (
+    load_labels,
+    locator_precision_from_scores,
+    mrr_from_scores,
+    observed_mode,
+    recall_from_scores,
+    score_rows,
+    ticket_derived_labels,
+)
 from .tools import build_registry, lookup_customer
 
 GOLDEN_PATH = Path("evals/golden.jsonl")
+
+# The three answers a D-08 run can give, as a closed vocabulary. Without this the
+# artifact records `action="send_reply"` for all three and the probe cannot answer
+# the one question it exists to answer — "does the model recover from a denial?" —
+# because "recovered" and "was never asked to" serialise identically.
+NOT_DENIED = "not_denied"  # the citation guard never fired: nothing was asked of it
+RECOVERED = "recovered"  # it fired, and the run still reached a terminal action
+UNRECOVERED = "unrecovered"  # it fired, and the run died without one
 
 JUDGE_SCHEMA = {
     "type": "json_schema",
@@ -66,6 +84,93 @@ def load_golden(path: Path = GOLDEN_PATH) -> list[dict[str, Any]]:
     return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
 
 
+def retrieval_metrics() -> dict[str, Any]:
+    """recall@1/@3 + MRR over the labeled set — report-only, never a gate (D-03).
+
+    `mode` is part of the payload because keyword and semantic recall are not
+    comparable numbers: without VOYAGE_API_KEY this measures the keyword
+    fallback, and an unlabeled figure would be read as semantic quality (D-10).
+
+    It is the mode the rows were ACTUALLY ranked in, read back out of `retrieve()`,
+    not `bool(key)`. `retrieve()` never raises — it degrades — so a configured key
+    is not evidence that semantic ranking ran: a missing/stale/mismatched
+    `kb/index.json` or a failing Voyage call returns keyword results under a live
+    secret, and that is the failure mode that reaches CI. `key_configured` and
+    `degraded_rows` carry the gap between what was paid for and what ran.
+
+    Two more fields exist so the headline cannot be read as more than it is:
+    `granularity: "document"` says recall/MRR resolve to one of three files, not to
+    a passage (WR-01) — `locator_precision@1` is the sub-document number — and
+    `query_source: "curated"` says the queries are hand-authored rewrites, not the
+    text the agent emits (WR-02), with the ticket-derived variant beside it.
+    """
+    index = load_index(settings.kb_dir)
+    labels = load_labels()
+    key = settings.voyage_api_key
+    payload = {
+        "granularity": "document",
+        "query_source": "curated",
+        "key_configured": bool(key),
+        **_score_block(index, labels, key=key),
+    }
+    # The same labels asked in the words a customer actually wrote (WR-02). The
+    # curated queries are keyword-friendly rewrites, worth about +0.09 recall@1 over
+    # the golden subject and -0.09 under subject+body — a swing bigger than anything
+    # this phase changed, previously undocumented and invisible to every test.
+    # Reported beside, never merged: one figure over two query sources describes
+    # neither.
+    payload["ticket_derived"] = {
+        "query_source": "golden_subject_body",
+        **_score_block(index, ticket_derived_labels(labels, load_golden()), key=key),
+    }
+    return payload
+
+
+def _score_block(
+    index: Index, labels: list[dict[str, Any]], *, key: str | None
+) -> dict[str, Any]:
+    """One scoring pass, every number derived from it.
+
+    All four figures and the mode label then describe the same retrieval, instead of
+    a label borrowed from a pass the numbers didn't come from — and one query
+    embedding per row is bought once, not once per metric.
+    """
+    scores = score_rows(index, labels, k=3, key=key)
+    return {
+        "mode": observed_mode(scores),
+        "degraded_rows": sum(s.degraded for s in scores),
+        "labeled_queries": len(labels),
+        "scored_queries": len(scores),
+        # recall@1 is `rank == 1` at depth 3: `retrieve(max_results=k)` truncates one
+        # ranked list, so the top-3 prefix contains the top-1 answer exactly.
+        "recall@1": recall_from_scores(scores, 1),
+        "recall@3": recall_from_scores(scores, 3),
+        "mrr": mrr_from_scores(scores),
+        # The one number a `#anchor` label can move: recall/MRR are document-level
+        # (see retrieval_eval._accept_set), so without this the anchor half of ten
+        # labels is decoration and `_locate_heading` — which picks the id the model
+        # is told to cite — is measured by nothing.
+        "locator_precision@1": locator_precision_from_scores(labels, scores),
+    }
+
+
+def safe_retrieval_metrics() -> dict[str, Any]:
+    """`retrieval_metrics()` with a floor under it — report-only must never gate (WR-04).
+
+    The metric block is evaluated after `asyncio.gather` has spent the money and
+    before the report is written. Unguarded, a malformed line in
+    `evals/retrieval.jsonl`, a label missing `query`, or an OSError reading the
+    labels propagates out of `run_evals` and out of `asyncio.run`, and the entire
+    paid 12-case report is lost to a traceback and a non-zero exit. D-03 says this
+    number never gates; via that path it was the only thing that could fail the job
+    outright. The error travels in the payload instead, where a reader sees it.
+    """
+    try:
+        return retrieval_metrics()
+    except Exception as exc:  # noqa: BLE001 — report-only, must never sink a paid run
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 @dataclass
 class CaseResult:
     id: str
@@ -85,20 +190,34 @@ class CaseResult:
     # whether the citation guard is load-bearing or decorative.
     citations: list[str] | None = None
     retrieval: dict[str, Any] = field(default_factory=dict)
+    # Observed, never graded. `guardrails` is every guard that fired during the run;
+    # `denial_recovery` is the D-08 question answered directly rather than left to a
+    # reader joining three fields; `seeded_denial` records whether the probe was armed
+    # at all, so "no denial fired" can be read as a finding about the model on an armed
+    # run and as an unremarkable fact on an unarmed one.
+    guardrails: list[dict[str, Any]] = field(default_factory=list)
+    denial_recovery: str = NOT_DENIED
+    seeded_denial: bool = False
 
 
 def extract_outcome(events: list[AgentEvent]) -> dict[str, Any]:
     """Pull the graded facts out of an agent run's event stream.
 
-    `citations` and `retrieval` are recorded but not graded. Without them a report
-    saying zero citation denials fired is unfalsifiable: it reads identically whether
-    the model cited three retrieved ids and the guard correctly stayed quiet, or the
-    model never cited anything and the guard could not have fired if it wanted to.
+    `citations`, `retrieval` and `guardrails` are recorded but not graded. Without them
+    a report saying zero citation denials fired is unfalsifiable: it reads identically
+    whether the model cited three retrieved ids and the guard correctly stayed quiet, or
+    the model never cited anything and the guard could not have fired if it wanted to.
+
+    `guardrails` closes the same gap one level up, for the denial itself: a run that
+    recovered from a denial and a run that was never denied both end `send_reply`, so
+    without the guard events in the artifact the D-08 probe reports "recovered fine"
+    whether or not anything was ever asked of the model.
     """
     outcome: dict[str, Any] = {
         "action": None, "category": None, "final_text": None, "cost_usd": 0.0, "error": None,
         "citations": None,
         "retrieval": {"mode": None, "degraded": False, "retrieved_ids": []},
+        "guardrails": [],
     }
     retrieved: set[str] = set()
     for event in events:
@@ -130,6 +249,14 @@ def extract_outcome(events: list[AgentEvent]) -> dict[str, Any]:
                 # running system never saw.
                 retrieved.update(x for x in (hit.get("doc"), hit.get("id")) if x)
                 retrieved.update(a for a in hit.get("anchors") or () if a)
+        elif event.type == "guardrail":
+            # Every guard that fired, not just the citation one: an injection denial
+            # (SEC-04) is the same kind of observed fact and belongs in the same place.
+            outcome["guardrails"].append({
+                "guard": event.data.get("guard"),
+                "tool": event.data.get("tool"),
+                "missing_citations": event.data.get("missing_citations"),
+            })
         elif event.type == "usage":
             outcome["cost_usd"] = event.data["cost_usd"]
         elif event.type == "resolution":
@@ -137,7 +264,20 @@ def extract_outcome(events: list[AgentEvent]) -> dict[str, Any]:
         elif event.type == "error":
             outcome["error"] = event.data["reason"]
     outcome["retrieval"]["retrieved_ids"] = sorted(retrieved)
+    outcome["denial_recovery"] = denial_recovery(outcome)
     return outcome
+
+
+def denial_recovery(outcome: dict[str, Any]) -> str:
+    """Did the citation guard fire, and did the run survive it? (D-08)
+
+    Derived here rather than left implicit so the artifact states the answer instead
+    of encoding it across `guardrails`, `action` and `error` for a reader to
+    reconstruct — the reconstruction is exactly what nobody does.
+    """
+    if not any(g["guard"] == "citation" for g in outcome["guardrails"]):
+        return NOT_DENIED
+    return RECOVERED if outcome["action"] in TERMINAL_TOOLS else UNRECOVERED
 
 
 async def judge_grounding(
@@ -179,7 +319,20 @@ async def judge_grounding(
     return json.loads(text)
 
 
-async def run_case(client: AsyncAnthropic, case: dict[str, Any], kb_text: str) -> CaseResult:
+async def run_case(
+    client: AsyncAnthropic,
+    case: dict[str, Any],
+    kb_text: str,
+    *,
+    seed_citation_denial: bool = False,
+) -> CaseResult:
+    """Run one golden case end to end and grade it.
+
+    `seed_citation_denial` forwards the D-08 probe to the agent loop. It stays off for
+    all 12 golden cases and for the `pass_rate` gate: the single armed case is a
+    report-only, manually-dispatched finding about whether a real model recovers from
+    a citation denial, not a threshold anything can fail on.
+    """
     conn = connect(":memory:")
     init_db(conn)
     cur = conn.execute(
@@ -195,7 +348,11 @@ async def run_case(client: AsyncAnthropic, case: dict[str, Any], kb_text: str) -
     }
     registry = build_registry(conn, settings.kb_dir)
 
-    events = [e async for e in run_ticket(client, registry, ticket)]
+    events = [
+        e async for e in run_ticket(
+            client, registry, ticket, seed_citation_denial=seed_citation_denial
+        )
+    ]
     outcome = extract_outcome(events)
     # Give the judge exactly what the agent could see: the lookup_customer tool
     # output (profile + ticket history) and when the ticket was filed.
@@ -217,6 +374,12 @@ async def run_case(client: AsyncAnthropic, case: dict[str, Any], kb_text: str) -
         error=outcome["error"],
         citations=outcome["citations"],
         retrieval=outcome["retrieval"],
+        guardrails=outcome["guardrails"],
+        denial_recovery=outcome["denial_recovery"],
+        # From this call's own flag, not inferred from the events: on an armed run
+        # that produced no denial, the absence IS the finding, and a value inferred
+        # from the denial could never record it.
+        seeded_denial=seed_citation_denial,
     )
     result.action_ok = outcome["action"] == case["expected_action"]
     result.category_ok = outcome["category"] in case["expected_categories"]
@@ -252,6 +415,12 @@ async def run_evals(limit: int | None, concurrency: int) -> dict[str, Any]:
     results = await asyncio.gather(*(bounded(c) for c in cases))
     passed = sum(r.passed for r in results)
     qualities = [r.quality for r in results if r.quality is not None]
+    # Offloaded: `retrieve()` reaches Voyage through a BLOCKING `httpx.post`, and this
+    # is a coroutine. Called inline, one query embedding per labeled row stalls the
+    # whole event loop for up to the client timeout apiece. Nothing else is in flight
+    # by this point, but "nothing else is in flight" is a property of today's caller,
+    # not of this function.
+    metrics = await asyncio.to_thread(safe_retrieval_metrics)
     return {
         "ran_at": datetime.now(UTC).isoformat(),
         "model": settings.model,
@@ -260,6 +429,8 @@ async def run_evals(limit: int | None, concurrency: int) -> dict[str, Any]:
         "pass_rate": round(passed / len(results), 3) if results else 0.0,
         "mean_quality": round(sum(qualities) / len(qualities), 2) if qualities else None,
         "total_cost_usd": round(sum(r.cost_usd for r in results), 4),
+        # Report-only (D-03): printed and archived, never compared to a threshold.
+        "retrieval_metrics": metrics,
         "results": [asdict(r) for r in results],
     }
 
@@ -282,6 +453,51 @@ def print_summary(report: dict[str, Any]) -> None:
         f" | mean quality {report['mean_quality']}"
         f" | agent cost ${report['total_cost_usd']}"
     )
+    print_retrieval_summary(report.get("retrieval_metrics"))
+
+
+def _fmt(value: float | None) -> str:
+    """`n/a`, not `0.00`: no anchor-labeled rows is not a locator score of zero."""
+    return "n/a" if value is None else f"{value:.2f}"
+
+
+def print_retrieval_summary(m: dict[str, Any] | None) -> None:
+    """Render the report-only retrieval block, including when computing it failed."""
+    if not m:
+        return
+    if m.get("error"):
+        # The metrics failed and the run survived it (WR-04). Printed, not raised:
+        # a report-only number that can silently vanish is worse than one that says
+        # it is missing, and one that can end the job is worse than both.
+        print(f"retrieval metrics unavailable: {m['error']} — report-only, not gated")
+        return
+    # recall@1 and MRR lead: recall@3 saturates on a 3-doc corpus (D-09).
+    print(
+        f"retrieval ({m['mode']}, {m.get('granularity', 'document')}-level,"
+        f" {m.get('query_source', 'curated')} queries)"
+        f" recall@1 {m['recall@1']:.2f}"
+        f" | MRR {m['mrr']:.2f}"
+        f" | recall@3 {m['recall@3']:.2f}"
+        f" | locator@1 {_fmt(m.get('locator_precision@1'))}"
+        f" over {m['scored_queries']} labeled queries — report-only, not gated"
+    )
+    derived = m.get("ticket_derived")
+    if derived:
+        # Printed beside, never instead: the gap between the two is the honest
+        # width of the headline, and it only exists on the page if both are on it.
+        print(
+            f"  same labels, ticket-derived queries: recall@1 {derived['recall@1']:.2f}"
+            f" | MRR {derived['mrr']:.2f}"
+            f" | locator@1 {_fmt(derived.get('locator_precision@1'))}"
+        )
+    if m.get("key_configured") and m["mode"] != "semantic":
+        # Paid for semantic ranking, did not get it. Silent here is how keyword
+        # numbers get read as semantic quality — the thing `mode` exists to stop.
+        print(
+            f"  WARNING: VOYAGE_API_KEY is set but {m['degraded_rows']} of"
+            f" {m['scored_queries']} rows degraded — these are NOT semantic numbers."
+            " Rebuild/commit kb/index.json or check Voyage."
+        )
 
 
 def main() -> None:

@@ -182,8 +182,18 @@ async def run_ticket(
     ticket: dict[str, Any],
     policy: ToolPolicy | None = None,
     budget: RunBudget | None = None,
+    *,
+    seed_citation_denial: bool = False,
 ) -> AsyncIterator[AgentEvent]:
-    """Run the agent on one ticket, yielding an AgentEvent per step."""
+    """Run the agent on one ticket, yielding an AgentEvent per step.
+
+    `seed_citation_denial` is an eval-only probe (D-08, closing 03-REVIEW WR-10): it
+    drops one genuinely-retrieved id from this run's accept-set so the model's own,
+    natural citation is denied exactly once, and whether it recovers to a terminal
+    action becomes observable. Keyword-only and off by default on purpose — the same
+    aversion to forgettable per-call controls as `bind_to_ticket` above, in reverse:
+    arming it narrows a live run's accept-set, so nothing but the eval harness may.
+    """
     policy = policy or ToolPolicy()
     budget = budget or RunBudget(
         settings.max_run_cost_usd, settings.price_in_per_mtok, settings.price_out_per_mtok
@@ -205,6 +215,13 @@ async def run_ticket(
     # across runs would let one run cite another's docs. Grown in place below, and the
     # executor holds the same object, so a cite is valid the moment it is retrieved.
     retrieved_ids: set[str] = set()
+
+    # The ids the D-08 probe has withheld from this run's accept-set. Filled at most
+    # once (the first search that returns anything) but enforced for the LIFE of the
+    # run, because a one-shot discard is not a withholding: retrieval.anchors() hands
+    # back every heading of a returned doc, so any later search_docs call touching the
+    # same file re-adds the dropped id verbatim and silently disarms the probe.
+    seeded_drops: set[str] = set()
 
     # Built once per run, from this run's own ticket — never stored on the registry,
     # which is built once and shared by every live run. Every tool call below goes
@@ -321,6 +338,41 @@ async def run_ticket(
                                 if hit.get("id"):
                                     retrieved_ids.add(hit["id"])
                                 retrieved_ids.update(a for a in hit.get("anchors") or () if a)
+                            # Eval-only probe (D-08). Arms on the first search that
+                            # returns anything, withholding the top hit's located id —
+                            # the one the model is most likely to cite — so the very
+                            # next send_reply cites something real that this run's
+                            # accept-set does not contain, and the guard denies it.
+                            #
+                            # Nothing fabricated is added to keep the set non-empty. A
+                            # placeholder id flows straight into the denial's
+                            # `available` list and its `retrieved_ids` — the guard
+                            # would be telling the model it may cite a source that was
+                            # never retrieved, and then accepting it. That inverts
+                            # RAG-04's property on the one path built to test it, and
+                            # writes a citation into the artifact that the running
+                            # system never served. Instead the probe declines to arm
+                            # when withholding would empty the set: an empty accept-set
+                            # denies everything with nothing to retry with, which is a
+                            # different (unrecoverable) experiment. Only a single hit
+                            # whose doc has no headings can reach that branch.
+                            hits = payload.get("results") or []
+                            if seed_citation_denial and not seeded_drops and hits:
+                                dropped = hits[0].get("id")
+                                if dropped and retrieved_ids - {dropped}:
+                                    seeded_drops.add(dropped)
+                                    logger.warning("guardrail.citation_denial_seeded",
+                                                   extra={"ctx": {"ticket_id": ticket["id"],
+                                                                  "dropped_id": dropped}})
+                            # Re-applied after EVERY grow, not just the arming one. A
+                            # second search returning the same file re-adds the dropped
+                            # id as one of its anchors, and a probe that disarms itself
+                            # produces an armed hook, zero denials and a clean terminal
+                            # action — byte-identical in the artifact to a genuine
+                            # recovery, which is the unfalsifiability D-08 exists to
+                            # close. In place (the executor holds this exact set by
+                            # reference); rebinding it would unbind the guard.
+                            retrieved_ids.difference_update(seeded_drops)
                         span.set_attributes({
                             "relay.tool.tier": spec.tier if spec else "unknown",
                             "relay.tool.is_error": is_error,
