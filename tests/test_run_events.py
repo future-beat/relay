@@ -16,15 +16,18 @@ import asyncio
 import inspect
 import json
 import sqlite3
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from helpers import FakeClient, response, text_block, tool_use_block
 from relay.agent import bind_to_ticket
 from relay.config import settings
 from relay.db import connect, init_db
 from relay.events import _CLOSE_SENTINEL, RunEventBroker, RunRecorder, project
 from relay.guardrails import ToolPolicy
+from relay.main import app, process_ticket
 from relay.models import AgentEvent
 from relay.telemetry import record_run
 from relay.tools import build_registry
@@ -412,3 +415,253 @@ def test_recorder_is_synchronous():
     # here would let the loop resume the run elsewhere with the transaction still open.
     for name in ("record", "execute_and_record", "_insert_event"):
         assert inspect.iscoroutinefunction(getattr(RunRecorder, name)) is False
+
+
+# --------------------------------------------------------------------------------------
+# Plan 03: the recorder wired end to end. Everything below drives a REAL run through
+# event_stream — scripted model, real tools, real SQLite — because the three properties
+# this phase must hold (full-sequence persistence, publish-after-commit, and no secret
+# in any published frame) are all properties of the wiring, and a unit test of
+# project() or RunRecorder in isolation cannot see any of them.
+# --------------------------------------------------------------------------------------
+
+# Seeded into a real run below and asserted absent from every published frame. Distinct
+# and improbable on purpose: a substring search for "email" would match half the corpus,
+# and a sentinel that could plausibly occur by accident makes the absence assertion mean
+# nothing. Each one enters the run through a DIFFERENT field project() actually inspects.
+EMAIL_SENTINEL = "leak-sentinel-9f3a2b@example.com"          # -> lookup_customer input+result
+BODY_SENTINEL = "SENTINEL-TICKET-BODY-7c1e4d"                # -> create_escalation.reason
+KEY_SENTINEL = "sk-ant-SENTINEL-FAKE-KEY-4b2df8"             # -> search_docs.query
+
+SENTINELS = (
+    ("customer email", EMAIL_SENTINEL),
+    ("ticket body", BODY_SENTINEL),
+    ("api key", KEY_SENTINEL),
+)
+
+
+def _streamed_event_types(body: str) -> list[str]:
+    """The AgentEvent types the SSE stream actually carried, in order.
+
+    `done` is filtered out: it is written by event_stream itself after run_ticket
+    finishes, is not an AgentEvent, and so has no run_events row to correspond to.
+    """
+    return [
+        line[len("event: "):]
+        for line in body.splitlines()
+        if line.startswith("event: ") and line != "event: done"
+    ]
+
+
+def _make_ticket(client, email: str, body: str, subject: str = "API limits") -> int:
+    created = client.post(
+        "/tickets", json={"customer_email": email, "subject": subject, "body": body}
+    )
+    assert created.status_code == 201
+    return created.json()["id"]
+
+
+def test_a_run_persists_its_full_event_sequence(client, capture_frames, monkeypatch):
+    """Every event the stream carried has exactly one run_events row, in seq order.
+
+    MUTATION that must turn this red: drop the `await _persisted(...)` wrapper from the
+    `usage` yield in agent.py (`yield AgentEvent(type="usage", ...)`) — four usage rows
+    then go missing and the type sequence no longer matches the stream.
+    """
+    # Pinned so search_docs below cannot reach Voyage: a real VOYAGE_API_KEY in .env
+    # would otherwise make this suite issue paid calls. _no_outbound_http is the
+    # backstop; this makes the test free by construction rather than by interception.
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": "liam@brightco.io"})]),
+        response([tool_use_block("search_docs", {"query": "rate limits"})]),
+        response([tool_use_block("send_reply", {"ticket_id": ticket_id, "body": "z" * 40})]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    body, _frames = asyncio.run(capture_frames(ticket_id))
+
+    streamed = _streamed_event_types(body)
+    assert "event: error" not in body
+    # A read tool, a write tool and the terminal resolution all present, so the
+    # sequence assertion below is covering both recorder paths and not just one.
+    assert {"usage", "tool_use", "tool_result", "resolution"} <= set(streamed)
+
+    # Re-opened from disk, not read back through app.state.conn: the claim is that
+    # these rows are COMMITTED, and a read on the writing connection would be green
+    # for an open transaction that never lands.
+    reopened = connect(settings.db_path)
+    try:
+        run_row = reopened.execute("SELECT run_uid, outcome FROM runs").fetchone()
+        assert run_row["outcome"] == "send_reply"
+        run_uid = run_row["run_uid"]
+        assert run_uid, "record_run did not stamp the run's uid — nothing joins to it"
+
+        rows = reopened.execute(
+            "SELECT type, seq FROM run_events WHERE run_uid = ? ORDER BY seq", (run_uid,)
+        ).fetchall()
+    finally:
+        reopened.close()
+
+    # One row per streamed event, same types, same order. Asserted as a whole list
+    # rather than a count so a row landing under the wrong type still fails.
+    assert [r["type"] for r in rows] == streamed
+    assert [r["seq"] for r in rows] == list(range(1, len(streamed) + 1))
+
+
+def test_broker_never_leads_the_database(client, monkeypatch):
+    """D-06: at the moment frame k is published, k events are already committed.
+
+    Written so the REVERSE is observable rather than assumed: the count is sampled
+    inside publish itself, so a publish that ran ahead of its write records a number
+    lower than its own position and this fails on that frame.
+
+    MUTATION that must turn this red: in agent.py's `_persisted`, stop awaiting the
+    write — `asyncio.create_task(asyncio.to_thread(recorder.record, event))` instead of
+    `await asyncio.to_thread(...)`. That is the realistic version of this bug (someone
+    "frees the loop" from the persistence path) and it makes every publish lead its row.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": "liam@brightco.io"})]),
+        response([tool_use_block("send_reply", {"ticket_id": ticket_id, "body": "z" * 40})]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    conn = app.state.conn
+    committed_at_publish: list[int] = []
+    real_publish = app.state.broker.publish
+
+    def counting_publish(frame):
+        # Sampled BEFORE the frame reaches any subscriber, on the event loop, which is
+        # exactly where a publish that led its write would be caught.
+        committed_at_publish.append(
+            conn.execute("SELECT COUNT(*) AS n FROM run_events").fetchone()["n"]
+        )
+        return real_publish(frame)
+
+    monkeypatch.setattr(app.state.broker, "publish", counting_publish)
+
+    async def drive():
+        stream = await process_ticket(ticket_id)
+        return "".join([chunk async for chunk in stream.body_iterator])
+
+    body = asyncio.run(drive())
+    assert "event: error" not in body
+
+    assert committed_at_publish, "the run published nothing — this test proved nothing"
+    for k, committed in enumerate(committed_at_publish, start=1):
+        assert committed >= k, (
+            f"publish #{k} ran with only {committed} rows committed — the broker led the"
+            " database, so a subscriber can see an event that never lands (D-06)"
+        )
+    # Every surfaced event is one row, so trailing by exactly zero is the true state;
+    # asserting it as well means a run that quietly stopped persisting some events
+    # cannot hide behind the >= above.
+    assert committed_at_publish[-1] == len(committed_at_publish)
+
+
+def test_no_projection_leaks_sensitive_data(client, capture_frames, monkeypatch):
+    """SC-3, the load-bearing test: no seeded secret reaches a published frame.
+
+    Three secrets enter the run through three DIFFERENT fields that project() actually
+    inspects — the ticket body goes in via `create_escalation.reason`, an observed tool
+    field, because a `text` event is dropped unconditionally and routing the body only
+    through prose would make the "body never leaks" half of this vacuous (Pitfall 4).
+
+    MUTATION that must turn this red for ALL THREE sentinels: spread the raw event data
+    into project()'s tool_use frame — `return {"type": t, "tool": d.get("tool"), **d}`.
+    Every sentinel rides a tool_use input, so one spread leaks all three.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    # A real customer row, so lookup_customer returns the whole record — email, name,
+    # plan — and the projection has something genuine to have to drop.
+    app.state.conn.execute(
+        "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
+        (EMAIL_SENTINEL, "Leak Sentinel", "enterprise", "2025-01-01"),
+    )
+    app.state.conn.commit()
+    ticket_id = _make_ticket(
+        client, EMAIL_SENTINEL, f"my key {KEY_SENTINEL} stopped working. {BODY_SENTINEL}"
+    )
+    app.state.client = FakeClient([
+        # (1) email -> tool_use.input.email, and -> tool_result.result.customer.email
+        response([tool_use_block("lookup_customer", {"email": EMAIL_SENTINEL})]),
+        # (2) fake key -> tool_use.input.query
+        response([tool_use_block("search_docs", {"query": f"rotating {KEY_SENTINEL}"})]),
+        # (3) ticket body -> create_escalation.reason, an OBSERVED field, plus the same
+        # string in model prose so the `text` drop is exercised on the way past.
+        response([
+            text_block(f"The customer wrote: {BODY_SENTINEL}"),
+            tool_use_block("create_escalation", {
+                "ticket_id": ticket_id,
+                "reason": f"customer reported: {BODY_SENTINEL} — needs a human",
+                "priority": "high",
+            }),
+        ]),
+        response([text_block("escalated")], stop_reason="end_turn"),
+    ])
+
+    body, frames = asyncio.run(capture_frames(ticket_id))
+
+    # The absence below is only meaningful if the secrets were genuinely in this run.
+    # Without this half the test would stay green against a run that never carried
+    # them — the unfalsifiable form of exactly this check.
+    assert "event: error" not in body
+    for name, sentinel in SENTINELS:
+        assert sentinel in body, (
+            f"the {name} sentinel never reached the run's own event stream — the"
+            " redaction assertion below would be vacuous"
+        )
+    raw = "".join(
+        r["payload"] for r in
+        app.state.conn.execute("SELECT payload FROM run_events").fetchall()
+    )
+    for name, sentinel in SENTINELS:
+        # D-01: run_events is private and full-fidelity. If redaction had leaked into
+        # the persistence path, the frames would be clean for the wrong reason and
+        # phase 6 would have nothing to drill into.
+        assert sentinel in raw, f"the {name} sentinel is missing from the raw run_events row"
+
+    published_tools = {f.get("tool") for f in frames if f.get("type") == "tool_use"}
+    assert {"lookup_customer", "search_docs", "create_escalation"} <= published_tools, (
+        f"the run did not publish all three leak vectors as frames: {published_tools}"
+    )
+
+    # Checked per frame and per sentinel, not against one concatenated blob, so a
+    # single leaking frame is enough to fail this and the failure names which frame
+    # and which secret. Collected rather than asserted in place because the useful
+    # answer under the mutation above is ALL the vectors that opened, not just the
+    # first — a leak that closes one field and leaves two is not a fix.
+    leaks = [
+        (i, frame.get("type"), frame.get("tool"), name)
+        for i, frame in enumerate(frames)
+        for name, sentinel in SENTINELS
+        if sentinel in json.dumps(frame)
+    ]
+    assert leaks == [], f"published frames leaked seeded secrets: {leaks}"
+
+
+def test_recorder_untouched_files():
+    """The frozen-caller contract, as a fact about the repo rather than a promise.
+
+    recorder defaults to None, so evals.py and mcp_server.py — which call run_ticket
+    and _execute_guarded with neither a recorder nor any knowledge of one — must not
+    have needed a single byte changed. If they did, the optional-collaborator design
+    broke and the fix belongs in agent.py, not here. ci.yml is included because a
+    green suite bought by loosening the gate is not a green suite.
+    """
+    repo = Path(__file__).parent.parent
+    frozen = ["src/relay/mcp_server.py", "src/relay/evals.py", ".github/workflows/ci.yml"]
+    # --name-only first purely so the failure names the file; --quiet is the assertion,
+    # because its exit code is the same one a reviewer would run by hand.
+    changed = subprocess.run(
+        ["git", "diff", "--name-only", "HEAD", "--", *frozen],
+        cwd=repo, capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    result = subprocess.run(
+        ["git", "diff", "--quiet", "HEAD", "--", *frozen], cwd=repo, check=False
+    )
+    assert result.returncode == 0, f"phase 5 modified a frozen file: {changed}"
