@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import time
+import uuid
 from contextlib import asynccontextmanager
 from html import escape
 
@@ -14,6 +15,7 @@ from .agent import run_ticket
 from .auth import Tier, api_key_header, require_tier
 from .config import settings
 from .db import connect, init_db
+from .events import RunEventBroker, RunRecorder, project
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
@@ -34,6 +36,11 @@ async def lifespan(app: FastAPI):
     app.state.registry = build_registry(conn, settings.kb_dir)
     app.state.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
     app.state.runs = RunRegistry()
+    # Beside the registry and for the same reason: it holds asyncio.Queues, which bind
+    # to the loop they are first used on, so building one at import would tie every
+    # subscriber to whichever loop imported the module (runs.py L60-64). Deliberately
+    # NOT folded into RunRegistry — a watching browser is not work to drain (D-12).
+    app.state.broker = RunEventBroker()
     yield
     # Drained before the connection closes. uvicorn cancels in-flight request tasks
     # when its graceful-shutdown window expires and then runs lifespan shutdown
@@ -218,12 +225,19 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
         usage: dict = {}
         outcome = "incomplete"
         recorded = False
+        # This run's identity, minted before the first event so every run_events row
+        # and the runs row written in the finally below carry the same key. Not the
+        # runs row's id: that row does not exist until the stream ends, long after the
+        # first event has to be written (hence a soft join key, not a foreign one).
+        run_uid = uuid.uuid4().hex
+        recorder = RunRecorder(app.state.conn, run_uid=run_uid, ticket_id=ticket.id)
         try:
             async for event in run_ticket(
                 app.state.client,
                 app.state.registry,
                 ticket.model_dump(),
                 policy=ToolPolicy(allow_writes=not dry_run),
+                recorder=recorder,
             ):
                 if event.type == "usage":
                     usage = event.data
@@ -231,6 +245,20 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                     outcome = event.data["via"] or "dry_run_complete"
                 elif event.type == "error":
                     outcome = f"error:{event.data['reason']}"
+                # The public mirror. `project()` is the only path event data may take
+                # to a subscriber, and it is an allowlist: None means "nothing safe to
+                # show for this event", which is a drop, never an empty frame.
+                #
+                # Post-commit by construction (D-06), not by an ordering rule anyone
+                # has to remember: run_ticket persists each event before it yields it,
+                # so arriving here already means committed. Publishing from inside the
+                # agent loop, or writing the row here, would both break that.
+                frame = project(event)
+                if frame is not None:
+                    app.state.broker.publish(frame)
+                # Unchanged, and deliberately NOT the projection: this stream belongs to
+                # the caller who owns the ticket and stays full-fidelity. Only the
+                # broadcast fan-out above is redacted.
                 yield f"event: {event.type}\ndata: {json.dumps(event.data)}\n\n"
             yield "event: done\ndata: {}\n\n"
         finally:
@@ -267,6 +295,9 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                         output_tokens=usage.get("output_tokens", 0),
                         cost_usd=usage.get("cost_usd", 0.0),
                         outcome=outcome,
+                        # Stamped so this summary row joins the per-step rows already
+                        # written under the same uid — the whole of phase 6's drill-down.
+                        run_uid=run_uid,
                     )
             except Exception:
                 logger.exception("run.record_failed", extra={"ctx": {"ticket_id": ticket.id}})
