@@ -117,6 +117,10 @@ None automated here. One manual post-deploy check belongs in `05-VALIDATION.md`:
 
 Schema, join key and settings all exist, so the recorder (05-02), broker (05-03) and `/events` (05-04) plans have their foundation. No blockers.
 
+## Self-Check: PASSED
+
+All four modified/created source files exist on disk; all five task commits (`6343281`, `780f1fb`, `00d12d7`, `c507d4d`, `ff8f1dd`) resolve in `git log`.
+
 ---
 *Phase: 05-run-event-persistence-live-feed*
 *Completed: 2026-08-12*
