@@ -105,5 +105,21 @@ class Settings(BaseSettings):
     # silently inert and every case keyword-ranked.
     retrieval_floor: float = 0.30
 
+    # Run-event live feed (phase 5). All defaulted: /events is public and projection-only,
+    # so this layer adds no key and nothing here needs to be configured to deploy.
+    #
+    # Per-subscriber bounded queue. Above this the broker drops the oldest frame rather
+    # than awaiting the slow subscriber — a stalled dashboard tab must not backpressure
+    # the paid run that is publishing to it.
+    events_queue_maxsize: int = 256
+    # SSE comment keep-alive, so a quiet feed does not look dead to a proxy or a browser
+    # that would otherwise time the connection out mid-idle.
+    events_heartbeat_seconds: float = 15.0
+    # Close an idle /events stream, so a forgotten tab cannot hold the Fly machine awake
+    # and defeat min_machines_running=0 (D-09). The deadline resets on real frames only,
+    # never on heartbeats — otherwise the server's own keep-alive would keep it alive
+    # forever. EventSource reconnects by itself when the viewer comes back.
+    events_idle_seconds: float = 300.0
+
 
 settings = Settings()
