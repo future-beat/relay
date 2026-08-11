@@ -14,9 +14,11 @@ allowlist redaction, and the load-bearing D-04 atomicity test.
 
 import asyncio
 import inspect
+import json
 
 from relay.db import connect, init_db
-from relay.events import _CLOSE_SENTINEL, RunEventBroker
+from relay.events import _CLOSE_SENTINEL, RunEventBroker, project
+from relay.models import AgentEvent
 from relay.telemetry import record_run
 
 
@@ -169,3 +171,130 @@ async def test_close_wakes_every_subscriber_with_the_sentinel():
     assert broker.closed is True
     assert idle.get_nowait() is _CLOSE_SENTINEL
     assert full.get_nowait() is _CLOSE_SENTINEL
+
+
+def test_project_tool_use_drops_input():
+    # tool_use.input is where every secret enters the stream: lookup_customer carries an
+    # email, send_reply the whole reply body, search_docs the query. The tool NAME is the
+    # only field the dashboard needs to show "it is looking the customer up right now".
+    frame = project(AgentEvent(
+        type="tool_use",
+        data={"tool": "lookup_customer", "input": {"email": "ava@acmecorp.com"}},
+    ))
+
+    assert frame == {"type": "tool_use", "tool": "lookup_customer"}
+    assert "ava@acmecorp.com" not in json.dumps(frame)
+
+
+def test_project_lookup_customer_drops_customer():
+    # The raw result is a whole customer row plus their last ten ticket subjects. None of
+    # it is projectable: there is no safe subset, so the whole object goes.
+    frame = project(AgentEvent(
+        type="tool_result",
+        data={
+            "tool": "lookup_customer",
+            "result": {
+                "found": True,
+                "customer": {"name": "Ava Chen", "email": "ava@acmecorp.com", "plan": "pro"},
+                "recent_tickets": [{"id": 3, "subject": "Refund for the March invoice"}],
+            },
+            "is_error": False,
+        },
+    ))
+
+    assert frame == {"type": "tool_result", "tool": "lookup_customer", "is_error": False}
+    rendered = json.dumps(frame)
+    for leaked in ("Ava Chen", "ava@acmecorp.com", "pro", "Refund for the March invoice"):
+        assert leaked not in rendered
+
+
+def test_project_search_docs_keeps_ids_not_text():
+    # D-07 allows retrieval doc ids and scores — that is what makes the feed legibly
+    # "grounded" — but never the retrieved prose, which is the largest untrusted-adjacent
+    # blob in the stream and the one most likely to restate a customer's own words back.
+    frame = project(AgentEvent(
+        type="tool_result",
+        data={
+            "tool": "search_docs",
+            "result": {"results": [
+                {"doc": "billing.md", "heading": "Refunds", "id": "billing.md#refunds",
+                 "text": "Refunds are issued within 14 days...", "score": 0.82},
+            ]},
+            "is_error": False,
+        },
+    ))
+
+    assert frame["results"] == [
+        {"doc": "billing.md", "id": "billing.md#refunds", "score": 0.82}
+    ]
+    assert "text" not in frame["results"][0]
+    assert "Refunds are issued within 14 days" not in json.dumps(frame)
+
+
+def test_project_text_is_dropped():
+    # Model prose restates whatever it just read — the customer's plan, their email, the
+    # ticket body. The viewer still sees that the model spoke; it does not see what it said.
+    frame = project(AgentEvent(type="text", data={"text": "Hi Ava, your card ending 4242..."}))
+
+    assert frame is None or "text" not in frame
+    assert "4242" not in json.dumps(frame)
+
+
+def test_project_never_spreads_raw_data():
+    """No projected frame may carry a field project() did not name.
+
+    MUTATION that must turn this red: add `**event.data` (or `**d`) to the tool_use frame
+    in project() — LEAK_SENTINEL then rides along inside the copied `input` and this
+    fails. That spread is a denylist wearing an allowlist's clothes: it publishes every
+    field anyone adds to an event from then on, silently and by default.
+    """
+    for event in (
+        AgentEvent(type="tool_use", data={"tool": "send_reply", "input": {"body": "LEAK_SENTINEL"}}),
+        AgentEvent(type="text", data={"text": "LEAK_SENTINEL"}),
+        AgentEvent(type="tool_result", data={
+            "tool": "lookup_customer",
+            "result": {"found": True, "customer": {"email": "LEAK_SENTINEL"}},
+            "is_error": False,
+        }),
+        AgentEvent(type="guardrail", data={
+            "guard": "citation", "tool": "send_reply", "action": "denied",
+            "missing_citations": ["LEAK_SENTINEL"], "retrieved_ids": ["LEAK_SENTINEL"],
+        }),
+    ):
+        assert "LEAK_SENTINEL" not in json.dumps(project(event)), f"leaked via {event.type}"
+
+
+def test_project_fails_closed_on_unknown_types_and_tools():
+    # An event type nobody has projected yet is dropped, not passed through: a new yield
+    # site in agent.py must be an explicit decision here, never a default-publish.
+    assert project(AgentEvent(type="debug_dump", data={"secret": "LEAK_SENTINEL"})) is None
+
+    frame = project(AgentEvent(type="tool_result", data={
+        "tool": "some_future_tool", "result": {"secret": "LEAK_SENTINEL"}, "is_error": False,
+    }))
+    assert frame == {"type": "tool_result", "tool": "some_future_tool", "is_error": False}
+
+
+def test_project_keeps_the_cost_and_outcome_the_dashboard_runs_on():
+    # The allowlist has to be permissive enough to be useful: cost, steps and outcome are
+    # the numbers the whole dashboard exists to show, and none of them is sensitive.
+    usage = project(AgentEvent(type="usage", data={
+        "steps": 2, "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.002,
+        "max_cost_usd": 0.5,
+    }))
+    assert usage == {"type": "usage", "steps": 2, "input_tokens": 10,
+                     "output_tokens": 5, "cost_usd": 0.002}
+
+    resolution = project(AgentEvent(type="resolution", data={
+        "via": "send_reply", "steps": 3, "cost_usd": 0.004, "max_cost_usd": 0.5,
+    }))
+    assert resolution == {"type": "resolution", "via": "send_reply",
+                          "cost_usd": 0.004, "steps": 3}
+
+    assert project(AgentEvent(type="error", data={"reason": "budget_exceeded"}))["reason"] == (
+        "budget_exceeded"
+    )
+    assert project(AgentEvent(type="notice", data={
+        "kind": "retrieval_degraded", "tool": "search_docs",
+        "retrieval_mode": "keyword", "cause": "voyage_failed", "results": 3,
+    }))["cause"] == "voyage_failed"
