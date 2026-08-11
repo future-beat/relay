@@ -1,9 +1,9 @@
 ---
 phase: 5
 slug: run-event-persistence-live-feed
-status: draft
-nyquist_compliant: false
-wave_0_complete: false
+status: planned
+nyquist_compliant: true
+wave_0_complete: true
 created: 2026-08-11
 ---
 
@@ -89,4 +89,4 @@ created: 2026-08-11
 - [ ] Atomicity + redaction tests mutation-checked
 - [ ] `nyquist_compliant: true` set in frontmatter
 
-**Approval:** pending
+**Approval:** covered by plans 05-01..05-04 (2026-08-11); plan-check 2 blockers + 2 warnings resolved in-plan.
