@@ -392,6 +392,103 @@ def test_scored_queries_is_the_denominator_the_numbers_were_divided_by(keyword_b
     assert m["degraded_rows"] == 0
 
 
+# --- WR-03/WR-04: the report-only block must not stall or sink the paid run -------
+#
+# `retrieval_metrics()` is evaluated inside `run_evals`, after asyncio.gather has
+# already spent the money and before anything is written to disk. Two hazards live
+# there: it makes BLOCKING httpx calls from a coroutine, and it was unguarded.
+
+
+def _empty_paid_run(monkeypatch):
+    """Drive run_evals with zero golden cases: the report path, none of the spend."""
+    monkeypatch.setattr(evals, "load_golden", lambda *a, **k: [])
+    # Never constructed against a real key, and never called — there are no cases.
+    monkeypatch.setattr(evals, "AsyncAnthropic", lambda **kwargs: object())
+
+
+async def test_retrieval_metrics_are_computed_off_the_event_loop(monkeypatch, keyword_baseline):
+    # mutation: replace `await asyncio.to_thread(safe_retrieval_metrics)` in
+    # run_evals with a direct `safe_retrieval_metrics()` call. The probe below then
+    # observes a running loop and this fails. retrieve() reaches Voyage through a
+    # blocking httpx.post, so inline it stalls the loop for one client timeout per
+    # labeled row.
+    import asyncio
+
+    observed = {}
+
+    def _probe():
+        try:
+            asyncio.get_running_loop()
+            observed["on_event_loop"] = True
+        except RuntimeError:
+            observed["on_event_loop"] = False
+        return {"mode": "keyword", "key_configured": False, "degraded_rows": 0,
+                "labeled_queries": 1, "scored_queries": 1,
+                "recall@1": 1.0, "recall@3": 1.0, "mrr": 1.0}
+
+    _empty_paid_run(monkeypatch)
+    monkeypatch.setattr(evals, "retrieval_metrics", _probe)
+
+    await evals.run_evals(None, 1)
+
+    assert observed["on_event_loop"] is False
+
+
+async def test_a_failing_metric_block_never_loses_the_paid_report(
+    monkeypatch, keyword_baseline, capsys
+):
+    # mutation (the WR-04 defect itself): call `retrieval_metrics()` directly from
+    # run_evals instead of `safe_retrieval_metrics`. The KeyError below then
+    # propagates out of run_evals and out of asyncio.run — in production that
+    # discards a completed 12-case paid report and exits non-zero, making the
+    # report-only metric the one thing that can fail the job (D-03 says it gates
+    # nothing). This test fails on the raised KeyError.
+    _empty_paid_run(monkeypatch)
+
+    def _boom():
+        raise KeyError("query")
+
+    monkeypatch.setattr(evals, "retrieval_metrics", _boom)
+
+    report = await evals.run_evals(None, 1)
+
+    # The report survived, and says why the number is missing rather than omitting it.
+    assert report["retrieval_metrics"] == {"error": "KeyError: 'query'"}
+    assert "pass_rate" in report and "results" in report
+    evals.print_summary(report)
+    assert "retrieval metrics unavailable: KeyError" in capsys.readouterr().out
+
+
+# --- WR-07: EVAL-01's delivery path, not just its arithmetic ---------------------
+#
+# The three metric tests above call retrieval_eval/retrieval_metrics directly.
+# Nothing asserted that the produced REPORT carries the block — deleting the
+# `"retrieval_metrics"` key from run_evals left the whole suite green, which is the
+# same shape as WR-10: the computation proven, the artifact it must appear in not.
+
+
+async def test_run_evals_report_carries_the_retrieval_metrics_block(
+    monkeypatch, keyword_baseline, capsys
+):
+    # mutation (the WR-07 defect itself): delete the `"retrieval_metrics"` entry
+    # from run_evals' returned dict, or drop the print_retrieval_summary call from
+    # print_summary. Either removes the whole deliverable of EVAL-01 and this fails.
+    _empty_paid_run(monkeypatch)
+
+    report = await evals.run_evals(None, 1)
+    m = report["retrieval_metrics"]
+
+    assert m["mode"] == "keyword"
+    assert m["key_configured"] is False
+    assert m["scored_queries"] == len(scored_labels(load_labels()))
+    assert 0.0 <= m["recall@1"] <= m["recall@3"] <= 1.0
+
+    evals.print_summary(report)
+    out = capsys.readouterr().out
+    assert "retrieval (keyword)" in out
+    assert "report-only, not gated" in out
+
+
 # --- EVAL-02: the prompt-injection golden case (D-05) ----------------------------
 #
 # The attacker input is the ticket body itself: it instructs the agent to post a

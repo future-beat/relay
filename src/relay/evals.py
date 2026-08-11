@@ -116,6 +116,23 @@ def retrieval_metrics() -> dict[str, Any]:
     }
 
 
+def safe_retrieval_metrics() -> dict[str, Any]:
+    """`retrieval_metrics()` with a floor under it — report-only must never gate (WR-04).
+
+    The metric block is evaluated after `asyncio.gather` has spent the money and
+    before the report is written. Unguarded, a malformed line in
+    `evals/retrieval.jsonl`, a label missing `query`, or an OSError reading the
+    labels propagates out of `run_evals` and out of `asyncio.run`, and the entire
+    paid 12-case report is lost to a traceback and a non-zero exit. D-03 says this
+    number never gates; via that path it was the only thing that could fail the job
+    outright. The error travels in the payload instead, where a reader sees it.
+    """
+    try:
+        return retrieval_metrics()
+    except Exception as exc:  # noqa: BLE001 — report-only, must never sink a paid run
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
 @dataclass
 class CaseResult:
     id: str
@@ -360,6 +377,12 @@ async def run_evals(limit: int | None, concurrency: int) -> dict[str, Any]:
     results = await asyncio.gather(*(bounded(c) for c in cases))
     passed = sum(r.passed for r in results)
     qualities = [r.quality for r in results if r.quality is not None]
+    # Offloaded: `retrieve()` reaches Voyage through a BLOCKING `httpx.post`, and this
+    # is a coroutine. Called inline, one query embedding per labeled row stalls the
+    # whole event loop for up to the client timeout apiece. Nothing else is in flight
+    # by this point, but "nothing else is in flight" is a property of today's caller,
+    # not of this function.
+    metrics = await asyncio.to_thread(safe_retrieval_metrics)
     return {
         "ran_at": datetime.now(UTC).isoformat(),
         "model": settings.model,
@@ -369,7 +392,7 @@ async def run_evals(limit: int | None, concurrency: int) -> dict[str, Any]:
         "mean_quality": round(sum(qualities) / len(qualities), 2) if qualities else None,
         "total_cost_usd": round(sum(r.cost_usd for r in results), 4),
         # Report-only (D-03): printed and archived, never compared to a threshold.
-        "retrieval_metrics": retrieval_metrics(),
+        "retrieval_metrics": metrics,
         "results": [asdict(r) for r in results],
     }
 
@@ -392,23 +415,34 @@ def print_summary(report: dict[str, Any]) -> None:
         f" | mean quality {report['mean_quality']}"
         f" | agent cost ${report['total_cost_usd']}"
     )
-    m = report.get("retrieval_metrics")
-    if m:
-        # recall@1 and MRR lead: recall@3 saturates on a 3-doc corpus (D-09).
+    print_retrieval_summary(report.get("retrieval_metrics"))
+
+
+def print_retrieval_summary(m: dict[str, Any] | None) -> None:
+    """Render the report-only retrieval block, including when computing it failed."""
+    if not m:
+        return
+    if m.get("error"):
+        # The metrics failed and the run survived it (WR-04). Printed, not raised:
+        # a report-only number that can silently vanish is worse than one that says
+        # it is missing, and one that can end the job is worse than both.
+        print(f"retrieval metrics unavailable: {m['error']} — report-only, not gated")
+        return
+    # recall@1 and MRR lead: recall@3 saturates on a 3-doc corpus (D-09).
+    print(
+        f"retrieval ({m['mode']}) recall@1 {m['recall@1']:.2f}"
+        f" | MRR {m['mrr']:.2f}"
+        f" | recall@3 {m['recall@3']:.2f}"
+        f" over {m['scored_queries']} labeled queries — report-only, not gated"
+    )
+    if m.get("key_configured") and m["mode"] != "semantic":
+        # Paid for semantic ranking, did not get it. Silent here is how keyword
+        # numbers get read as semantic quality — the thing `mode` exists to stop.
         print(
-            f"retrieval ({m['mode']}) recall@1 {m['recall@1']:.2f}"
-            f" | MRR {m['mrr']:.2f}"
-            f" | recall@3 {m['recall@3']:.2f}"
-            f" over {m['scored_queries']} labeled queries — report-only, not gated"
+            f"  WARNING: VOYAGE_API_KEY is set but {m['degraded_rows']} of"
+            f" {m['scored_queries']} rows degraded — these are NOT semantic numbers."
+            " Rebuild/commit kb/index.json or check Voyage."
         )
-        if m.get("key_configured") and m["mode"] != "semantic":
-            # Paid for semantic ranking, did not get it. Silent here is how keyword
-            # numbers get read as semantic quality — the thing `mode` exists to stop.
-            print(
-                f"  WARNING: VOYAGE_API_KEY is set but {m['degraded_rows']} of"
-                f" {m['scored_queries']} rows degraded — these are NOT semantic numbers."
-                " Rebuild/commit kb/index.json or check Voyage."
-            )
 
 
 def main() -> None:
