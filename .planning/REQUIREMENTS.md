@@ -30,9 +30,9 @@
 
 ### Evaluation
 
-- [ ] **EVAL-01**: A retrieval eval set (labeled query → relevant chunk ids) reports recall@k and MRR, wired into the existing harness, and the existing 12-ticket eval suite does not regress below its CI threshold
-- [ ] **EVAL-02**: A prompt-injection golden case (ticket body attempting to act on another ticket) asserts the SEC-04 guard fires
-- [ ] **EVAL-03**: A citation-faithfulness check asserts every chunk id cited in a reply was retrieved in that run (deterministic; no LLM judge)
+- [x] **EVAL-01**: A retrieval eval set (labeled query → relevant chunk ids) reports recall@k and MRR, wired into the existing harness, and the existing 12-ticket eval suite does not regress below its CI threshold
+- [x] **EVAL-02**: A prompt-injection golden case (ticket body attempting to act on another ticket) asserts the SEC-04 guard fires
+- [x] **EVAL-03**: A citation-faithfulness check asserts every chunk id cited in a reply was retrieved in that run (deterministic; no LLM judge)
 
 ### Dashboard
 
@@ -82,9 +82,9 @@ Mapped by roadmap creation 2026-08-06 — 22/22 v1 requirements, no orphans.
 | RAG-03 | Phase 3 | Complete |
 | RAG-04 | Phase 3 | Complete |
 | RAG-05 | Phase 3 | Complete |
-| EVAL-01 | Phase 4 | Pending |
-| EVAL-02 | Phase 4 | Pending |
-| EVAL-03 | Phase 4 | Pending |
+| EVAL-01 | Phase 4 | Complete |
+| EVAL-02 | Phase 4 | Complete |
+| EVAL-03 | Phase 4 | Complete |
 | DATA-03 | Phase 5 | Pending |
 | DASH-01 | Phase 5 | Pending |
 | DASH-02 | Phase 6 | Pending |
