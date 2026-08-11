@@ -9,6 +9,7 @@ PRAGMA-guarded ALTER, and hence these tests run init_db twice on a populated dat
 """
 
 from relay.db import connect, init_db
+from relay.telemetry import record_run
 
 
 def test_run_uid_migration_is_idempotent(tmp_path):
@@ -53,3 +54,36 @@ def test_run_events_table_shape(conn):
     assert (row["run_uid"], row["ticket_id"], row["seq"], row["type"]) == ("abc123", 7, 0, "tool_use")
     assert row["payload"] == '{"name": "lookup_customer"}'
     assert row["created_at"]
+
+
+def test_record_run_persists_run_uid(conn):
+    record_run(
+        conn,
+        ticket_id=1,
+        model="claude-sonnet-5",
+        duration_ms=100,
+        steps=2,
+        input_tokens=10,
+        output_tokens=5,
+        cost_usd=0.002,
+        outcome="resolved",
+        run_uid="abc123",
+    )
+    assert conn.execute("SELECT run_uid FROM runs").fetchone()["run_uid"] == "abc123"
+
+
+def test_record_run_without_run_uid_still_works(conn):
+    # The default is what keeps every pre-phase-5 caller (evals, mcp_server, the tests
+    # that call record_run directly) working unchanged.
+    record_run(
+        conn,
+        ticket_id=1,
+        model="claude-sonnet-5",
+        duration_ms=100,
+        steps=2,
+        input_tokens=10,
+        output_tokens=5,
+        cost_usd=0.002,
+        outcome="resolved",
+    )
+    assert conn.execute("SELECT run_uid FROM runs").fetchone()["run_uid"] is None
