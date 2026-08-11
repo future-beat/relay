@@ -27,7 +27,7 @@ from relay.config import settings
 from relay.db import connect, init_db
 from relay.events import _CLOSE_SENTINEL, RunEventBroker, RunRecorder, project
 from relay.guardrails import ToolPolicy
-from relay.main import app, process_ticket
+from relay.main import app, events, process_ticket
 from relay.models import AgentEvent
 from relay.telemetry import record_run
 from relay.tools import build_registry
@@ -665,3 +665,269 @@ def test_recorder_untouched_files():
         ["git", "diff", "--quiet", "HEAD", "--", *frozen], cwd=repo, check=False
     )
     assert result.returncode == 0, f"phase 5 modified a frozen file: {changed}"
+
+
+# --------------------------------------------------------------------------------------
+# Plan 04: the public /events transport. Everything below drives the real route generator
+# (`await events()` -> `body_iterator`), because all four properties this wave must hold —
+# live delivery, the initial snapshot, the idle close, and zero leaked subscribers — are
+# properties of that generator's control flow and are invisible to a test of the broker.
+# --------------------------------------------------------------------------------------
+
+REPLY_SENTINEL = "SENTINEL-REPLY-BODY-3d9a71"
+
+
+async def _next_chunk(it, timeout: float = 2.0) -> str:
+    """One chunk, with a deadline. A hung read is a bug, not a slow test."""
+    return await asyncio.wait_for(it.__anext__(), timeout)
+
+
+async def _read_to_close(it, *, timeout: float, what: str) -> list[str]:
+    """Every chunk until the generator returns. Fails loudly if it never does."""
+    chunks: list[str] = []
+
+    async def _read():
+        async for chunk in it:
+            chunks.append(chunk)
+
+    try:
+        await asyncio.wait_for(_read(), timeout=timeout)
+    except TimeoutError:
+        pytest.fail(f"{what} — read {len(chunks)} chunks and the stream was still open")
+    return chunks
+
+
+def test_events_delivers_a_live_run(client, monkeypatch):
+    """SC-2: an open /events stream receives a run's redacted frames WHILE it runs.
+
+    "While" is asserted, not assumed: each feed chunk is stamped with whether the run
+    had already finished when it arrived, and at least one must have arrived before it
+    did. A design that collected frames and flushed them at the end — or that a
+    dashboard had to poll for — passes every other assertion here and fails that one.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    # Short, so a quiet moment costs 20ms of keep-alive rather than the 15s default; the
+    # idle ceiling stays well clear so nothing closes underneath this test.
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.02)
+    monkeypatch.setattr(settings, "events_idle_seconds", 5.0)
+    ticket_id = _make_ticket(client, EMAIL_SENTINEL, f"charged twice. {BODY_SENTINEL}")
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": EMAIL_SENTINEL})]),
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id,
+            "body": f"Refunded — it lands in 3-5 days. {REPLY_SENTINEL}",
+        })]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    async def drive():
+        stream = await events()
+        it = stream.body_iterator
+        first = await _next_chunk(it)
+        run_finished = asyncio.Event()
+        feed: list[tuple[str, bool]] = []
+
+        async def reader():
+            async for chunk in it:
+                if chunk.startswith(":"):
+                    continue  # keep-alive comment, not a frame
+                feed.append((chunk, run_finished.is_set()))
+                if "event: resolution" in chunk:
+                    return
+
+        async def runner():
+            run = await process_ticket(ticket_id)
+            async for _chunk in run.body_iterator:
+                # Hand the loop back after every step the run emits, which is what a
+                # real HTTP client does between chunks — and what lets the assertion
+                # below distinguish "delivered live" from "delivered at the end".
+                await asyncio.sleep(0)
+            run_finished.set()
+
+        reader_task = asyncio.create_task(reader())
+        try:
+            await runner()
+            await asyncio.wait_for(reader_task, timeout=2.0)
+        finally:
+            reader_task.cancel()
+            await it.aclose()
+        return first, feed
+
+    first, feed = asyncio.run(drive())
+
+    assert "event: snapshot" in first
+    assert feed, "the feed received nothing at all — this test would prove nothing"
+    assert any(not finished for _chunk, finished in feed), (
+        "every frame arrived only after the run had already ended — the feed is not live"
+    )
+
+    body = "".join(chunk for chunk, _ in feed)
+    # Safe fields PRESENT: the tool names and the cost are what the dashboard renders,
+    # and an allowlist tuned to leak nothing by publishing nothing is not a feed.
+    assert "event: tool_use" in body
+    for expected in ('"tool": "lookup_customer"', '"tool": "send_reply"', '"cost_usd"'):
+        assert expected in body, f"the feed dropped {expected} — nothing left to show"
+    assert "event: resolution" in body
+    # Sensitive fields ABSENT: the customer's address, their ticket body and the reply
+    # the agent sent them all passed through this run's events on the way here.
+    for name, sentinel in (*SENTINELS, ("reply body", REPLY_SENTINEL)):
+        assert sentinel not in body, f"the public feed leaked the {name}"
+    assert len(app.state.broker._subs) == 0, "the closed feed left a subscriber behind"
+
+
+def test_events_sends_initial_snapshot_on_connect(client):
+    """D-14: the FIRST frame is what is running right now, before any live event.
+
+    MUTATION that must turn this red: delete the `yield _snapshot_frame()` line before
+    the receive loop in main.py's stream(). The first chunk is then the live frame
+    published below (or nothing at all until one is), and both assertions fail — a tab
+    opened mid-run would sit on an empty feed until the next step happened.
+    """
+    async def drive():
+        # A run already in flight when the viewer connects. Registered directly rather
+        # than by driving a real run, because the snapshot has to be observed at a
+        # moment mid-run, which a completed run cannot give us.
+        token = app.state.runs.register(ticket_id=4242)
+        try:
+            stream = await events()
+            it = stream.body_iterator
+            first = await _next_chunk(it)
+            # Published only AFTER the snapshot was read, so "the snapshot came first"
+            # is a fact about ordering and not about which one happened to be ready.
+            app.state.broker.publish({"type": "usage", "steps": 1, "cost_usd": 0.002})
+            second = await _next_chunk(it)
+            await it.aclose()
+            return first, second
+        finally:
+            app.state.runs.deregister(token)
+
+    first, second = asyncio.run(drive())
+
+    assert first.startswith("event: snapshot\ndata: ")
+    payload = json.loads(first.split("data: ", 1)[1].strip())
+    assert payload["type"] == "snapshot"
+    assert [run["ticket_id"] for run in payload["runs"]] == [4242], (
+        "the in-flight run was not in the connect snapshot — a mid-run viewer sees nothing"
+    )
+    # Built field by field like project(): a monotonic clock reading is meaningless off
+    # this process, so the frame carries elapsed time and nothing else.
+    assert set(payload["runs"][0]) == {"ticket_id", "running_for_ms"}
+    # And the live event is second, not first.
+    assert second.startswith("event: usage\ndata: ")
+
+
+def test_events_disconnect_unsubscribes(client):
+    """CR-02: neither a stream that never starts nor one that disconnects leaks a queue.
+
+    MUTATION that must turn this red: subscribe outside the generator body (call
+    `app.state.broker.subscribe()` in the `events()` handler, above `async def stream`)
+    — the never-started half then leaves one queue behind, because a finally in a body
+    that never ran does not execute. The second half falls to moving `unsubscribe(q)`
+    out of the finally and below the loop, where a disconnect skips it entirely.
+
+    A leaked subscriber is not merely untidy: publish keeps writing into a queue nobody
+    reads for the life of the process, so every later run pays for a viewer that left.
+    """
+    async def never_starts():
+        # The body is deliberately never iterated — Starlette can cancel a
+        # StreamingResponse before its generator starts, which is exactly this.
+        await events()
+
+    asyncio.run(never_starts())
+    assert len(app.state.broker._subs) == 0, "a stream that never started leaked a subscriber"
+
+    async def starts_then_disconnects():
+        stream = await events()
+        it = stream.body_iterator
+        await _next_chunk(it)  # connected: the snapshot frame arrived
+        assert len(app.state.broker._subs) == 1, (
+            "the connected stream never subscribed — the disconnect assertion below"
+            " would pass against a route that reads nothing"
+        )
+        await it.aclose()  # the client goes away mid-stream
+
+    asyncio.run(starts_then_disconnects())
+    assert len(app.state.broker._subs) == 0, "a disconnected stream leaked a subscriber"
+
+
+def test_events_heartbeats_then_idle_closes(client, monkeypatch):
+    """D-09/SC-4: a stream fed nothing but its own heartbeats still closes.
+
+    MUTATION that must turn this red: reset the idle deadline in the heartbeat branch
+    of main.py's stream() (`idle_deadline = time.monotonic() + settings.events_idle_seconds`
+    beside the `yield ": keep-alive"`). The stream then renews itself forever, the read
+    below never ends, and this fails on the timeout. That bug is invisible in production
+    except as a Fly machine that never reaches `stopped` — min_machines_running=0
+    silently defeated by the server's own keep-alive — which is why the heartbeat-only
+    case is the one asserted here rather than a quiet-then-busy one.
+    """
+    # Several heartbeats inside the ceiling, so "it emitted keep-alives AND still closed"
+    # is one observation rather than two runs. Real values are 15s/300s.
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.02)
+    monkeypatch.setattr(settings, "events_idle_seconds", 0.2)
+
+    async def drive():
+        stream = await events()
+        return await _read_to_close(
+            stream.body_iterator,
+            timeout=3.0,
+            what="a heartbeat-only /events stream never idle-closed (D-09)",
+        )
+
+    chunks = asyncio.run(drive())
+
+    keep_alives = [c for c in chunks if c == ": keep-alive\n\n"]
+    assert len(keep_alives) >= 2, (
+        f"the stream closed without heartbeating first ({chunks!r}) — a quiet-but-live"
+        " feed would be dropped by a proxy before the ceiling was ever reached"
+    )
+    # Nothing but the connect snapshot and comments: no run published anything, so a
+    # frame here would mean the feed invented one.
+    assert [c for c in chunks if not c.startswith(":")] == [chunks[0]]
+    assert chunks[0].startswith("event: snapshot")
+    assert len(app.state.broker._subs) == 0, "the idle-closed stream leaked a subscriber"
+
+
+def test_events_viewer_is_not_a_registered_run(client, monkeypatch):
+    """D-12/SC-4: a viewer is not a run — it never enters RunRegistry, so it cannot
+    stall the shutdown drain — and lifespan's broker.close() ends it.
+
+    MUTATION that must turn this red: call `app.state.runs.register(ticket_id=0)` inside
+    main.py's stream() (the natural mistake — event_stream registers there, so the shape
+    is right next door). `active` becomes 1, and the drain below then waits out its full
+    grace period and returns False instead of draining instantly. Every deploy would
+    burn the graceful-shutdown window for as long as one tab stayed open, and the
+    machine would never autostop.
+    """
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.02)
+    monkeypatch.setattr(settings, "events_idle_seconds", 5.0)
+
+    async def drive():
+        stream = await events()
+        it = stream.body_iterator
+        await _next_chunk(it)  # connected and subscribed
+        assert len(app.state.broker._subs) == 1
+
+        active_with_a_viewer = app.state.runs.active
+        snapshot_with_a_viewer = app.state.runs.snapshot()
+        # The consequence, not just the count: a drain with a viewer attached must take
+        # the empty-registry fast path. The short timeout is what makes a stalled drain
+        # a failed assertion rather than a slow test.
+        drained = await app.state.runs.drain(timeout=0.05)
+
+        # Shutdown's other half: close() wakes the open stream with the sentinel, so it
+        # returns instead of sitting out its idle ceiling inside uvicorn's window.
+        app.state.broker.close()
+        remaining = await _read_to_close(
+            it, timeout=2.0, what="broker.close() did not end the open /events stream"
+        )
+        return active_with_a_viewer, snapshot_with_a_viewer, drained, remaining
+
+    active, snapshot, drained, remaining = asyncio.run(drive())
+
+    assert active == 0, "the /events viewer registered as a run — the drain will wait for it"
+    assert snapshot == []
+    assert drained is True, "the drain did not complete with a viewer attached (D-12)"
+    # The sentinel is not a frame: the stream ends on it, it is never serialised out.
+    assert [c for c in remaining if not c.startswith(":")] == []
+    assert len(app.state.broker._subs) == 0
