@@ -24,6 +24,7 @@ import logging
 from typing import Any
 
 from .config import settings
+from .models import AgentEvent
 
 logger = logging.getLogger("relay.events")
 
@@ -106,3 +107,93 @@ class RunEventBroker:
         self.closed = True
         for q in tuple(self._subs):
             self._offer(q, _CLOSE_SENTINEL)
+
+
+def _project_tool_result(d: dict) -> dict:
+    """The per-tool allowlist. This is where the leak risk concentrates.
+
+    Every branch names its own fields, and the fallthrough for an unrecognised tool
+    keeps only the name and the error flag — so a tool added later is redacted by
+    default and someone has to come here on purpose to publish more of it.
+    """
+    tool = d.get("tool")
+    result = d.get("result")
+    if not isinstance(result, dict):
+        # An error string or a non-JSON result: publish that it happened, not what.
+        return {"type": "tool_result", "tool": tool, "is_error": d.get("is_error")}
+    if tool == "search_docs":
+        # ids + scores make the feed legibly grounded (D-07); `text` and `heading` are
+        # the retrieved prose and stay out of the frame entirely.
+        results = result.get("results")
+        return {
+            "type": "tool_result",
+            "tool": tool,
+            "results": [
+                {"doc": r.get("doc"), "id": r.get("id"), "score": r.get("score")}
+                for r in results
+                if isinstance(r, dict)
+            ] if isinstance(results, list) else [],
+        }
+    if tool == "send_reply":
+        return {
+            "type": "tool_result", "tool": tool,
+            "reply_id": result.get("reply_id"), "status": result.get("status"),
+        }
+    if tool == "create_escalation":
+        return {
+            "type": "tool_result", "tool": tool,
+            "escalation_id": result.get("escalation_id"), "status": result.get("status"),
+        }
+    if tool == "set_category":
+        # The category, not the ticket_id echo — the id is already the run's own.
+        return {"type": "tool_result", "tool": tool, "category": result.get("category")}
+    # lookup_customer lands here with the rest: its result is a whole customer row plus
+    # ten ticket subjects, and there is no safe subset of that to show.
+    return {"type": "tool_result", "tool": tool, "is_error": d.get("is_error")}
+
+
+def project(event: AgentEvent) -> dict | None:
+    """Redact one run event into a public feed frame, or None to drop it (D-07, SC-3).
+
+    An allowlist, built field by field. Never `{**event.data}`: a spread publishes
+    every field anyone adds to an event from then on — a denylist whose entries
+    nobody ever writes down. The events flowing through here carry customer emails,
+    ticket bodies, reply text and search queries, so the default must be "not
+    published" and each exception must be a decision visible in this function.
+
+    Returning None (rather than an empty frame) for an unrecognised type means a new
+    yield site in agent.py is silently absent from the feed until someone adds it
+    here — annoying, and much better than silently present.
+    """
+    t, d = event.type, event.data
+    if t == "usage":
+        return {"type": t, "steps": d.get("steps"), "input_tokens": d.get("input_tokens"),
+                "output_tokens": d.get("output_tokens"), "cost_usd": d.get("cost_usd")}
+    if t == "resolution":
+        return {"type": t, "via": d.get("via"), "cost_usd": d.get("cost_usd"),
+                "steps": d.get("steps")}
+    if t == "error":
+        # reason/status/type are enumerated or numeric; no message text is carried.
+        # `error_type`, not `type`: the API error's own type would collide with the
+        # frame's, and silently overwrite it if this were ever built by a spread.
+        return {"type": t, "reason": d.get("reason"), "status": d.get("status"),
+                "error_type": d.get("type")}
+    if t == "tool_use":
+        return {"type": t, "tool": d.get("tool")}          # the NAME only — never `input`
+    if t == "tool_result":
+        return _project_tool_result(d)
+    if t == "guardrail":
+        # That a guard fired and which one. Not the denied payload: `missing_citations`
+        # and `supplied_ticket_id` are the model's own output, echoed back from a
+        # ticket body we do not control.
+        return {"type": t, "guard": d.get("guard"), "tool": d.get("tool"),
+                "action": d.get("action")}
+    if t == "notice":
+        return {"type": t, "kind": d.get("kind"), "tool": d.get("tool"),
+                "retrieval_mode": d.get("retrieval_mode"), "cause": d.get("cause"),
+                "results": d.get("results")}
+    if t == "text":
+        # The viewer sees that the model spoke, not what it said: prose restates
+        # whatever the model just read, which includes the customer's own details.
+        return {"type": t}
+    return None
