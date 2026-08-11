@@ -29,13 +29,15 @@ from .agent import TERMINAL_TOOLS, run_ticket
 from .config import settings
 from .db import connect, init_db
 from .models import AgentEvent
-from .retrieval import load_index
+from .retrieval import Index, load_index
 from .retrieval_eval import (
     load_labels,
+    locator_precision_from_scores,
     mrr_from_scores,
     observed_mode,
     recall_from_scores,
     score_rows,
+    ticket_derived_labels,
 )
 from .tools import build_registry, lookup_customer
 
@@ -95,16 +97,47 @@ def retrieval_metrics() -> dict[str, Any]:
     `kb/index.json` or a failing Voyage call returns keyword results under a live
     secret, and that is the failure mode that reaches CI. `key_configured` and
     `degraded_rows` carry the gap between what was paid for and what ran.
+
+    Two more fields exist so the headline cannot be read as more than it is:
+    `granularity: "document"` says recall/MRR resolve to one of three files, not to
+    a passage (WR-01) — `locator_precision@1` is the sub-document number — and
+    `query_source: "curated"` says the queries are hand-authored rewrites, not the
+    text the agent emits (WR-02), with the ticket-derived variant beside it.
     """
     index = load_index(settings.kb_dir)
     labels = load_labels()
     key = settings.voyage_api_key
-    # One scoring pass: all three numbers and the mode label then describe the same
-    # retrieval, instead of a label borrowed from a pass the numbers didn't come from.
+    payload = {
+        "granularity": "document",
+        "query_source": "curated",
+        "key_configured": bool(key),
+        **_score_block(index, labels, key=key),
+    }
+    # The same labels asked in the words a customer actually wrote (WR-02). The
+    # curated queries are keyword-friendly rewrites, worth about +0.09 recall@1 over
+    # the golden subject and -0.09 under subject+body — a swing bigger than anything
+    # this phase changed, previously undocumented and invisible to every test.
+    # Reported beside, never merged: one figure over two query sources describes
+    # neither.
+    payload["ticket_derived"] = {
+        "query_source": "golden_subject_body",
+        **_score_block(index, ticket_derived_labels(labels, load_golden()), key=key),
+    }
+    return payload
+
+
+def _score_block(
+    index: Index, labels: list[dict[str, Any]], *, key: str | None
+) -> dict[str, Any]:
+    """One scoring pass, every number derived from it.
+
+    All four figures and the mode label then describe the same retrieval, instead of
+    a label borrowed from a pass the numbers didn't come from — and one query
+    embedding per row is bought once, not once per metric.
+    """
     scores = score_rows(index, labels, k=3, key=key)
     return {
         "mode": observed_mode(scores),
-        "key_configured": bool(key),
         "degraded_rows": sum(s.degraded for s in scores),
         "labeled_queries": len(labels),
         "scored_queries": len(scores),
@@ -113,6 +146,11 @@ def retrieval_metrics() -> dict[str, Any]:
         "recall@1": recall_from_scores(scores, 1),
         "recall@3": recall_from_scores(scores, 3),
         "mrr": mrr_from_scores(scores),
+        # The one number a `#anchor` label can move: recall/MRR are document-level
+        # (see retrieval_eval._accept_set), so without this the anchor half of ten
+        # labels is decoration and `_locate_heading` — which picks the id the model
+        # is told to cite — is measured by nothing.
+        "locator_precision@1": locator_precision_from_scores(labels, scores),
     }
 
 
@@ -418,6 +456,11 @@ def print_summary(report: dict[str, Any]) -> None:
     print_retrieval_summary(report.get("retrieval_metrics"))
 
 
+def _fmt(value: float | None) -> str:
+    """`n/a`, not `0.00`: no anchor-labeled rows is not a locator score of zero."""
+    return "n/a" if value is None else f"{value:.2f}"
+
+
 def print_retrieval_summary(m: dict[str, Any] | None) -> None:
     """Render the report-only retrieval block, including when computing it failed."""
     if not m:
@@ -430,11 +473,23 @@ def print_retrieval_summary(m: dict[str, Any] | None) -> None:
         return
     # recall@1 and MRR lead: recall@3 saturates on a 3-doc corpus (D-09).
     print(
-        f"retrieval ({m['mode']}) recall@1 {m['recall@1']:.2f}"
+        f"retrieval ({m['mode']}, {m.get('granularity', 'document')}-level,"
+        f" {m.get('query_source', 'curated')} queries)"
+        f" recall@1 {m['recall@1']:.2f}"
         f" | MRR {m['mrr']:.2f}"
         f" | recall@3 {m['recall@3']:.2f}"
+        f" | locator@1 {_fmt(m.get('locator_precision@1'))}"
         f" over {m['scored_queries']} labeled queries — report-only, not gated"
     )
+    derived = m.get("ticket_derived")
+    if derived:
+        # Printed beside, never instead: the gap between the two is the honest
+        # width of the headline, and it only exists on the page if both are on it.
+        print(
+            f"  same labels, ticket-derived queries: recall@1 {derived['recall@1']:.2f}"
+            f" | MRR {derived['mrr']:.2f}"
+            f" | locator@1 {_fmt(derived.get('locator_precision@1'))}"
+        )
     if m.get("key_configured") and m["mode"] != "semantic":
         # Paid for semantic ranking, did not get it. Silent here is how keyword
         # numbers get read as semantic quality — the thing `mode` exists to stop.

@@ -14,7 +14,17 @@ from relay.db import SEED_CUSTOMERS
 from relay.evals import extract_outcome, load_golden
 from relay.models import AgentEvent, TicketCategory
 from relay.retrieval import load_index, slug
-from relay.retrieval_eval import load_labels, mrr, recall_at_k, scored_labels
+from relay.retrieval_eval import (
+    load_labels,
+    locator_precision_from_scores,
+    mrr,
+    mrr_from_scores,
+    recall_at_k,
+    recall_from_scores,
+    score_rows,
+    scored_labels,
+    ticket_derived_labels,
+)
 
 SEED_EMAILS = {c[0] for c in SEED_CUSTOMERS}
 VALID_ACTIONS = {"send_reply", "create_escalation"}
@@ -352,7 +362,7 @@ def test_print_summary_flags_keyword_numbers_printed_under_a_configured_key(caps
     }
     evals.print_summary(report)
     out = capsys.readouterr().out
-    assert "retrieval (keyword)" in out
+    assert "retrieval (keyword," in out
     assert "WARNING" in out
     assert "11 of 11 rows degraded" in out
 
@@ -392,6 +402,141 @@ def test_scored_queries_is_the_denominator_the_numbers_were_divided_by(keyword_b
     assert m["degraded_rows"] == 0
 
 
+# --- WR-01: what the headline number actually measures ---------------------------
+#
+# recall@k/MRR are DOCUMENT-level: _accept_set unions doc + located id + every
+# anchor (mirroring the citation guard), so a result matches iff the document
+# matches and no `#anchor` label can move them. That was true and undocumented, and
+# the ten anchors in evals/retrieval.jsonl read as if they counted. The fix is both
+# halves: say so in the payload (`granularity`) and add the one metric that DOES
+# read them, so the labels stop being decoration.
+
+
+def _doc_anchors_from_index() -> dict[str, list[str]]:
+    """Every `doc#slug` id kb/index.json licenses, grouped by document."""
+    raw = json.loads((Path(__file__).parent.parent / "kb" / "index.json").read_text())
+    return {d["doc"]: [f"{d['doc']}#{slug(h)}" for h in d["headings"]] for d in raw["docs"]}
+
+
+def _mislabel_anchors(labels):
+    """Same documents, every `#anchor` pointed at a DIFFERENT section of that document.
+
+    The mutation the review ran by hand: it must leave document recall untouched
+    (that is the semantics) and must move the sub-document metric (that is the
+    metric being non-vacuous).
+    """
+    by_doc = _doc_anchors_from_index()
+    mislabeled = []
+    for row in labels:
+        relevant = []
+        for rid in row["relevant"]:
+            if "#" not in rid:
+                relevant.append(rid)
+                continue
+            doc = rid.split("#", 1)[0]
+            others = [a for a in by_doc[doc] if a != rid]
+            assert others, f"{doc} has a single heading; cannot mislabel"
+            relevant.append(others[0])
+        mislabeled.append({**row, "relevant": relevant})
+    return mislabeled
+
+
+def test_anchor_labels_move_the_locator_metric_and_not_document_recall(keyword_baseline):
+    # mutation: implement locator_precision_from_scores against `_accept_set` (or
+    # against `row["relevant"]`'s doc names) instead of the rank-1 result's located
+    # `id`. It then goes anchor-blind like recall does, `mislabeled == baseline`, and
+    # the strict inequality below fails — which is the WR-01 defect returning: every
+    # reported number inert to the anchor half of ten labels.
+    #
+    # The equalities above it are equally load-bearing in the other direction: if
+    # someone narrows _accept_set so recall becomes chunk-level, they fail here and
+    # have to update `granularity` and the docstrings rather than silently changing
+    # what "recall@1 0.91" claims.
+    index = load_index(Path("kb"))
+    labels = load_labels()
+    mislabeled = _mislabel_anchors(labels)
+    assert mislabeled != labels, "the mutation did not change any label"
+
+    scores = score_rows(index, labels, k=3)
+    wrong_scores = score_rows(index, mislabeled, k=3)
+
+    # (a) the documented semantics: recall/MRR cannot see anchors, by construction.
+    assert recall_from_scores(wrong_scores, 1) == recall_from_scores(scores, 1)
+    assert recall_from_scores(wrong_scores, 3) == recall_from_scores(scores, 3)
+    assert mrr_from_scores(wrong_scores) == mrr_from_scores(scores)
+
+    # (b) and the anchors are not decoration: one number does read them.
+    baseline = locator_precision_from_scores(labels, scores)
+    wrong = locator_precision_from_scores(mislabeled, wrong_scores)
+    assert baseline is not None and baseline > 0
+    assert wrong < baseline, "the locator metric is blind to the anchor labels"
+
+
+def test_locator_precision_is_none_rather_than_zero_without_anchor_labels(keyword_baseline):
+    """No anchored rows is not a locator score of 0 — reporting it as one reads as
+    total locator failure rather than as an absent measurement."""
+    index = load_index(Path("kb"))
+    doc_only = [{**row, "relevant": [r for r in row["relevant"] if "#" not in r]}
+                for row in load_labels()]
+    scores = score_rows(index, doc_only, k=3)
+    assert locator_precision_from_scores(doc_only, scores) is None
+
+
+def test_the_report_states_its_granularity(keyword_baseline):
+    # mutation: drop `granularity` from retrieval_metrics' payload. A reader then
+    # sees "recall@1 0.91" with nothing saying it resolves to one of three FILES.
+    m = evals.retrieval_metrics()
+    assert m["granularity"] == "document"
+    assert m["locator_precision@1"] is not None
+
+
+# --- WR-02: the queries are hand-authored rewrites, not what the agent sends ------
+#
+# The label `query` strings are keyword-friendly rewrites of the golden tickets
+# ("Pro plan pricing" for the subject "How much is Pro?"). The agent composes its
+# own query from the ticket, and the choice is worth ~±0.18 recall@1 — a bigger
+# swing than anything this phase changed, previously undisclosed.
+
+
+def test_the_report_names_its_query_source_and_carries_a_ticket_derived_variant(
+    keyword_baseline,
+):
+    # mutation: delete the `ticket_derived` block, or drop `query_source`. The
+    # curated number then reads as the system's retrieval quality against real
+    # ticket text, which is the claim nobody ever checked.
+    m = evals.retrieval_metrics()
+    assert m["query_source"] == "curated"
+
+    derived = m["ticket_derived"]
+    assert derived["query_source"] == "golden_subject_body"
+    assert derived["scored_queries"] == m["scored_queries"]
+    # Both are real measurements over the same labels and the same retriever, so the
+    # gap between them is the gap between curated and ticket-shaped input.
+    assert 0.0 <= derived["recall@1"] <= 1.0
+    assert derived["recall@1"] != m["recall@1"], (
+        "the two query sources produced identical numbers — the variant is not"
+        " actually being asked in the ticket's words"
+    )
+
+
+def test_ticket_derived_labels_use_the_golden_ticket_text(keyword_baseline):
+    labels = load_labels()
+    cases = load_golden()
+    derived = ticket_derived_labels(labels, cases)
+
+    assert len(derived) == len(labels), "the label ids no longer map 1:1 onto golden"
+    by_id = {c["id"]: c for c in cases}
+    for row, original in zip(derived, labels, strict=True):
+        assert row["relevant"] == original["relevant"], "labels must not be rewritten"
+        case = by_id[row["id"]]
+        assert case["subject"] in row["query"] and case["body"] in row["query"]
+        assert row["query"] != original["query"]
+
+    # A label with no matching case is dropped, not carried with its curated query:
+    # one figure mixing two query sources describes neither.
+    assert ticket_derived_labels(labels, []) == []
+
+
 # --- WR-03/WR-04: the report-only block must not stall or sink the paid run -------
 #
 # `retrieval_metrics()` is evaluated inside `run_evals`, after asyncio.gather has
@@ -400,8 +545,12 @@ def test_scored_queries_is_the_denominator_the_numbers_were_divided_by(keyword_b
 
 
 def _empty_paid_run(monkeypatch):
-    """Drive run_evals with zero golden cases: the report path, none of the spend."""
-    monkeypatch.setattr(evals, "load_golden", lambda *a, **k: [])
+    """Let run_evals build its whole report with `limit=0`: the path, none of the spend.
+
+    `limit=0` rather than a stubbed `load_golden`: retrieval_metrics reads the golden
+    cases too (for the ticket-derived variant), and blanking them there would have
+    this test measure a report shape the harness never produces.
+    """
     # Never constructed against a real key, and never called — there are no cases.
     monkeypatch.setattr(evals, "AsyncAnthropic", lambda **kwargs: object())
 
@@ -429,7 +578,7 @@ async def test_retrieval_metrics_are_computed_off_the_event_loop(monkeypatch, ke
     _empty_paid_run(monkeypatch)
     monkeypatch.setattr(evals, "retrieval_metrics", _probe)
 
-    await evals.run_evals(None, 1)
+    await evals.run_evals(0, 1)
 
     assert observed["on_event_loop"] is False
 
@@ -450,7 +599,7 @@ async def test_a_failing_metric_block_never_loses_the_paid_report(
 
     monkeypatch.setattr(evals, "retrieval_metrics", _boom)
 
-    report = await evals.run_evals(None, 1)
+    report = await evals.run_evals(0, 1)
 
     # The report survived, and says why the number is missing rather than omitting it.
     assert report["retrieval_metrics"] == {"error": "KeyError: 'query'"}
@@ -475,7 +624,7 @@ async def test_run_evals_report_carries_the_retrieval_metrics_block(
     # print_summary. Either removes the whole deliverable of EVAL-01 and this fails.
     _empty_paid_run(monkeypatch)
 
-    report = await evals.run_evals(None, 1)
+    report = await evals.run_evals(0, 1)
     m = report["retrieval_metrics"]
 
     assert m["mode"] == "keyword"
@@ -485,7 +634,7 @@ async def test_run_evals_report_carries_the_retrieval_metrics_block(
 
     evals.print_summary(report)
     out = capsys.readouterr().out
-    assert "retrieval (keyword)" in out
+    assert "retrieval (keyword," in out
     assert "report-only, not gated" in out
 
 
