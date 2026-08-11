@@ -20,7 +20,8 @@ Durably record every agent step to a new `run_events` table, and fan out a publi
 - **D-03:** On restart, in-flight subscribers simply reconnect and see new runs; history is not replayed to the live feed. Acceptable because durable history lives in `run_events` for Phase 6's drill-down. No `Last-Event-ID` resume (already Out of Scope for the milestone).
 
 ### Write path & transaction nesting
-- **D-04:** Each event row is persisted **during the stream**, inside the SAME `transaction()` as that step's own writes. This is the first real exercise of Phase 2's nest-safe `transaction()` (deferred WR-01, closed in gap closure): a `send_reply` opens a transaction and the event write for that step nests inside it — savepoints make that correct. Do NOT open a second top-level transaction per event.
+- **D-04:** Each event row is persisted inside the SAME `transaction()` as that step's own writes, so a step's write and its event row commit atomically. This is the first real exercise of Phase 2's nest-safe `transaction()` (deferred WR-01, closed in gap closure): the tool write opens a transaction and the event insert nests inside it as a savepoint.
+  **CORRECTED after research (2026-08-11):** the persistence seam is in **`agent.py` inside the offloaded worker**, NOT in `main.py`'s `event_stream`. `Database.transaction()` holds its RLock for the whole body and nests on ONE thread only; the tool write runs and commits inside the `to_thread` worker, so by the time the `tool_result` event surfaces back on the event loop in `event_stream`, that transaction is already closed. Persisting from `event_stream` would be a second top-level transaction — exactly what this decision forbids, and non-atomic. Wrap tool-exec + event-insert in one `transaction()` in the worker. Injected as an optional `recorder` so `evals.py`/`mcp_server.py` stay untouched.
 - **D-05:** The DB write goes through the existing `asyncio.to_thread` seam (Phase 2), so a slow disk never stalls the paid run's event loop.
 - **D-06:** **Publish to the broker only AFTER the DB write commits.** The live feed must never show an event that wasn't durably recorded — the DB is the source of truth, the broker mirrors it, never leads it.
 
@@ -32,6 +33,11 @@ Durably record every agent step to a new `run_events` table, and fan out a publi
 - **D-09:** `/events` streams send a periodic comment **heartbeat** and **close after an idle ceiling** (~5 min with no runs) so a forgotten dashboard tab cannot hold the Fly machine awake and defeat `min_machines_running=0` / "cheap to keep running". `EventSource` auto-reconnects when the user returns.
 - **D-10:** The broker uses **bounded queues with drop-oldest** on a slow subscriber. A stalled watcher backpressures nothing — the paid run's publish is fire-and-forget. Satisfies SC-4 both directions: no stall of the paid run, and the machine still reaches `stopped`.
 - **D-11:** `/events` is **public and projection-only** (no key). It carries only allowlisted projections, so publishing it openly costs nothing — consistent with the Phase 1 public-surface posture (dashboard/metrics/health are already public).
+
+### Resolved / added after research (2026-08-11)
+- **D-12 — `/events` viewers must NOT enter `RunRegistry`.** They are watchers, not runs; counting them would stall the Phase 2 shutdown drain (which waits for `active == 0`). The broker's subscriber set is separate from the registry's active-run set.
+- **D-13 — `run_events` is `CREATE TABLE IF NOT EXISTS`, but any new column on the existing `runs` table (e.g. a `run_uid` to join events to a run) needs a guarded, idempotent `ALTER TABLE`.** `init_db` re-running against the live Fly volume will NOT add a column to an existing table via the `CREATE TABLE` DDL — a silent no-op that leaves the column absent in production. Detect-and-add explicitly.
+- **D-14 — on connect, `/events` sends an initial snapshot of currently-running runs, then live events.** This is live *state* (who is running now), not the run *history* D-03 declines to replay — a viewer joining mid-run should see the in-flight runs, not a blank feed until the next event.
 
 ### Claude's Discretion
 - `run_events` schema columns (at least: run/ticket ref, seq, event type, timestamp, a JSON payload column); indexing for Phase 6 drill-down
