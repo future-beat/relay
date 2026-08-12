@@ -10,6 +10,7 @@ import asyncio
 import inspect
 import json
 import re
+from contextlib import contextmanager
 from datetime import datetime
 
 import pytest
@@ -1178,3 +1179,356 @@ def test_streaming_routes_are_not_buffered(client, monkeypatch):
         assert resp.headers["content-type"].startswith("text/event-stream")
         assert resp.headers.get("cache-control") == "no-cache", resp.headers
         assert resp.headers.get("x-accel-buffering") == "no", resp.headers
+
+
+@contextmanager
+def _anon(client):
+    """Drop the fixture's credential for one block.
+
+    Restated here rather than imported from tests/test_auth.py: the client fixture puts
+    X-API-Key on the client's DEFAULT headers, so a keyless request has to remove it and
+    not merely omit it — and a "public route" test that quietly sent the owner key would
+    be the vacuous form of exactly the claim it makes.
+    """
+    saved = client.headers.pop("X-API-Key")
+    try:
+        yield client
+    finally:
+        client.headers["X-API-Key"] = saved
+
+
+def _drive_a_denied_then_accepted_run(client, ticket_id: int) -> str:
+    """Script one run that produces tool_use, tool_result AND guardrail rows.
+
+    The first send_reply names another ticket, so the binding guard denies it and the
+    agent yields a `guardrail` event before the failed tool_result; the second is
+    accepted and resolves the run. Returns the run's uid, taken from the response
+    header — i.e. exactly what a Try-it visitor would hold.
+    """
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": "liam@brightco.io"})]),
+        response([tool_use_block("send_reply", {
+            "ticket_id": 999_999,
+            "body": "Your rate limit is 600 requests/minute on the Pro plan.",
+        }, id="toolu_denied")]),
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id,
+            "body": "Your rate limit is 600 requests/minute on the Pro plan.",
+        }, id="toolu_ok")]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    assert resp.status_code == 200
+    assert "event: error" not in resp.text
+    assert "event: resolution" in resp.text
+    return resp.headers["X-Relay-Run-Uid"]
+
+
+def _insert_runs_row(uid: str, *, ticket_id: int, age_days: int = 0) -> None:
+    """A `runs` row aged by SQLite's own clock — the swept/unrecorded split turns on it.
+
+    `datetime('now', ?)` rather than a Python-formatted literal, so the row's timestamp
+    is produced by exactly the expression the retention comparison uses.
+    """
+    app.state.conn.execute(
+        "INSERT INTO runs (ticket_id, model, duration_ms, steps, input_tokens,"
+        " output_tokens, cost_usd, outcome, created_at, run_uid)"
+        " VALUES (?, 'claude-sonnet-5', 120, 3, 1000, 500, 0.02, 'send_reply',"
+        " datetime('now', ?), ?)",
+        (ticket_id, f"-{age_days} days", uid),
+    )
+    app.state.conn.commit()
+
+
+def test_run_detail_returns_a_complete_run(client, monkeypatch):
+    """DASH-03: a keyless GET /runs/{uid} renders one run's redacted steps.
+
+    Driven as a REAL run through the recorder, so the rows are the shapes production
+    writes, and fetched with NO API key — this route is public like /events and
+    /metrics, and its safety is content control, not access control.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    uid = _drive_a_denied_then_accepted_run(client, ticket_id)
+
+    with _anon(client) as anon:
+        resp = anon.get(f"/runs/{uid}")
+    assert resp.status_code == 200
+    detail = resp.json()
+
+    assert detail["run_uid"] == uid
+    assert detail["ticket_id"] == ticket_id
+    assert detail["status"] == "complete"
+    # Owner-created, so redacted. The FLAG is not secret; the content is.
+    assert detail["demo"] is False
+    assert "ticket" not in detail, "a non-demo drill-down published the ticket text"
+
+    run = detail["run"]
+    assert run["outcome"] == "send_reply"
+    assert run["ticket_id"] == ticket_id
+    assert run["steps"] >= 1 and run["duration_ms"] >= 0
+    assert run["cost_usd"] > 0
+    assert set(run) == {
+        "outcome", "cost_usd", "duration_ms", "steps", "input_tokens",
+        "output_tokens", "model", "created_at", "ticket_id",
+    }, run
+
+    steps = detail["steps"]
+    assert steps, "a complete run rendered no steps at all"
+    # Non-empty is not enough: a drill-down that publishes only `usage` frames would
+    # satisfy it and show nothing of what the agent DID. All three of the types this
+    # page exists to render have to be there.
+    assert {"tool_use", "tool_result", "guardrail"} <= {s["type"] for s in steps}
+    assert [s["seq"] for s in steps] == sorted(s["seq"] for s in steps)
+    guard = next(s for s in steps if s["type"] == "guardrail")
+    assert guard["guard"] == "ticket_binding" and guard["action"] == "denied"
+
+
+def test_run_detail_404s_on_a_malformed_or_unknown_uid(client, monkeypatch):
+    """A uid that cannot exist is refused before the database is touched (T-06-17).
+
+    The uid shape is known exactly (uuid4().hex), so a scripted walk of made-up keys
+    must cost a regex and not a query — the route is public, keyless, and over a table
+    that grows with the whole back catalogue.
+
+    MUTATION that must turn this red: drop the `_RUN_UID_RE.match` guard — the DB
+    sentinel below then fires, because every malformed uid reaches a SELECT.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+
+    real_conn = app.state.conn
+
+    class _ExplodingConn:
+        """Any DB touch at all is the failure this test is about."""
+
+        def __getattr__(self, name):
+            raise AssertionError(f"a malformed uid reached the database (conn.{name})")
+
+    malformed = [
+        "../../etc/passwd",
+        "abc",
+        "Z" * 32,                 # 32 chars, not hex
+        "0" * 31,                 # right alphabet, wrong length
+        "0123456789ABCDEF" * 2,   # uppercase hex — uuid4().hex is lowercase
+    ]
+    app.state.conn = _ExplodingConn()
+    try:
+        with _anon(client) as anon:
+            for uid in malformed:
+                resp = anon.get(f"/runs/{uid}")
+                assert resp.status_code == 404, (uid, resp.status_code)
+                # The short-string domain form, not the perimeter's dict — and it names
+                # no uid back, so the 404 body cannot be used as an echo oracle.
+                assert resp.json()["detail"] == "unknown run", resp.json()
+    finally:
+        app.state.conn = real_conn
+
+    # Well-formed but absent: this one MAY touch the database, and still 404s.
+    with _anon(client) as anon:
+        absent = anon.get("/runs/" + "0" * 32)
+    assert absent.status_code == 404
+    assert absent.json()["detail"] == "unknown run"
+
+
+def test_run_detail_of_a_swept_run_renders_as_swept(client):
+    """The four absence states are distinguishable, and only one of them is a 404.
+
+    `purge_expired_run_events` deletes run_events at 30 days and deliberately spares the
+    `runs` row, so "no steps" is the NORMAL end state of every run in the back
+    catalogue. A visitor following a link into it must be told the steps expired.
+
+    MUTATION that must turn this red: return 404 when the event rows are missing. A
+    30-day-old run then becomes indistinguishable from a forged uid — the page can no
+    longer tell "this run happened and its detail expired" from "this uid is a lie",
+    and the honest retention story silently reads as a broken link (T-06-18).
+    """
+    swept_uid, unrecorded_uid, in_flight_uid = ("a" * 32, "b" * 32, "c" * 32)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+
+    # (1) runs row present, events swept by retention.
+    _insert_runs_row(
+        swept_uid, ticket_id=ticket_id, age_days=settings.events_retention_days + 5
+    )
+    # (2) runs row present, INSIDE the window: a legacy pre-Phase-5 run, or a run whose
+    # per-step writes failed. Not swept — nothing expired — and saying "swept" about it
+    # would be a lie about retention.
+    _insert_runs_row(unrecorded_uid, ticket_id=ticket_id, age_days=0)
+    # (3) events present, runs row not yet written — the row lands in event_stream's
+    # finally, so this is what EVERY run looks like while it is streaming.
+    app.state.conn.execute(
+        "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload, elapsed_ms)"
+        " VALUES (?, ?, 1, 'usage', ?, 12)",
+        (in_flight_uid, ticket_id, json.dumps({
+            "steps": 1, "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.001,
+        })),
+    )
+    app.state.conn.commit()
+
+    with _anon(client) as anon:
+        swept = anon.get(f"/runs/{swept_uid}")
+        unrecorded = anon.get(f"/runs/{unrecorded_uid}")
+        in_flight = anon.get(f"/runs/{in_flight_uid}")
+        absent = anon.get("/runs/" + "d" * 32)
+
+    assert swept.status_code == 200
+    assert swept.json()["status"] == "swept"
+    assert swept.json()["steps"] == []
+    # A note the page can render verbatim, naming the window rather than a bare state.
+    assert str(settings.events_retention_days) in swept.json()["note"]
+    assert swept.json()["run"]["outcome"] == "send_reply"
+
+    assert unrecorded.status_code == 200
+    assert unrecorded.json()["status"] == "unrecorded"
+    assert unrecorded.json()["steps"] == []
+    assert "note" not in unrecorded.json()
+
+    assert in_flight.status_code == 200
+    assert in_flight.json()["status"] == "in_flight"
+    assert in_flight.json()["run"] is None
+    assert [s["type"] for s in in_flight.json()["steps"]] == ["usage"]
+    assert in_flight.json()["ticket_id"] == ticket_id
+
+    # The ONLY 404: nothing under this uid on either side.
+    assert absent.status_code == 404
+
+
+def test_run_detail_is_rate_limited_per_ip(client, monkeypatch):
+    """T-06-17: a scripted walk of the back catalogue is metered, in its own bucket.
+
+    MUTATION that must turn this red: drop `dependencies=[Depends(run_detail_gate)]`
+    from the route decorator — the second GET returns 404/200 instead of 429 and the
+    endpoint is back to unlimited free reads over every run the volume holds.
+
+    Its OWN bucket, not /events': a drill-down flood must not spend the live feed's
+    reconnect allowance (which would break the visitor's own feed) or hide itself
+    inside the feed's log line.
+    """
+    monkeypatch.setattr(settings, "anon_run_detail_limit", "1/minute")
+    uid = "e" * 32
+    with _anon(client) as anon:
+        first = anon.get(f"/runs/{uid}")
+        second = anon.get(f"/runs/{uid}")
+
+    # Metered before the handler, so even a 404 spends its unit — an unknown-uid walk
+    # is exactly the traffic this bounds.
+    assert first.status_code == 404
+    assert second.status_code == 429
+    assert second.json()["detail"]["error"] == "rate_limited"
+    assert second.headers["Retry-After"]
+
+
+def test_run_detail_read_is_bounded(client, monkeypatch):
+    """The per-run read carries a LIMIT — one run cannot be an unbounded response.
+
+    run_events grows by ~10 rows per run and nothing caps a single run's step count
+    (the agent's step limit is the only bound, and it is configuration). A route that
+    materialises every row of the largest run in the catalogue, on the loop that
+    answers the 3s container HEALTHCHECK, is a denial-of-service surface with a public
+    URL.
+
+    MUTATION that must turn this red: drop `LIMIT ?` from the run_events SELECT.
+    """
+    monkeypatch.setattr(settings, "run_detail_max_events", 2)
+    uid = "f" * 32
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    for seq in range(1, 6):
+        app.state.conn.execute(
+            "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload, elapsed_ms)"
+            " VALUES (?, ?, ?, 'usage', ?, ?)",
+            (uid, ticket_id, seq, json.dumps({
+                "steps": seq, "input_tokens": 10, "output_tokens": 5, "cost_usd": 0.001,
+            }), seq * 10),
+        )
+    app.state.conn.commit()
+
+    with _anon(client) as anon:
+        detail = anon.get(f"/runs/{uid}").json()
+
+    # Exactly the limit, and the FIRST rows by seq — a truncated run must read as its
+    # beginning, not as an arbitrary window.
+    assert [s["seq"] for s in detail["steps"]] == [1, 2]
+
+
+def test_budget_gauge_matches_the_gate(client):
+    """D-11: /metrics renders the number that refuses the visitor's next run.
+
+    MUTATION that must turn this red: compute the gauge's spend from the response's own
+    `last_runs` rows instead of calling budget_snapshot. The reservation held below
+    vanishes from the gauge, so the page advertises budget remaining while /process is
+    already 503-ing — a credibility failure on the one page whose whole purpose is
+    credibility.
+    """
+    record_run(app.state.conn, ticket_id=1, model="m", duration_ms=10, steps=1,
+               input_tokens=1, output_tokens=1, cost_usd=0.25, outcome="send_reply")
+
+    # A run admitted but not yet written to `runs`. The GATE counts this; a gauge
+    # derived from committed rows alone cannot see it, which is the whole mutation.
+    token = reserve_run()
+    try:
+        payload = client.get("/metrics").json()
+        expected = budget_snapshot(app.state.conn)
+    finally:
+        release_run(token)
+
+    assert payload["budget"] == expected
+    assert set(payload["budget"]) == {
+        "spent_today_usd", "daily_ceiling_usd", "remaining_usd", "exhausted", "resets_at",
+    }
+    # And the reservation really was included, so the equality above was not vacuous:
+    # the gauge reads strictly above the committed rows it could have summed instead.
+    committed = sum(r["cost_usd"] for r in payload["last_runs"])
+    assert payload["budget"]["spent_today_usd"] > committed >= 0.25, payload["budget"]
+    assert payload["budget"]["exhausted"] is False
+
+
+def test_a_legacy_null_origin_run_is_redacted_at_the_route(client, monkeypatch):
+    """origin IS NULL fails closed AT THE ROUTE, not merely at the column (D-02).
+
+    The Fly volume is full of rows written before `origin` existed. 06-01 pinned the
+    stored value as NULL; this pins what the PUBLIC ROUTE does with it, which is the
+    half a visitor can actually reach. The ticket is inserted by raw SQL — exactly as a
+    pre-migration deploy wrote it — and then driven through a real recorded run.
+
+    MUTATION that must turn this red: derive full fidelity by truthiness or by
+    `origin != "owner"` instead of `origin == "demo"`. NULL is neither 'demo' nor
+    'owner', so a fail-open comparison publishes a legacy customer's raw ticket body
+    and tool inputs to anyone holding the uid.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    secret = "LEGACY-NULL-ORIGIN-SENTINEL-3ad91f"
+    cur = app.state.conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+        ("legacy@acmecorp.com", "written before origin existed", f"help: {secret}"),
+    )
+    app.state.conn.commit()
+    ticket_id = cur.lastrowid
+    assert _origin_of(ticket_id) is None, "the legacy row was classified after all"
+
+    app.state.client = FakeClient([
+        response([tool_use_block("create_escalation", {
+            "ticket_id": ticket_id,
+            "reason": f"customer reported: {secret} — needs a human review",
+            "priority": "high",
+        })]),
+        response([text_block("escalated")], stop_reason="end_turn"),
+    ])
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    assert resp.status_code == 200
+    assert "event: error" not in resp.text
+    uid = resp.headers["X-Relay-Run-Uid"]
+
+    # Present in the raw rows first — otherwise the absence below is vacuous.
+    raw = "".join(
+        r["payload"] for r in
+        app.state.conn.execute(
+            "SELECT payload FROM run_events WHERE run_uid = ?", (uid,)
+        ).fetchall()
+    )
+    assert secret in raw, "the sentinel never reached the run's raw rows"
+
+    with _anon(client) as anon:
+        detail = anon.get(f"/runs/{uid}").json()
+    assert detail["demo"] is False
+    assert detail["steps"], "the drill-down published nothing — a vacuous pass"
+    assert secret not in json.dumps(detail), "a NULL-origin run rendered full fidelity"
+    assert "ticket" not in detail
