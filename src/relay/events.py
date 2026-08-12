@@ -9,7 +9,8 @@ that watches it, and each one fails in a way the others cannot catch:
 - `project()` is the only path raw event data may take to become a public frame. It
   is an allowlist, built field by field: a denylist leaks the first field someone
   adds later, and the fields flowing past here include customer emails, ticket
-  bodies and reply text (D-07).
+  bodies and reply text (D-07). `attribute_to_run()` stamps the run's identity onto
+  a frame project() has already built — it is not a second path to one.
 - `RunRecorder` writes one `run_events` row per step. For a write-tier tool the row
   goes in the tool's OWN transaction as a savepoint, so the reply and the record of
   the reply commit or roll back together (D-04).
@@ -247,6 +248,29 @@ def project(event: AgentEvent) -> dict | None:
         # whatever the model just read, which includes the customer's own details.
         return {"type": t}
     return None
+
+
+def attribute_to_run(frame: dict, *, run_uid: str, ticket_id: int) -> dict:
+    """Stamp an already-projected frame with the run it belongs to (CR-03).
+
+    The service admits concurrent runs by design — RunRegistry holds a dict of them and
+    the connect snapshot renders a list — so an unattributed feed interleaves two runs'
+    tool_use, usage and resolution frames with no way to tell which cost or which
+    outcome belonged to which ticket. That makes phase 6's per-run cards unbuildable
+    and the frames unjoinable to the `run_events` rows this phase exists to write.
+
+    Separate from project() rather than a parameter of it: project() is a pure
+    per-event redactor and knows nothing about runs, while identity is known only at
+    the publish site. Separate from a second serialisation path too — it takes a frame
+    project() already built and adds two fields, so nothing reaches a subscriber
+    without having passed the allowlist first.
+
+    Neither field is a new disclosure: `ticket_id` is already published by /events'
+    own connect snapshot and by /metrics' last_runs, and `run_uid` by the same
+    /metrics rows. The identity is written LAST so no event field can ever overwrite
+    it — a frame that lies about which run it came from is worse than no frame.
+    """
+    return {**frame, "run_uid": run_uid, "ticket_id": ticket_id}
 
 
 class RunRecorder:

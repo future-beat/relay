@@ -15,7 +15,14 @@ from .agent import run_ticket
 from .auth import Tier, api_key_header, require_tier
 from .config import settings
 from .db import connect, init_db
-from .events import _CLOSE_SENTINEL, BrokerUnavailable, RunEventBroker, RunRecorder, project
+from .events import (
+    _CLOSE_SENTINEL,
+    BrokerUnavailable,
+    RunEventBroker,
+    RunRecorder,
+    attribute_to_run,
+    project,
+)
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
@@ -278,9 +285,17 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                 # has to remember: run_ticket persists each event before it yields it,
                 # so arriving here already means committed. Publishing from inside the
                 # agent loop, or writing the row here, would both break that.
+                #
+                # Stamped with this run's identity on the way out (CR-03): several runs
+                # can be in flight at once, and a frame nobody can attribute is a cost
+                # figure without a ticket and a resolution without a run. The stamp is
+                # applied here, where the identity is known, and never inside project(),
+                # which stays a pure per-event redactor.
                 frame = project(event)
                 if frame is not None:
-                    app.state.broker.publish(frame)
+                    app.state.broker.publish(
+                        attribute_to_run(frame, run_uid=run_uid, ticket_id=ticket.id)
+                    )
                 # Unchanged, and deliberately NOT the projection: this stream belongs to
                 # the caller who owns the ticket and stays full-fidelity. Only the
                 # broadcast fan-out above is redacted.

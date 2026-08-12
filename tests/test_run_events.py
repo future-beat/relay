@@ -14,6 +14,7 @@ allowlist redaction, and the load-bearing D-04 atomicity test.
 
 import asyncio
 import inspect
+import itertools
 import json
 import sqlite3
 import subprocess
@@ -22,7 +23,13 @@ from pathlib import Path
 import pytest
 from fastapi import HTTPException
 
-from helpers import FakeClient, response, text_block, tool_use_block
+from helpers import (
+    FakeClient,
+    TicketAwareFakeClient,
+    response,
+    text_block,
+    tool_use_block,
+)
 from relay.agent import bind_to_ticket
 from relay.config import settings
 from relay.db import connect, init_db
@@ -695,6 +702,90 @@ def test_broker_never_leads_the_database(client, monkeypatch):
     # asserting it as well means a run that quietly stopped persisting some events
     # cannot hide behind the >= above.
     assert committed_at_publish[-1] == len(committed_at_publish)
+
+
+def test_concurrent_runs_are_attributable_in_the_feed(client, monkeypatch):
+    """CR-03: every published frame names the run and ticket it belongs to.
+
+    Two runs in flight at once, which is the case the service admits by design
+    (RunRegistry holds a dict of them, the connect snapshot renders a list) and the
+    case a single-run test cannot see: without identity a subscriber gets interleaved
+    tool_use / usage / resolution frames and no way to tell whose cost or whose outcome
+    each one was. Phase 6's per-run cards are unbuildable from that, and the frames
+    cannot be joined to the run_events rows this phase writes.
+
+    MUTATION 1 that must turn this red: publish `frame` instead of
+    `attribute_to_run(frame, ...)` in event_stream — every frame loses its identity and
+    the first assertion fails.
+    MUTATION 2 that must turn this red: stamp a constant (`run_uid="run"`) — the frames
+    then all claim one run, the two tickets collapse into it, and the 1:1 assertion
+    fails. That is the actual defect: attribution that exists but does not distinguish.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_a = _make_ticket(client, "ava@acmecorp.com", "charged twice for March", "Refund")
+    ticket_b = _make_ticket(client, "liam@brightco.io", "what are my rate limits?", "Limits")
+    # Replies to whichever ticket the prompt names, so one client can serve two
+    # genuinely overlapping runs.
+    app.state.client = TicketAwareFakeClient()
+
+    async def drive():
+        q = app.state.broker.subscribe()
+        try:
+            async def run(ticket_id):
+                stream = await process_ticket(ticket_id)
+                async for _chunk in stream.body_iterator:
+                    # Hand the loop back between steps, which is what makes these two
+                    # runs interleave rather than execute one after the other.
+                    await asyncio.sleep(0)
+
+            await asyncio.gather(run(ticket_a), run(ticket_b))
+        finally:
+            app.state.broker.unsubscribe(q)
+        frames = []
+        while True:
+            try:
+                frames.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                return frames
+
+    frames = asyncio.run(drive())
+
+    assert frames, "the feed received nothing — this test would prove nothing"
+    unattributed = [f for f in frames if "run_uid" not in f or "ticket_id" not in f]
+    assert unattributed == [], f"published frames carry no run identity: {unattributed}"
+
+    # The bug is conflation, so the assertion is on the MAPPING, not on presence: each
+    # uid must belong to exactly one ticket, and the two runs must be two runs.
+    by_uid: dict[str, set[int]] = {}
+    for frame in frames:
+        by_uid.setdefault(frame["run_uid"], set()).add(frame["ticket_id"])
+    assert len(by_uid) == 2, f"two runs published under {len(by_uid)} identities: {by_uid}"
+    assert all(len(tickets) == 1 for tickets in by_uid.values()), (
+        f"a run's frames were attributed to more than one ticket: {by_uid}"
+    )
+    assert {t for tickets in by_uid.values() for t in tickets} == {ticket_a, ticket_b}
+
+    # Genuinely interleaved: if the two runs had serialised, the frame stream would be
+    # one run's frames then the other's, and this defect would be invisible again.
+    ordering = [f["run_uid"] for f in frames]
+    switches = sum(1 for a, b in itertools.pairwise(ordering) if a != b)
+    assert switches > 1, (
+        f"the two runs did not overlap in the feed ({switches} switches) — the"
+        " conflation this test exists to catch could not have occurred"
+    )
+
+    # And the identity joins to the durable record: the same pairs, from the runs table.
+    reopened = connect(settings.db_path)
+    try:
+        rows = reopened.execute("SELECT run_uid, ticket_id FROM runs").fetchall()
+    finally:
+        reopened.close()
+    assert {(r["run_uid"], r["ticket_id"]) for r in rows} == {
+        (uid, next(iter(tickets))) for uid, tickets in by_uid.items()
+    }
+    # Each run's own outcome is attributable, not just its tool calls.
+    resolutions = {f["run_uid"] for f in frames if f["type"] == "resolution"}
+    assert resolutions == set(by_uid), "a run's resolution frame belonged to no run"
 
 
 def test_no_projection_leaks_sensitive_data(client, capture_frames, monkeypatch):
