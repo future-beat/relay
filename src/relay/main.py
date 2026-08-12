@@ -15,7 +15,7 @@ from .agent import run_ticket
 from .auth import Tier, api_key_header, require_tier
 from .config import settings
 from .db import connect, init_db
-from .events import _CLOSE_SENTINEL, RunEventBroker, RunRecorder, project
+from .events import _CLOSE_SENTINEL, BrokerUnavailable, RunEventBroker, RunRecorder, project
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
 from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
@@ -81,7 +81,7 @@ _SHUTTING_DOWN_NOTE = (
 )
 
 
-def _gate(bucket: str, *, meter_spend: bool = False):
+def _gate(bucket: str, *, meter_spend: bool = False, public: bool = False):
     """Build the perimeter dependency for one route: an anonymous per-IP meter,
     then auth, then the daily spend ceiling on costly routes, then the tiered
     per-IP window.
@@ -103,10 +103,21 @@ def _gate(bucket: str, *, meter_spend: bool = False):
     became an unthrottled endpoint for anyone holding the published demo key,
     precisely when the service was least able to defend itself. The refusal now
     charges its own bucket on the way out, which keeps both properties.
+
+    `public=True` builds the same perimeter minus the credential: the anon meter and
+    then the route's own bucket keyed on "anon". It is for surfaces D-11 keeps open on
+    purpose (the live feed), whose safety is content control rather than access
+    control — an unmetered public surface is still a free-work surface, and on a
+    connection-holding route it is the thing that defeats min_machines_running=0.
     """
 
-    async def _dependency(request: Request, presented: str | None = _API_KEY) -> Tier:
+    async def _dependency(request: Request, presented: str | None = _API_KEY) -> Tier | None:
         await enforce("auth", "anon", request)
+        if public:
+            # No tier to resolve and none to return: the caller presented nothing, and
+            # metering an anonymous bucket is the whole of this gate.
+            await enforce(bucket, "anon", request)
+            return None
         tier = _ANY_TIER(presented)
         if meter_spend:
             # Offloaded, because the cost here is acquiring Database's lock, not
@@ -136,6 +147,9 @@ def _gate(bucket: str, *, meter_spend: bool = False):
 create_gate = _gate("create")
 read_gate = _gate("read")
 process_gate = _gate("process", meter_spend=True)
+# Public (D-11) but not unmetered: /events holds a connection open for its whole idle
+# ceiling, which is exactly what a reconnect loop needs to keep the machine awake.
+events_gate = _gate("events", public=True)
 
 
 @app.get("/", include_in_schema=False)
@@ -352,15 +366,39 @@ def _snapshot_frame() -> str:
     return f"event: snapshot\ndata: {json.dumps({'type': 'snapshot', 'runs': runs})}\n\n"
 
 
-@app.get("/events")
+@app.get("/events", dependencies=[Depends(events_gate)])
 async def events() -> StreamingResponse:
     """The public live feed: every run's redacted steps, as they happen (D-11, SC-2).
 
-    No gate, deliberately — it joins /metrics and /dashboard as a public surface. Its
-    safety is content control, not access control: every frame here was built by
+    No API key, deliberately — it joins /metrics and /dashboard as a public surface.
+    Its safety is content control, not access control: every frame here was built by
     project()'s allowlist before it reached the broker, so there is nothing to
     authorise. Do not add a second serialisation path around that.
+
+    Public is not the same as unbounded, and this route is the one that makes the
+    difference matter: it holds a connection open for its whole idle ceiling, and the
+    machine may only autostop when none are held. So it is bounded twice — a per-IP
+    window on connects (events_gate above, a route dependency and never middleware,
+    because a StreamingResponse locks its status at 200 on first yield), and a hard
+    ceiling on concurrent subscribers below, since publish() is O(subscribers) on the
+    same loop that answers the container HEALTHCHECK.
     """
+    if app.state.broker.at_capacity:
+        # Refused here rather than inside the generator: this is the last point where a
+        # rejection can still be an HTTP status code. Nothing is subscribed on this
+        # path, so a refusal cannot leak a queue.
+        logger.info("events.refused_at_capacity", extra={"ctx": {}})
+        raise HTTPException(
+            503,
+            detail={
+                "error": "too_many_viewers",
+                "note": (
+                    "The live feed is at its viewer limit. Try again in a moment —"
+                    " this is a deliberate cost control on the public demo, not an outage."
+                ),
+            },
+            headers={"Retry-After": "30"},
+        )
 
     async def stream():
         # First statement of the body, and the reason is event_stream's L200-209 note:
@@ -369,7 +407,18 @@ async def events() -> StreamingResponse:
         # higher (in the handler) would leak a queue on every aborted connection, and a
         # leaked subscriber is worse than a leaked registry entry — publish keeps
         # writing to a queue nobody reads for the life of the process (CR-02).
-        q = app.state.broker.subscribe()
+        try:
+            q = app.state.broker.subscribe()
+        except BrokerUnavailable:
+            # The handler's check above passed and another connection took the last
+            # slot before this body was scheduled. The status line is already 200, so
+            # the only refusal left is in-stream: a comment (never an event — nothing
+            # here went through project()) and an immediate close. No queue exists on
+            # this path, so the finally below must not run — hence the return here
+            # rather than a flag threaded through it.
+            logger.info("events.refused_at_capacity", extra={"ctx": {"raced": True}})
+            yield ": at-capacity\n\n"
+            return
         # A viewer is NOT registered in RunRegistry (D-12). The phase-2 drain waits for
         # `active == 0`; a counted viewer would hold shutdown open for its full grace
         # period and pin the machine awake — the opposite of what this route's idle

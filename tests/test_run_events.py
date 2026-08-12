@@ -20,12 +20,19 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from fastapi import HTTPException
 
 from helpers import FakeClient, response, text_block, tool_use_block
 from relay.agent import bind_to_ticket
 from relay.config import settings
 from relay.db import connect, init_db
-from relay.events import _CLOSE_SENTINEL, RunEventBroker, RunRecorder, project
+from relay.events import (
+    _CLOSE_SENTINEL,
+    BrokerUnavailable,
+    RunEventBroker,
+    RunRecorder,
+    project,
+)
 from relay.guardrails import ToolPolicy
 from relay.main import app, events, process_ticket
 from relay.models import AgentEvent
@@ -156,6 +163,29 @@ def test_publish_is_synchronous():
     # so this is asserted on the function object, where no test body can forget it.
     assert inspect.iscoroutinefunction(RunEventBroker.publish) is False
     assert inspect.iscoroutinefunction(RunEventBroker.close) is False
+
+
+async def test_subscribe_refuses_past_the_ceiling_without_leaking_a_queue():
+    """CR-01: the subscriber set is bounded, and a refusal creates nothing.
+
+    MUTATION that must turn this red: delete the `if self.at_capacity: raise` guard from
+    subscribe() — the second call then hands back a queue and `_subs` grows to 2, which
+    is the unbounded set an anonymous reconnect loop grows for free while every paid
+    run pays O(subscribers) to publish into it.
+    """
+    broker = RunEventBroker(maxsize=2, max_subscribers=1)
+    q = broker.subscribe()
+
+    assert broker.at_capacity is True
+    with pytest.raises(BrokerUnavailable):
+        broker.subscribe()
+
+    # The refused viewer left nothing behind: no queue to publish into, no slot spent.
+    assert broker._subs == {q}
+    # And the ceiling is not a one-shot: the slot frees when the viewer leaves.
+    broker.unsubscribe(q)
+    assert broker.at_capacity is False
+    assert broker.subscribe() is not q
 
 
 async def test_unsubscribe_is_idempotent():
@@ -886,6 +916,118 @@ def test_events_heartbeats_then_idle_closes(client, monkeypatch):
     assert [c for c in chunks if not c.startswith(":")] == [chunks[0]]
     assert chunks[0].startswith("event: snapshot")
     assert len(app.state.broker._subs) == 0, "the idle-closed stream leaked a subscriber"
+
+
+# --------------------------------------------------------------------------------------
+# Code review CR-01: the public feed is bounded. /events is the only route that holds a
+# connection open for minutes, and D-11 keeps it keyless — so the two bounds below are
+# the whole of its perimeter: a per-IP window on connects, and a hard ceiling on
+# concurrent subscribers. Both are properties of the route, invisible to a broker test.
+# --------------------------------------------------------------------------------------
+
+
+def test_events_connects_are_rate_limited_per_ip(client, monkeypatch):
+    """CR-01: an anonymous reconnect loop is metered like every other public surface.
+
+    MUTATION that must turn this red: drop `dependencies=[Depends(events_gate)]` from the
+    /events route decorator — the second connect then returns 200 and the endpoint is
+    back to unlimited free connection-holding, which is how a `while :; do curl -sN
+    /events & done` loop pins the Fly machine at `started` and defeats
+    min_machines_running=0 (the milestone's own budget constraint).
+
+    Metered as a route DEPENDENCY and never middleware: BaseHTTPMiddleware buffers a
+    StreamingResponse, and the status line is locked at 200 the moment it yields.
+    """
+    monkeypatch.setattr(settings, "anon_events_limit", "1/minute")
+    # So the admitted stream closes on its own instead of holding the TestClient open
+    # for the 300s ceiling — this test is about the connect, not the stream.
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.01)
+    monkeypatch.setattr(settings, "events_idle_seconds", 0.02)
+
+    first = client.get("/events")
+    second = client.get("/events")
+
+    assert first.status_code == 200
+    assert first.headers["content-type"].startswith("text/event-stream")
+    assert second.status_code == 429, "a second connect from the same IP was not metered"
+    assert second.json()["detail"]["error"] == "rate_limited"
+    # A real status code, not an in-stream error on a 200: the refusal has to happen
+    # before the generator starts, which is why the gate is a dependency.
+    assert second.headers["Retry-After"]
+    assert second.headers["content-type"].startswith("application/json")
+    assert len(app.state.broker._subs) == 0, "a refused connect left a subscriber behind"
+
+
+def test_events_refuses_a_viewer_past_the_subscriber_cap(client, monkeypatch):
+    """CR-01: the (cap+1)th viewer is refused with a 503, and leaks no queue.
+
+    MUTATION that must turn this red: delete the `if app.state.broker.at_capacity` block
+    from the /events handler — the second connect then subscribes, `_subs` grows past
+    the cap, and both the refusal and the no-leak assertion fail. Without the cap the
+    cost of a publish is chosen by whoever opens the most connections, on the same loop
+    that answers the 3s container HEALTHCHECK.
+    """
+    monkeypatch.setattr(settings, "events_max_subscribers", 1)
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.02)
+    monkeypatch.setattr(settings, "events_idle_seconds", 5.0)
+
+    async def drive():
+        stream = await events()
+        it = stream.body_iterator
+        await _next_chunk(it)  # admitted: the snapshot arrived, so the slot is taken
+        assert len(app.state.broker._subs) == 1, (
+            "the first viewer never subscribed — the cap assertion below would pass"
+            " against a route that admits nobody"
+        )
+        with pytest.raises(HTTPException) as refused:
+            await events()
+        # The refusal allocated nothing: still exactly the one admitted viewer.
+        assert len(app.state.broker._subs) == 1, "the refused viewer leaked a queue"
+        await it.aclose()
+        return refused.value
+
+    exc = asyncio.run(drive())
+
+    assert exc.status_code == 503
+    assert exc.detail["error"] == "too_many_viewers"
+    assert exc.headers["Retry-After"]
+    assert len(app.state.broker._subs) == 0
+
+
+def test_events_refuses_in_stream_when_the_last_slot_goes_after_admission(client, monkeypatch):
+    """CR-01: losing the race for the last slot ends the stream cleanly, not with a raise.
+
+    The handler's capacity check and the generator's subscribe() are two statements with
+    a scheduling point between them, so a second connection can take the last slot in
+    between. By then the status line is locked at 200 and the only refusal left is
+    in-stream. Simulated by making subscribe() refuse an admitted connection — the exact
+    interleaving, deterministically, without racing two real connections.
+
+    MUTATION that must turn this red: drop the `try/except BrokerUnavailable` around
+    `q = app.state.broker.subscribe()` in stream() — BrokerUnavailable then propagates
+    into the SSE path as a 500-shaped crash mid-response, and the chunk assertion fails.
+    """
+    # Short, so a regression that keeps the stream open fails fast rather than sitting
+    # out the 300s ceiling.
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.01)
+    monkeypatch.setattr(settings, "events_idle_seconds", 0.05)
+
+    def taken_by_someone_else(self):
+        raise BrokerUnavailable("too many live viewers")
+
+    # The handler admitted this connection; the last slot went before the body ran.
+    monkeypatch.setattr(RunEventBroker, "subscribe", taken_by_someone_else)
+
+    async def drive():
+        stream = await events()
+        return [chunk async for chunk in stream.body_iterator]
+
+    chunks = asyncio.run(drive())
+
+    # A comment, never an event: nothing on this path went through project(), and the
+    # stream ends immediately rather than holding a connection it cannot feed.
+    assert chunks == [": at-capacity\n\n"]
+    assert len(app.state.broker._subs) == 0, "the raced refusal leaked a queue"
 
 
 def test_events_viewer_is_not_a_registered_run(client, monkeypatch):

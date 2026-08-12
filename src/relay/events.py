@@ -36,6 +36,15 @@ logger = logging.getLogger("relay.events")
 _CLOSE_SENTINEL = object()
 
 
+class BrokerUnavailable(RuntimeError):
+    """The broker will not take another subscriber right now.
+
+    Raised by subscribe() at the ceiling, never inside publish: refusing a viewer is
+    an admission decision, and the one thing this module may not do is raise into a
+    paid run's fan-out.
+    """
+
+
 class RunEventBroker:
     """Fans run frames out to every live `/events` subscriber.
 
@@ -45,14 +54,53 @@ class RunEventBroker:
     the phase-2 shutdown path waits on: a watching browser is not work to wait for.
     """
 
-    def __init__(self, *, maxsize: int | None = None) -> None:
+    def __init__(self, *, maxsize: int | None = None, max_subscribers: int | None = None) -> None:
         self._subs: set[Any] = set()
         # Defaulted from settings rather than a literal so tests can build a tiny
         # broker without monkeypatching config, and deployment can tune the real one.
         self._maxsize = settings.events_queue_maxsize if maxsize is None else maxsize
+        self._max_subscribers = max_subscribers
         self.closed = False
 
+    @property
+    def max_subscribers(self) -> int:
+        """The admission ceiling, read live rather than frozen at construction.
+
+        Unlike _maxsize — which is baked into each queue as it is created — this is
+        checked once per connect, so reading settings here means the deployed value can
+        be tuned (and a test can lower it) against the broker lifespan already built.
+        """
+        return (
+            settings.events_max_subscribers
+            if self._max_subscribers is None
+            else self._max_subscribers
+        )
+
+    @property
+    def at_capacity(self) -> bool:
+        """Whether the next subscribe() would be refused.
+
+        Read by the /events handler so the refusal is a real 503, before the
+        StreamingResponse locks its status line at 200 on the first yield.
+        """
+        return len(self._subs) >= self.max_subscribers
+
     def subscribe(self) -> asyncio.Queue:
+        """Admit one viewer, or refuse past the ceiling.
+
+        The ceiling is enforced here and not only at the handler because this is the
+        one place a queue is created: a check that lives anywhere else is a check a
+        future caller can route around, and the cost being bounded — an O(subscribers)
+        publish on the paid run's loop, plus maxsize frames each — is charged the
+        moment this returns. Refusing before the queue exists is also what keeps a
+        rejection from leaking one.
+        """
+        if self.at_capacity:
+            logger.warning(
+                "events.subscriber_limit_reached",
+                extra={"ctx": {"subscribers": len(self._subs), "limit": self.max_subscribers}},
+            )
+            raise BrokerUnavailable("too many live viewers")
         q: asyncio.Queue = asyncio.Queue(maxsize=self._maxsize)
         self._subs.add(q)
         return q

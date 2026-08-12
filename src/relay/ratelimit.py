@@ -64,6 +64,10 @@ _LIMIT_SETTINGS: dict[tuple[str, str], str] = {
     # spending the tiered allowance a global outage did not consume. Keyed by a
     # pseudo-tier: the ceiling is global, so the caller's tier is irrelevant to it.
     ("process", "outage"): "outage_process_limit",
+    # The public feed resolves no credential, so "anon" here is the only tier there is
+    # — the bucket exists so a reconnect loop against /events is bounded per IP without
+    # spending (or being hidden inside) the shared auth window above.
+    ("events", "anon"): "anon_events_limit",
 }
 
 _items: dict[tuple[str, str], RateLimitItem] = {}

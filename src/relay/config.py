@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     # keep a refusal cheaper than a retry loop. It is a separate bucket rather than the
     # tiered one so a global outage still does not spend the caller's own allowance.
     outage_process_limit: str = "10/minute"
+    # The public live feed's own per-IP bucket (phase 5). /events resolves no credential,
+    # so there is no tier to key on and this is the only per-caller bound on it. A
+    # separate bucket rather than the shared anon one because a viewer reconnecting on
+    # its idle ceiling must not spend the allowance that meters key guessing, and a feed
+    # flood must be visible in the logs as itself. Generous against real use — an
+    # EventSource reconnects once per idle close (5 min) — and small against a
+    # reconnect loop, which is the connection-holding attack that defeats scale-to-zero.
+    anon_events_limit: str = "30/minute"
 
     # Guardrails (phase 2). Prices default to Claude Sonnet 5 per-MTok rates.
     max_run_cost_usd: float = 0.50
@@ -120,6 +128,13 @@ class Settings(BaseSettings):
     # never on heartbeats — otherwise the server's own keep-alive would keep it alive
     # forever. EventSource reconnects by itself when the viewer comes back.
     events_idle_seconds: float = 300.0
+    # Hard ceiling on concurrent live viewers. publish() is O(subscribers) and runs on
+    # the loop that answers the container HEALTHCHECK, and each subscriber holds up to
+    # events_queue_maxsize frames on a 512MB machine — so an uncapped subscriber set is
+    # an attacker-chosen cost charged to every paid run. Over the cap /events refuses
+    # with a 503 rather than growing: a viewer turned away costs nothing, a viewer
+    # admitted costs every run that publishes afterwards.
+    events_max_subscribers: int = 50
 
 
 settings = Settings()
