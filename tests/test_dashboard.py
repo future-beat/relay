@@ -1540,3 +1540,273 @@ def test_a_legacy_null_origin_run_is_redacted_at_the_route(client, monkeypatch):
     assert detail["steps"], "the drill-down published nothing — a vacuous pass"
     assert secret not in json.dumps(detail), "a NULL-origin run rendered full fidelity"
     assert "ticket" not in detail
+
+
+# --- Wave 3: the load-bearing leak test ---------------------------------------------
+#
+# Four sentinels, each riding a DIFFERENT field the raw run_events payload actually
+# carries, so no single redaction closes all four and a partial fix cannot pass. Distinct
+# and improbable on purpose: a substring search for "email" would match half the corpus,
+# and a sentinel that could occur by accident makes an absence assertion mean nothing.
+DRILL_EMAIL = "drill-sentinel-4e81c7@example.com"     # -> lookup_customer input + result
+DRILL_BODY = "SENTINEL-DRILL-BODY-92fa10"             # -> create_escalation.reason
+DRILL_KEY = "sk-ant-SENTINEL-DRILL-KEY-6d0b3e"        # -> search_docs.query
+DRILL_CITE = "sentinel-fabricated-doc-7b4c92.md"      # -> guardrail.missing_citations
+
+DRILL_SENTINELS = (
+    ("customer email", DRILL_EMAIL),
+    ("ticket body", DRILL_BODY),
+    ("api key", DRILL_KEY),
+    ("fabricated citation", DRILL_CITE),
+)
+
+
+def _script_the_four_vector_run(ticket_id: int) -> None:
+    """One run that carries all four sentinels into four different payload fields.
+
+    Every vector is an OBSERVED field rather than model prose: `text` events are the
+    one thing the public branch reduces to a character count, so routing a secret only
+    through prose would make three quarters of this vacuous (Pitfall 4).
+    """
+    app.state.client = FakeClient([
+        # (1) email -> tool_use.input.email, and -> tool_result.result.customer.email
+        response([tool_use_block("lookup_customer", {"email": DRILL_EMAIL})]),
+        # (2) fake key -> tool_use.input.query
+        response([tool_use_block("search_docs", {"query": f"rotating {DRILL_KEY}"})]),
+        # (3) a citation naming a doc the run never retrieved -> the citation guard
+        # denies the reply and its guardrail event carries missing_citations.
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id,
+            "body": "Rotate the key from the dashboard; the old one stops working.",
+            "citations": [DRILL_CITE],
+        })]),
+        # (4) ticket body -> create_escalation.reason, an OBSERVED field, plus the same
+        # string in model prose so the text branch is exercised on the way past.
+        response([
+            text_block(f"The customer wrote: {DRILL_BODY}"),
+            tool_use_block("create_escalation", {
+                "ticket_id": ticket_id,
+                "reason": f"customer reported: {DRILL_BODY} — needs a human review",
+                "priority": "high",
+            }),
+        ]),
+        response([text_block("escalated")], stop_reason="end_turn"),
+    ])
+
+
+def _seed_the_looked_up_customer() -> None:
+    """A real customers row, so lookup_customer returns a whole record — email, name,
+    plan — and the drill-down has something genuine it has to drop."""
+    app.state.conn.execute(
+        "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
+        (DRILL_EMAIL, "Drill Sentinel", "enterprise", "2025-01-01"),
+    )
+    app.state.conn.commit()
+
+
+def _prove_the_sentinels_are_really_in_the_run(uid: str, body: str) -> None:
+    """Presence, twice, before any absence is claimed.
+
+    Without this half the whole test would stay green against a run that never carried
+    the secrets — the unfalsifiable form of exactly this check, and the degenerate pass
+    this project has shipped before.
+    """
+    assert "event: error" not in body
+    for name, sentinel in DRILL_SENTINELS:
+        assert sentinel in body, (
+            f"the {name} sentinel never reached the run's own owner-facing stream —"
+            " every absence assertion below would be vacuous"
+        )
+    raw = "".join(
+        r["payload"] for r in app.state.conn.execute(
+            "SELECT payload FROM run_events WHERE run_uid = ?", (uid,)
+        ).fetchall()
+    )
+    for name, sentinel in DRILL_SENTINELS:
+        # D-01: run_events is private and full-fidelity. If redaction had leaked into
+        # the PERSISTENCE path, the drill-down would be clean for the wrong reason and
+        # this phase would have nothing to drill into.
+        assert sentinel in raw, (
+            f"the {name} sentinel is missing from the raw run_events rows"
+        )
+
+
+def test_run_detail_never_leaks_a_non_demo_runs_content(client, monkeypatch):
+    """THE load-bearing test (T-06-13): a non-demo run's public drill-down discloses
+    none of the run's seeded secrets.
+
+    /runs/{uid} is keyless and reachable with any uid harvested from the public feed or
+    /metrics, over a 30-day back catalogue of other people's customer emails, ticket
+    bodies and reply text. This is the phase's security boundary, and it is the only
+    place where the raw store becomes reachable from the internet.
+
+    MUTATION that must turn this red for ALL FOUR sentinels: forward the raw payload on
+    project_run_detail's public branch — e.g. `step.update(payload)` in the tool_use
+    branch, or returning `{**step, **payload}` at the end of the loop. Every sentinel
+    rides a payload field, so one spread opens all four.
+
+    SECOND, INDEPENDENT MUTATION: pass `full_fidelity=True` unconditionally from the
+    route (or give the projector a `full_fidelity: bool = True` default and drop the
+    keyword at the call site). The redaction code is untouched and correct; the
+    AUTHORISATION is what fails, which is the failure this route can actually have.
+
+    Presence is proved TWICE first — in the run's own owner-facing stream and in the
+    raw run_events rows — and the anti-vacuity assertions at the end are what stop a
+    drill-down that leaks nothing because it publishes nothing.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    _seed_the_looked_up_customer()
+    # The OWNER key, so tickets.origin is 'owner' and the run is redacted.
+    ticket_id = _make_ticket(
+        client, DRILL_EMAIL, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
+    )
+    _script_the_four_vector_run(ticket_id)
+
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    assert resp.status_code == 200
+    uid = resp.headers["X-Relay-Run-Uid"]
+    _prove_the_sentinels_are_really_in_the_run(uid, resp.text)
+    assert _origin_of(ticket_id) == "owner"
+
+    with _anon(client) as anon:
+        detail = anon.get(f"/runs/{uid}").json()
+
+    assert detail["demo"] is False
+    steps = detail["steps"]
+
+    # Per STEP and per SENTINEL, not against one concatenated blob: a single leaking
+    # step is enough to fail this, the message names which step and which secret, and
+    # the useful answer under the mutations above is ALL the vectors that opened —
+    # a leak that closes one field and leaves three is not a fix.
+    leaks = [
+        (i, step.get("type"), step.get("tool"), name)
+        for i, step in enumerate(steps)
+        for name, sentinel in DRILL_SENTINELS
+        if sentinel in json.dumps(step)
+    ]
+    assert leaks == [], f"the drill-down's steps leaked seeded secrets: {leaks}"
+
+    # And nowhere else in the response either — the envelope carries the run summary and
+    # (on the demo branch only) ticket text, and a leak there is the same leak.
+    whole = json.dumps(detail)
+    envelope_leaks = [name for name, sentinel in DRILL_SENTINELS if sentinel in whole]
+    assert envelope_leaks == [], f"the drill-down envelope leaked: {envelope_leaks}"
+    assert "customer_email" not in whole
+
+    # Anti-vacuity: a drill-down that published nothing would satisfy every assertion
+    # above. It has to have rendered the run.
+    assert steps, "the drill-down published no steps at all"
+    assert {"tool_use", "tool_result", "guardrail"} <= {s["type"] for s in steps}
+    tools = {s.get("tool") for s in steps if s["type"] == "tool_use"}
+    assert {"lookup_customer", "search_docs", "create_escalation"} <= tools, tools
+    # The redacted shape is genuinely there: the tool NAMES and argument KEY names are
+    # published, so this is redaction rather than omission.
+    lookup = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "lookup_customer")
+    assert lookup["arg_keys"] == ["email"] and "input" not in lookup
+    guard = next(s for s in steps if s["type"] == "guardrail")
+    assert guard["guard"] == "citation" and guard["missing_count"] == 1
+    assert "missing_citations" not in guard
+
+
+def test_full_fidelity_is_server_decided(client, monkeypatch):
+    """T-06-14: no query parameter, header or cookie can widen the disclosure.
+
+    The full-fidelity flag is the one authorisation decision this phase makes, so every
+    client-reachable input is a tampering vector. The route's signature takes exactly
+    one path parameter; the flag is derived from tickets.origin and nothing else.
+
+    MUTATION that must turn this red: accept the flag from the request — e.g.
+    `async def run_detail(run_uid: str, full: bool = False)` and pass
+    `full_fidelity=(full or origin == "demo")`. The byte-comparison below then differs
+    and the sentinel assertion fires.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    _seed_the_looked_up_customer()
+    ticket_id = _make_ticket(
+        client, DRILL_EMAIL, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
+    )
+    _script_the_four_vector_run(ticket_id)
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    uid = resp.headers["X-Relay-Run-Uid"]
+    _prove_the_sentinels_are_really_in_the_run(uid, resp.text)
+
+    with _anon(client) as anon:
+        plain = anon.get(f"/runs/{uid}")
+        tampered = anon.get(
+            f"/runs/{uid}",
+            params={"full": "1", "fidelity": "raw", "demo": "true", "origin": "demo"},
+            headers={
+                "X-Demo": "1",
+                "X-Relay-Origin": "demo",
+                "X-Full-Fidelity": "true",
+                "Cookie": "origin=demo; full=1",
+            },
+        )
+
+    assert plain.status_code == tampered.status_code == 200
+    # Byte-identical, not merely equivalent: a widened response that happened to
+    # serialise to the same keys in a different order would still be a disclosure.
+    assert tampered.content == plain.content
+    for name, sentinel in DRILL_SENTINELS:
+        assert sentinel not in tampered.text, f"tampering disclosed the {name} sentinel"
+
+
+def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
+    """D-02's INVERSE: the Try-it visitor gets the raw trace of their OWN run.
+
+    Without this, "full fidelity for demo runs" is untested and can silently regress to
+    redacted-for-everyone — the drill-down would still pass every leak test above, and
+    the whole payoff of the Try-it flow would be gone with nothing noticing.
+
+    The visitor authored this content, so the raw tool inputs and outputs are the point.
+    `customer_email` is still withheld (Q3): /tickets accepts an arbitrary address from
+    anyone holding the published key, so it is the one field a visitor could use to
+    publish a third party's identifier. The ticket's own address below is a separate
+    sentinel that no tool ever sees, so its absence is a claim about the ENVELOPE and
+    not an accident of the run's script.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    _seed_the_looked_up_customer()
+    ticket_address = "demo-ticket-address-1c9e55@example.com"
+    # The DEMO key, so tickets.origin is 'demo' — the whole difference from the leak
+    # test above is which credential posted /tickets.
+    ticket_id = _demo_ticket(
+        client, ticket_address, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
+    )
+    assert _origin_of(ticket_id) == "demo"
+    _script_the_four_vector_run(ticket_id)
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    uid = resp.headers["X-Relay-Run-Uid"]
+    _prove_the_sentinels_are_really_in_the_run(uid, resp.text)
+
+    with _anon(client) as anon:
+        detail = anon.get(f"/runs/{uid}").json()
+
+    assert detail["demo"] is True
+    steps = detail["steps"]
+    lookup = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "lookup_customer")
+    # The raw input DICT, not just its key names — asserted as the value it carried.
+    assert lookup["input"] == {"email": DRILL_EMAIL}
+    lookup_result = next(
+        s for s in steps if s["type"] == "tool_result" and s["tool"] == "lookup_customer"
+    )
+    assert lookup_result["result"]["customer"]["email"] == DRILL_EMAIL
+    search = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "search_docs")
+    assert DRILL_KEY in search["input"]["query"]
+    escalation = next(
+        s for s in steps if s["type"] == "tool_use" and s["tool"] == "create_escalation"
+    )
+    assert DRILL_BODY in escalation["input"]["reason"]
+    guard = next(s for s in steps if s["type"] == "guardrail")
+    assert guard["missing_citations"] == [DRILL_CITE]
+    # Model prose is returned too, not just its length.
+    assert any(DRILL_BODY in (s.get("text") or "") for s in steps if s["type"] == "text")
+
+    # The visitor's own words back — named fields, not a spread of the ticket row.
+    assert detail["ticket"] == {
+        "subject": "API limits",
+        "body": f"my key {DRILL_KEY} stopped working. {DRILL_BODY}",
+    }
+    # ...and the email is withheld even here, by key AND by value.
+    assert "customer_email" not in json.dumps(detail)
+    assert ticket_address not in json.dumps(detail)
