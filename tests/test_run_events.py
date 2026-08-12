@@ -2049,3 +2049,79 @@ def test_events_viewer_is_not_a_registered_run(client, monkeypatch):
     # The sentinel is not a frame: the stream ends on it, it is never serialised out.
     assert [c for c in remaining if not c.startswith(":")] == []
     assert len(app.state.broker._subs) == 0
+
+
+# --------------------------------------------------------------------------------------
+# DASH-01's other clause: "the dashboard RECEIVES a live run feed". The transport is
+# proven live by test_events_delivers_a_live_run above; what is proven HERE is only that
+# the page served to a browser is wired to consume it. Stated plainly because the gap
+# matters: this suite has no DOM — no jsdom, no headless browser — so nothing below
+# executes the dashboard's JavaScript. These are regression guards on the served HTML,
+# not evidence that a browser renders a frame. Whether the feed actually appears on
+# screen is a human check, and it is the one thing that closes DASH-01 for real.
+# --------------------------------------------------------------------------------------
+
+_FEED_BEGIN = "// --- live feed (/events) — begin ---"
+_FEED_END = "// --- live feed (/events) — end ---"
+
+
+def _feed_block(html: str) -> str:
+    """The dashboard's live-feed JS, isolated from the /metrics polling around it."""
+    assert _FEED_BEGIN in html and _FEED_END in html, (
+        "the live-feed block markers are gone — every assertion below would be vacuous"
+    )
+    return html.split(_FEED_BEGIN, 1)[1].split(_FEED_END, 1)[0]
+
+
+def test_the_dashboard_subscribes_to_the_live_feed(client):
+    """DASH-01: the served page opens /events itself, and still polls for the aggregates.
+
+    MUTATION that must turn this red: point the constructor at anything else
+    (`new EventSource("/metrics")`), or delete the snapshot listener, or drop a frame
+    type from FEED_TYPES — every frame /events writes carries an `event:` name, so a
+    page listening only for the default `message` event receives nothing at all and a
+    type missing from that list is a step that silently never renders.
+    """
+    html = client.get("/dashboard").text
+    block = _feed_block(html)
+
+    assert 'new EventSource("/events")' in block
+    # D-14: the connect frame has its own event name and is not one of the run types.
+    assert 'es.addEventListener("snapshot"' in block
+    # Every type project() can emit, asserted against the SUBSCRIPTION list itself and
+    # not against the block at large: each of these names also appears in the renderer's
+    # dispatch, so a search over the whole block stayed green with a type dropped from
+    # the listeners — a step that is rendered by code nothing ever calls.
+    subscribed = block.split("const FEED_TYPES = [", 1)[1].split("]", 1)[0]
+    for frame_type in ("usage", "resolution", "error", "tool_use", "tool_result",
+                       "guardrail", "notice", "text"):
+        assert f'"{frame_type}"' in subscribed, f"the page never listens for {frame_type}"
+    # CR-03 exists so concurrent runs stay distinguishable. This asserts only that the
+    # page READS the identity it stamps — that it GROUPS by it is DOM behaviour no grep
+    # can see, and removing the grouping lookup while keeping the label leaves this
+    # green. Named as the weak guard it is rather than left to look like proof.
+    assert "f.run_uid" in block and "f.ticket_id" in block
+    # D-09 closes an idle stream on purpose. The page must treat the reconnect as
+    # normal, so the CLOSED readyState is the only branch allowed to look like a fault.
+    assert "EventSource.CLOSED" in block
+    # The live feed ADDS to the dashboard; it does not replace the aggregate numbers.
+    assert "setInterval(refresh, 5000)" in html
+
+
+def test_the_dashboard_feed_renders_frame_values_as_text_never_html(client):
+    """SC-3/INFO-1: `tool` is a model-chosen string that reaches this page verbatim.
+
+    project() is an allowlist of scalars with one exception — the tool NAME, which the
+    model chooses and which the verifier published through the feed unchanged as
+    `PROBE_HALLUCINATED_TOOL_NAME`. Under prompt injection that is the one channel by
+    which model-controlled text reaches a browser, so the feed's renderer must never
+    interpolate a frame value as markup.
+
+    MUTATION that must turn this red: change `line.textContent = describe(f)` to
+    `line.innerHTML = describe(f)` in DASHBOARD_HTML.
+    """
+    block = _feed_block(client.get("/dashboard").text)
+
+    assert "textContent" in block
+    for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval("):
+        assert sink not in block, f"the live feed renders frame values through {sink}"

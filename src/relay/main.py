@@ -523,6 +523,13 @@ th, td { text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; 
         padding: .8rem 1.2rem; margin-bottom: 1.5rem; font-size: .85rem; }
 .demo code { background: #f4f4f4; padding: .1rem .3rem; border-radius: 4px; }
 .demo em { color: #666; font-style: normal; }
+h2 { font-size: 1rem; margin: 2rem 0 .4rem; }
+#feed-status { color: #666; font-size: .8rem; }
+#feed { list-style: none; padding: 0; margin: .6rem 0 0; font-size: .85rem; }
+#feed li { border: 1px solid #eee; border-radius: 6px; padding: .4rem .7rem;
+           margin: 0 0 .4rem; }
+#feed b { display: block; margin-bottom: .2rem; }
+#feed .step { color: #444; }
 </style></head><body>
 <h1>Relay — agent runs</h1>
 <div class="demo">
@@ -531,6 +538,8 @@ Try it yourself — this key is published on purpose:
 <em>Deliberately limited: 5 runs/hour per IP, and the demo caps Claude spend at $5/day.</em>
 </div>
 <div class="cards" id="cards"></div>
+<h2>Live feed <span id="feed-status">connecting</span></h2>
+<ul id="feed"></ul>
 <table id="runs"><thead><tr><th>id</th><th>ticket</th><th>outcome</th><th>steps</th>
 <th>tokens in/out</th><th>cost</th><th>ms</th><th>at</th></tr></thead><tbody></tbody></table>
 <script>
@@ -547,6 +556,84 @@ async function refresh() {
      <td>${r.duration_ms}</td><td>${r.created_at}</td></tr>`).join("");
 }
 refresh(); setInterval(refresh, 5000);
+
+// --- live feed (/events) — begin ---
+// The aggregate numbers above still poll; this ADDS the live half DASH-01 names.
+// Everything below renders frames off the PUBLIC feed. They are allowlisted by
+// project(), but `tool` is a model-chosen string that reaches this page verbatim,
+// so every value from a frame is written with textContent and never as markup.
+// That is the one rule this block may not break — a test greps this block for the
+// markup sinks and fails if one appears.
+const FEED_TYPES = ["usage", "resolution", "error", "tool_use", "tool_result",
+                    "guardrail", "notice", "text"];
+const feedEl = document.getElementById("feed");
+const feedStatus = document.getElementById("feed-status");
+const runNodes = new Map();
+
+function describe(f) {
+  if (f.type === "tool_use") return "-> " + f.tool;
+  if (f.type === "tool_result") return (f.is_error ? "x " : "<- ") + f.tool +
+    (f.denied_by ? " denied by " + f.denied_by : "");
+  if (f.type === "guardrail") return "guardrail " + f.guard + " -> " + f.action;
+  if (f.type === "usage") return "step " + f.steps + " · $" + f.cost_usd;
+  if (f.type === "resolution") return "resolved via " + f.via + " · $" + f.cost_usd;
+  if (f.type === "error") return "error · " + f.reason;
+  if (f.type === "notice") return "notice · " + f.kind + " · " + f.tool;
+  return f.type;
+}
+
+// Grouped by run_uid, which is why CR-03 stamps it: several runs are in flight at
+// once on a live demo, and a flat list interleaves them into nonsense.
+function runNode(f) {
+  let node = runNodes.get(f.run_uid);
+  if (!node) {
+    node = document.createElement("li");
+    node.dataset.uid = f.run_uid;
+    const head = document.createElement("b");
+    head.textContent = "ticket #" + f.ticket_id + " · run " +
+                       String(f.run_uid).slice(0, 8);
+    node.append(head);
+    runNodes.set(f.run_uid, node);
+    feedEl.prepend(node);
+    while (feedEl.children.length > 6) {
+      const gone = feedEl.lastElementChild;
+      runNodes.delete(gone.dataset.uid);
+      gone.remove();
+    }
+  }
+  return node;
+}
+
+function onFrame(ev) {
+  const f = JSON.parse(ev.data);
+  const line = document.createElement("div");
+  line.className = "step";
+  line.textContent = describe(f);
+  runNode(f).append(line);
+}
+
+const es = new EventSource("/events");
+es.addEventListener("open", () => { feedStatus.textContent = "live"; });
+// D-14: the runs already in flight when this tab connects, so a viewer joining a
+// quiet moment mid-run sees them rather than a blank list until the next step.
+es.addEventListener("snapshot", ev => {
+  const runs = JSON.parse(ev.data).runs || [];
+  feedStatus.textContent = runs.length
+    ? "live · in flight: " + runs.map(r => "#" + r.ticket_id).join(", ")
+    : "live · nothing running";
+});
+// Every frame carries an `event:` name, so a page listening only for the default
+// `message` event would receive nothing at all.
+FEED_TYPES.forEach(t => es.addEventListener(t, onFrame));
+// D-09 closes an idle stream on purpose and EventSource reconnects on its own, so a
+// disconnect is this page's normal resting state, not a fault. No console noise and
+// no error styling unless the browser has genuinely given up (readyState CLOSED).
+es.onerror = () => {
+  feedStatus.textContent = es.readyState === EventSource.CLOSED
+    ? "feed closed — reload to watch again"
+    : "live · reconnecting";
+};
+// --- live feed (/events) — end ---
 </script></body></html>"""
 
 
