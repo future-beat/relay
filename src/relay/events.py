@@ -260,9 +260,18 @@ def project(event: AgentEvent) -> dict | None:
         return {"type": t, "guard": d.get("guard"), "tool": d.get("tool"),
                 "action": d.get("action")}
     if t == "notice":
+        # `result_count`, not `results`, and coerced rather than forwarded (WR-02). Every
+        # other field this function publishes is a scalar or an enum; this was the one
+        # forward of unconstrained shape. agent.py sets it to a len() today, but nothing
+        # here required that: the natural future edit ("show WHICH results we fell back
+        # to") makes it the list, and this branch would then publish each hit's `text`
+        # and `heading` — the retrieved prose _project_tool_result strips four lines
+        # above — to an unauthenticated endpoint, with no test failing. The name now
+        # states the shape and the coercion enforces it: anything but an int is dropped.
+        count = d.get("results")
         return {"type": t, "kind": d.get("kind"), "tool": d.get("tool"),
                 "retrieval_mode": d.get("retrieval_mode"), "cause": d.get("cause"),
-                "results": d.get("results")}
+                "result_count": count if isinstance(count, int) else None}
     if t == "text":
         # The viewer sees that the model spoke, not what it said: prose restates
         # whatever the model just read, which includes the customer's own details.

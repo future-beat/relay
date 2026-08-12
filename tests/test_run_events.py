@@ -409,10 +409,48 @@ def test_project_keeps_the_cost_and_outcome_the_dashboard_runs_on():
     assert project(AgentEvent(type="error", data={"reason": "budget_exceeded"}))["reason"] == (
         "budget_exceeded"
     )
-    assert project(AgentEvent(type="notice", data={
+    notice = project(AgentEvent(type="notice", data={
         "kind": "retrieval_degraded", "tool": "search_docs",
         "retrieval_mode": "keyword", "cause": "voyage_failed", "results": 3,
-    }))["cause"] == "voyage_failed"
+    }))
+    assert notice["cause"] == "voyage_failed"
+    assert notice["result_count"] == 3
+
+
+def test_project_notice_publishes_a_count_and_never_the_results():
+    """WR-02: the one field that used to forward whatever the notice carried.
+
+    agent.py sets `results` to a len() today, so the leak is latent rather than live —
+    but nothing in project() required an int, and the natural future edit ("show WHICH
+    results we degraded to") makes it the list of hits. This pins the shape at the
+    boundary instead of trusting the producer: the frame's field is a COUNT, and a
+    non-int is dropped.
+
+    MUTATION that must turn this red: restore `"results": d.get("results")` in the
+    notice branch of project() — the retrieved prose and headings ride straight out to
+    the unauthenticated /events feed and the sentinel assertion below fails.
+    """
+    leaked = project(AgentEvent(type="notice", data={
+        "kind": "retrieval_degraded",
+        "tool": "search_docs",
+        "retrieval_mode": "keyword",
+        "cause": "index_unavailable",
+        # The shape one line in agent.py away: the hits themselves, prose included.
+        "results": [
+            {"doc": "billing.md", "heading": "Refunds",
+             "text": "PROSE_SENTINEL — refunds are issued within 14 days", "score": 0.82},
+        ],
+    }))
+
+    assert "PROSE_SENTINEL" not in json.dumps(leaked), (
+        "a list-shaped notice published the retrieved prose the tool_result branch"
+        " goes out of its way to strip"
+    )
+    assert "results" not in leaked, "the unconstrained field name is back"
+    assert leaked["result_count"] is None, "a non-int count was forwarded rather than dropped"
+    # Still useful for the shape it was designed for: the degradation is legible.
+    assert leaked["cause"] == "index_unavailable"
+    assert leaked["retrieval_mode"] == "keyword"
 
 
 def _seed_ticket(db) -> int:
