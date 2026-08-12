@@ -791,3 +791,187 @@ def test_cited_is_computed_against_the_accepted_reply(conn, registry):
         ("api.md#rate-limits", False),         # cited only by the DENIED attempt
         ("SSO.md#SSO-Enterprise", True),       # licensed side needed normalising
     ]
+
+
+# Two docs, one query, keyword mode: "refunds and rate limits" retrieves api.md AND
+# billing.md, so a run can cite one and leave the other retrieved-but-not-cited. A
+# single-hit query would make the "every other chunk is False" half vacuous.
+TWO_DOC_QUERY = "refunds and rate limits"
+
+
+def _run_events_from_disk(type_filter: str | None = None) -> list:
+    """This run's committed rows, re-opened from the file the app wrote them to."""
+    reopened = connect(settings.db_path)
+    try:
+        run_uid = reopened.execute("SELECT run_uid FROM runs").fetchone()["run_uid"]
+        rows = reopened.execute(
+            "SELECT seq, type, payload, elapsed_ms, created_at FROM run_events"
+            " WHERE run_uid = ? ORDER BY seq",
+            (run_uid,),
+        ).fetchall()
+    finally:
+        reopened.close()
+    return [r for r in rows if type_filter is None or r["type"] == type_filter]
+
+
+def _licensed_ids(hit: dict) -> set[str]:
+    """Every id one search_docs hit licenses — agent.py:400-405, restated in the test.
+
+    Restated rather than imported: if the projector and the test called one helper,
+    a change to that helper would move both and the agreement would be with itself.
+    """
+    return {hit["doc"], hit["id"], *hit["anchors"]}
+
+
+def test_cited_vs_not_matches_the_citation_guards_accept_set(client, capture_frames,
+                                                             monkeypatch):
+    """The drill-down's grounding highlight and the guard's decision provably agree.
+
+    Driven as a REAL run through the recorder rather than hand-built rows, so the
+    payload shapes are the ones production actually writes, and the guard is the real
+    guard: the reply cites a retrieved id in different case and whitespace, and the
+    run must reach `resolution via send_reply` — i.e. the control ACCEPTED it. The
+    drill-down then has to say the same thing about the same reply.
+
+    MUTATION that must turn this red: compare raw strings instead of normalise_citation
+    on the CITED side. The citation the guard accepted renders as not-cited — an audit
+    view contradicting the control it audits, which is worse than no audit view because
+    a reader cannot tell which of the two is lying.
+
+    SECOND MUTATION: count the DENIED attempt's citations. The run below makes a first
+    send_reply that cites a genuinely retrieved id (api.md) but names another ticket,
+    so the binding guard refuses it — api.md then renders cited, claiming grounding for
+    a reply that was never sent.
+
+    STATED PLAINLY: this test does NOT pin normalise_citation on the LICENSED side.
+    Real retrieval mints ids that are already lowercase, so a run cannot produce a
+    licensed id that needs normalising; that half is pinned by the unit test above,
+    whose legacy hit carries an id an older build could have written. I ran the
+    licensed-side mutation against this test and it passed.
+
+    The expected set is derived from the run's OWN search results rather than
+    hardcoded, so a change in kb/ content cannot quietly make this vacuous, and the
+    retrieved set is asserted non-empty (and multi-doc) before anything is claimed
+    about cited-vs-not.
+    """
+    # A real VOYAGE_API_KEY sits in .env; pinned to None so retrieval runs in keyword
+    # mode and this test is free and deterministic by construction.
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "refunds and my rate limits?")
+    app.state.client = FakeClient([
+        response([tool_use_block("search_docs", {"query": TWO_DOC_QUERY})]),
+        # A DENIED attempt that cites a real retrieved id. The citation guard would
+        # have accepted it; the ticket binding refuses the call for another reason —
+        # which is the point: "cited" must mean "in a reply that was actually sent",
+        # not "in something the model typed".
+        response([tool_use_block("send_reply", {
+            "ticket_id": 999_999,
+            "body": "Your rate limit is per-minute — see the API doc.",
+            "citations": ["api.md#rate-limits"],
+        }, id="toolu_denied")]),
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id,
+            "body": "Refunds take 14 days and your rate limit is per-minute.",
+            # The same id the run retrieved, retyped by the model in another case with
+            # stray whitespace. The guard accepts it; so must the drill-down.
+            "citations": ["  BILLING.md#Refunds\n"],
+        }, id="toolu_ok")]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    body, _frames = asyncio.run(capture_frames(ticket_id))
+
+    # The CONTROL's verdicts, both of them: one send_reply refused, one accepted, and
+    # the run resolved by replying. Without this the agreement below would be between
+    # two failures.
+    assert "event: error" not in body
+    assert "event: resolution" in body
+    rows = _run_events_from_disk()
+    parsed = [(r, json.loads(r["payload"])) for r in rows]
+    send_results = [
+        d for r, d in parsed if r["type"] == "tool_result" and d["tool"] == "send_reply"
+    ]
+    assert [d["is_error"] for d in send_results] == [True, False], send_results
+    assert send_results[0]["result"]["denied_by"] == "ticket_binding"
+
+    search_payload = next(
+        d for r, d in parsed if r["type"] == "tool_result" and d["tool"] == "search_docs"
+    )
+    hits = search_payload["result"]["results"]
+    assert len(hits) >= 2, f"the query retrieved {len(hits)} doc(s) — nothing to contrast"
+
+    # The guard's own accept-set, rebuilt from this run's results exactly as agent.py
+    # builds it, and the citations the ACCEPTED reply carried. Derived by walking the
+    # rows here rather than by calling the projector: an agreement computed by the
+    # thing under test is an agreement with itself.
+    accept_set = {normalise_citation(i) for hit in hits for i in _licensed_ids(hit)}
+    sends = [
+        d for r, d in parsed
+        if r["type"] in ("tool_use", "tool_result") and d["tool"] == "send_reply"
+    ]
+    citations = next(
+        use["input"]["citations"]
+        for use, result in zip(sends[0::2], sends[1::2], strict=True)
+        if not result["is_error"]
+    )
+    accepted_citations = {normalise_citation(c) for c in citations}
+    assert accepted_citations <= accept_set, "the guard would not have accepted these"
+    expected_cited = {
+        hit["id"] for hit in hits
+        if {normalise_citation(i) for i in _licensed_ids(hit)} & accepted_citations
+    }
+    assert expected_cited, "no retrieved chunk was cited — the assertion below is vacuous"
+    assert expected_cited != {hit["id"] for hit in hits}, "every chunk was cited"
+
+    steps = project_run_detail(
+        rows,
+        full_fidelity=False,
+        known_tools=_known_tools(app.state.registry),
+    )
+    search_step = next(
+        s for s in steps if s["type"] == "tool_result" and s["tool"] == "search_docs"
+    )
+    assert {r["id"] for r in search_step["results"] if r["cited"]} == expected_cited
+    assert {r["id"] for r in search_step["results"] if not r["cited"]} == (
+        {hit["id"] for hit in hits} - expected_cited
+    )
+
+
+def test_cited_is_false_when_no_reply_was_accepted(client, capture_frames, monkeypatch):
+    """An escalating run marks every retrieved chunk not-cited, and does not raise.
+
+    The empty-cited-set path is a legible state, not an error: a run can search and
+    then escalate, and "retrieved, not cited" is exactly the true thing to render. A
+    projector that treated the missing send_reply as an exceptional case would 500 the
+    drill-down for every escalation in the back catalogue — which is the outcome the
+    demo shows off most.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "refunds and my rate limits?")
+    app.state.client = FakeClient([
+        response([tool_use_block("search_docs", {"query": TWO_DOC_QUERY})]),
+        response([tool_use_block("create_escalation", {
+            # >= 20 chars: CreateEscalationInput.reason has a min_length, and a
+            # validation failure here would end the run "ended_without_action" and
+            # quietly turn this into a test about a broken run.
+            "ticket_id": ticket_id,
+            "reason": "needs a human to review the refund window",
+            "priority": "high",
+        })]),
+        response([text_block("escalated")], stop_reason="end_turn"),
+    ])
+
+    body, _frames = asyncio.run(capture_frames(ticket_id))
+    assert "event: error" not in body
+    rows = _run_events_from_disk()
+
+    steps = project_run_detail(
+        rows, full_fidelity=False, known_tools=_known_tools(app.state.registry)
+    )
+    search_step = next(
+        s for s in steps if s["type"] == "tool_result" and s["tool"] == "search_docs"
+    )
+    # Non-empty first: "nothing is cited" over an empty result list proves nothing.
+    assert search_step["results"], "the run retrieved nothing"
+    assert all(r["cited"] is False for r in search_step["results"])
+    assert next(s for s in steps if s["type"] == "resolution")["via"] == "create_escalation"
