@@ -2517,3 +2517,199 @@ def test_try_it_renders_disabled_without_a_demo_key(client, monkeypatch):
     assert ".disabled = true" in code, "the form is never disabled"
     # Copy, not silence: a dead button with no explanation reads as a broken page.
     assert "TRY_CONFIGURED" in code
+
+
+def test_try_it_streams_with_fetch_not_eventsource(client):
+    """The run is streamed with `fetch` + a frame-buffered SSE parse, never EventSource.
+
+    `EventSource` takes only `(url, {withCredentials})` — it cannot POST and cannot set a
+    header [MDN], so it can neither start a run nor present `X-API-Key`. And the frames
+    must be split on a `\\n\\n` BUFFER rather than matched by a regex over the body: SSE
+    frames land split across chunk boundaries, and a whole-body regex only produces
+    anything once the stream has ended, which is precisely the thing being demonstrated.
+
+    MUTATION that must turn this red: replace the fetch with
+    `new EventSource("/tickets/" + id + "/process")`. It is a GET with no key, so the
+    perimeter answers 401 and the demo silently never runs — while the page still looks
+    like it is trying.
+
+    SECOND MUTATION: buffer the whole body and split it once at the end
+    (`(await res.text()).split("\\n\\n")`) — the trace appears all at once when the run
+    finishes, which is a transcript, not a live stream.
+
+    WEAK BY CONSTRUCTION: grep over the served page. Nothing here opens a stream or
+    parses a frame; the DOM-level proof is 06-07's human checkpoint.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _TRY))
+
+    # The same two calls scripts/demo.sh makes, both carrying the published key.
+    assert 'fetch("/tickets"' in code, "the form never creates a ticket"
+    assert '"/process"' in code, "the form never runs the ticket it created"
+    assert code.count('"X-API-Key": DEMO_KEY') == 2, (
+        "both calls must present the published demo key"
+    )
+    assert code.count('method: "POST"') == 2
+
+    # The streamed read, and the buffer that makes it a stream.
+    assert "res.body.getReader()" in code
+    assert "TextDecoder" in code and "{ stream: true }" in code
+    assert '"\\n\\n"' in code, "frames are not split on a blank-line boundary"
+    assert "buffer.indexOf" in code, "there is no frame BUFFER — a split alone loses tails"
+    assert 'startsWith("event: ")' in code and 'startsWith("data: ")' in code
+
+    # ...and no EventSource on this path. Exactly one survives on the whole page: the
+    # ambient live feed's, which is a GET of a public route and needs no key.
+    assert "EventSource" not in code, "the try-it path reached for EventSource"
+    assert html.count("new EventSource") == 1
+    assert "res.text()" not in code, "the body is read whole instead of streamed"
+
+
+def test_try_it_deep_links_its_own_run(client):
+    """The submitter's run is identified from the SERVER's header and deep-linked.
+
+    Two views of one run are on this page at the same time: the `fetch` stream above is
+    the OWNER-facing full-fidelity stream, and the ambient `/events` feed carries the
+    REDACTED projection of the same run. Without the uid the page renders one run twice,
+    at two fidelities, with nothing connecting them — and cannot open its own trace,
+    which is D-02's entire payoff.
+
+    MUTATION that must turn this red: drop the `X-Relay-Run-Uid` read. The stream still
+    renders, the feed still shows the run, and the connection between them — plus the
+    "see the full trace" control — is silently gone.
+
+    SECOND MUTATION (T-06-30, spoofing): badge the feed from a client-chosen id (a
+    `crypto.randomUUID()` or the ticket id) instead of the uid the server returned to
+    THIS submitter — the "your run" badge stops meaning anything.
+
+    WEAK BY CONSTRUCTION: grep over the served page; no DOM, no header, no click.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _TRY))
+
+    assert 'res.headers.get("X-Relay-Run-Uid")' in code, (
+        "the page never learns which run is its own"
+    )
+    # The deep link into the drill-down 06-06 shipped — full fidelity, because the
+    # ticket was CREATED with the demo key.
+    assert "openDrill(uid)" in code, "the visitor cannot open their own run's trace"
+    # The badge on the public feed, keyed on the feed's own per-run node map.
+    assert "runNodes.get(uid)" in code, "the visitor's run is never badged in the feed"
+    assert "your run" in html, "the badge carries no copy"
+    # ...and the run stays IN the feed: seeing the same run redacted below and in full
+    # above is the security story rendered as an interface.
+    assert "remove()" not in code and "delete(" not in code, (
+        "the visitor's run is hidden from the public feed instead of badged in it"
+    )
+    # The identity is the server's, never the client's.
+    for invented in ("crypto.randomUUID", "Math.random", "Date.now()"):
+        assert invented not in code, f"the run identity is minted client-side with {invented}"
+
+
+def test_try_it_renders_refusals_as_designed_states(client):
+    """D-08: 429 and 503 render as the cost control working, in the SERVER's own words.
+
+    The rate limiter and the budget ceiling both write product copy into their refusal
+    bodies (`detail.note`), and the budget one also computes the reset instant
+    (`detail.resets_at`, from `budget_snapshot`). The page renders those strings and
+    invents neither. Auth refusals carry a PLAIN STRING detail instead of an object, so
+    both shapes are handled — a renderer that only reads `detail.note` shows a blank box
+    on the deployment that configured no keys.
+
+    MUTATION that must turn this red: recompute the reset in the browser
+    (`new Date().setUTCHours(24, 0, 0, 0)`) instead of rendering `detail.resets_at` —
+    a second, disagreeing answer to "when does this reset?" on the one page whose entire
+    job is credibility, and rendered in the visitor's local timezone at that.
+
+    SECOND MUTATION: render the refusal through the error path — `alert(...)` or the
+    same styling as a failed fetch. It then reads as a fault, which is the exact
+    misreading D-08 exists to prevent: the cap is the feature being demonstrated.
+
+    WEAK BY CONSTRUCTION: grep over the served page. The SERVER half of this contract —
+    that those fields exist and carry that copy — is asserted for real by
+    `test_refusals_render_as_product_copy` below.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _TRY))
+
+    # Branch on the response, on BOTH calls: /tickets can 429 too (demo_create_limit).
+    assert code.count("if (!res.ok)") + code.count("if (!created.ok)") >= 2, (
+        "a refusal on one of the two calls is unhandled"
+    )
+    assert "429" in code and "503" in code, "the two refusal statuses are not distinguished"
+
+    # Both detail shapes: an object for the perimeter's refusals, a plain string for auth.
+    assert 'typeof detail === "string"' in code, "a string detail renders as blank"
+    assert "detail.note" in code, "the server's own copy is not what the page shows"
+
+    # The reset instant is the server's ISO string, rendered verbatim.
+    assert "detail.resets_at" in code
+    for recompute in ("setUTCHours", "getTimezoneOffset", "toISOString", "86400",
+                      "new Date("):
+        assert recompute not in code, f"midnight is re-derived in JS with {recompute}"
+
+    # A designed state, not an error toast.
+    assert 'class: "refusal"' in code
+    assert ".refusal {" in html, "the refusal has no styling of its own"
+    for shout in ("alert(", "console.error"):
+        assert shout not in code, f"a refusal is reported as a fault with {shout}"
+
+
+def test_refusals_render_as_product_copy(client, monkeypatch):
+    """The SERVER half of D-08: every field the page renders is really on the wire.
+
+    The grep test above pins what the page READS. This drives the real routes and pins
+    what they SEND — `error`, a non-empty `note`, and for the budget refusal an ISO
+    `resets_at` that actually parses. Between them, a rename on either side is caught:
+    the page's refusal box would otherwise go quietly blank in production, on the exact
+    path a visitor hits when the demo is doing its job.
+
+    No Anthropic call is made or needed: both 429s are raised by the perimeter before
+    any run starts (the ticket id below does not exist, and the gate charges its bucket
+    before the route body decides that), and the 503 is raised from recorded spend.
+
+    MUTATION that must turn this red on the server side: drop `note` from either refusal
+    detail, or return the budget's reset as a bare `"midnight UTC"` string instead of an
+    ISO timestamp — the page has nothing to render and no instant to show.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket = {
+        "customer_email": "visitor@example.com",
+        "subject": "refusals are a designed state",
+        "body": "the demo refuses in its own words",
+    }
+
+    # 1. POST /tickets — the create allowance (demo_create_limit, 20/hour in production).
+    monkeypatch.setattr(settings, "demo_create_limit", "1/hour")
+    assert client.post("/tickets", json=ticket, headers=DEMO_HEADERS).status_code == 201
+    refused = client.post("/tickets", json=ticket, headers=DEMO_HEADERS)
+    assert refused.status_code == 429
+    detail = refused.json()["detail"]
+    assert detail["error"] == "rate_limited"
+    assert detail["note"].strip(), "the create refusal carries no copy to render"
+    assert detail["retry_after_seconds"] >= 1
+
+    # 2. POST /process — the binding constraint (demo_process_limit, 5/hour).
+    monkeypatch.setattr(settings, "demo_process_limit", "1/hour")
+    assert client.post("/tickets/9999/process", headers=DEMO_HEADERS).status_code == 404
+    refused = client.post("/tickets/9999/process", headers=DEMO_HEADERS)
+    assert refused.status_code == 429
+    detail = refused.json()["detail"]
+    assert detail["error"] == "rate_limited"
+    assert detail["note"].strip(), "the process refusal carries no copy to render"
+
+    # 3. POST /process — the daily ceiling. Checked BEFORE the tiered window, so it is
+    #    what a visitor meets once the demo has spent its day.
+    record_run(
+        app.state.conn, ticket_id=1, model="m", duration_ms=1, steps=1,
+        input_tokens=1, output_tokens=1, cost_usd=settings.max_daily_cost_usd,
+        outcome="send_reply",
+    )
+    refused = client.post("/tickets/9999/process", headers=DEMO_HEADERS)
+    assert refused.status_code == 503
+    detail = refused.json()["detail"]
+    assert detail["error"] == "daily_budget_exhausted"
+    assert detail["note"].strip(), "the budget refusal carries no copy to render"
+    # An ISO instant the page can print verbatim — never a phrase the browser would
+    # have to parse, and never a number it would have to convert.
+    assert datetime.fromisoformat(detail["resets_at"]).tzinfo is not None
