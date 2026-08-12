@@ -2437,8 +2437,10 @@ def test_try_it_offers_three_editable_examples(client):
 
     # Three, and exactly three — a fourth chip pointing at an unseeded address would
     # give the agent a customer lookup that always misses.
-    assert code.count("customer_email:") == 3, (
-        "the try-it block does not carry exactly three examples"
+    # Counted in the PINNED form (`customer_email: "…"`) so the one dynamic use — the
+    # request body's `customer_email: tryEmail` — cannot pad the count.
+    assert code.count('customer_email: "') == 3, (
+        "the try-it block does not carry exactly three pinned examples"
     )
     for label in ("billing", "technical", "how-to"):
         assert label in code, f"the {label} example is not offered"

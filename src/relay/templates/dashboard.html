@@ -65,6 +65,29 @@ dialog#drill::backdrop { background: rgba(0, 0, 0, .35); }
 .chunk.uncited .tag { color: #888; }
 .raw { margin: .3rem 0 0; color: #444; font-size: .78rem; }
 .raw .line { word-break: break-all; }
+#try-it { border: 1px solid #ccc; border-radius: 10px; padding: .2rem 1.2rem 1rem; }
+#try-examples .chip { cursor: pointer; border: 1px solid #ddd; }
+#try-examples .chip.on { background: #444; color: #fff; border-color: #444; }
+.try-fields { display: grid; gap: .2rem; margin: .6rem 0 .2rem; }
+.try-fields label { color: #666; font-size: .75rem; }
+.try-fields input, .try-fields textarea { font: inherit; font-size: .85rem; width: 100%;
+    box-sizing: border-box; padding: .35rem .5rem; border: 1px solid #ccc;
+    border-radius: 6px; }
+.try-note { color: #666; font-size: .75rem; margin: .2rem 0 .6rem; }
+.try-bar { display: flex; gap: .6rem; align-items: center; font-size: .8rem; }
+.try-bar button { border: 1px solid #444; background: #444; color: #fff;
+    border-radius: 6px; padding: .35rem .9rem; }
+.try-bar button[disabled] { background: #999; border-color: #999; cursor: default; }
+#try-state { color: #666; }
+#try-stream { margin-top: .6rem; font-size: .8rem; }
+#try-stream .step { color: #333; border-left: 2px solid #e2e2e2; padding: .05rem .6rem; }
+.refusal { border: 1px solid #d8c48a; border-left: 4px solid #b8912f; background: #fdf8ec;
+    border-radius: 8px; padding: .6rem .9rem; }
+.refusal b { display: block; margin-bottom: .2rem; }
+.refusal p { margin: .2rem 0; }
+.refusal .resets { color: #665; }
+#feed-list li.mine { border-color: #444; }
+#feed-list .mine-tag { color: #036; font-size: .75rem; }
 </style></head><body>
 <header>
 <h1>Relay — agent runs</h1>
@@ -77,7 +100,27 @@ Try it yourself — this key is published on purpose:
 </div>
 </header>
 
-<!-- section#try-it is added by its own plan (06-07); nothing here builds it. -->
+<section id="try-it">
+<h2>Try it — run a real ticket</h2>
+<p class="sub">Pick an example, edit it if you like, and send it. This runs for real
+against Claude with the key above — no sandbox, no canned answer — and the trace stays
+publicly readable for 30 days. Capped at 5 runs/hour per IP and a daily spend ceiling;
+if it refuses, that is the cost control, not a fault.</p>
+<div class="chips" id="try-examples"></div>
+<div class="try-fields">
+<label for="try-subject">subject</label>
+<input id="try-subject" type="text" autocomplete="off">
+<label for="try-body">what the customer wrote</label>
+<textarea id="try-body" rows="3"></textarea>
+</div>
+<p class="try-note" id="try-who"></p>
+<div class="try-bar">
+<button id="try-send" type="button">send it</button>
+<span id="try-state"></span>
+<span id="try-actions"></span>
+</div>
+<div id="try-stream"></div>
+</section>
 
 <section id="summary">
 <h2>Summary</h2>
@@ -645,6 +688,126 @@ function renderRawDetail(s, host) {
   host.append(box);
 }
 // --- drill-down (/runs/{uid}) — end ---
+
+// --- try it — begin ---
+// DASH-05 / D-06 / D-07: the "and run it themselves" half of this page. Three prefilled
+// examples, editable before sending, submitted with the PUBLISHED demo key — the same
+// two calls scripts/demo.sh makes, against the same perimeter, at the same cost. Not a
+// dry run: the reply or the escalation landing in the drill-down is the payoff, and a
+// demo that only pretends to run is not evidence of anything.
+const DEMO_KEY = "__RELAY_DEMO_KEY__";
+// The page is served to anonymous visitors on a deployment that may have configured no
+// keys at all (two shipped tests do exactly that), and the whole page is one script: a
+// throw during setup here would take the feed, the charts and the drill-down with it.
+const TRY_CONFIGURED = DEMO_KEY !== "(not configured)";
+
+// Lifted verbatim from evals/golden.jsonl (refund-monthly, rate-limits-pro,
+// password-reset) — already grounded in kb/, already covering both terminal actions
+// (one escalation, two replies), and already measured by the eval suite. A paraphrase
+// here would demo something nothing verifies.
+//
+// The address is PINNED per example and there is deliberately no field for it. The
+// seeded customers are the only rows lookup_customer can find, and — because a
+// demo-origin run's drill-down is full fidelity (D-02) and publicly readable for the
+// retention window — a typed address would let one visitor publish another person's
+// identifier into a 30-day world-readable record, with this form as the mechanism
+// (T-06-27).
+const TRY_EXAMPLES = [
+  {
+    label: "billing",
+    expect: "expect an escalation — billing.md says refunds need a human",
+    customer_email: "mia@datalane.ai",
+    subject: "Refund for yesterday's charge",
+    body: "I was charged for my monthly Pro subscription yesterday but meant to cancel. Can I get a refund?",
+  },
+  {
+    label: "technical",
+    expect: "expect a reply citing api.md#rate-limits",
+    customer_email: "liam@brightco.io",
+    subject: "What are my API rate limits?",
+    body: "I'm building an integration and want to know how many requests per minute my plan allows.",
+  },
+  {
+    label: "how-to",
+    expect: "expect a reply citing account.md#password-reset",
+    customer_email: "noah@freetier.dev",
+    subject: "Can't remember my password",
+    body: "I forgot my password and can't log in. Can you reset it for me?",
+  },
+];
+
+const tryExamplesEl = document.getElementById("try-examples");
+const trySubject = document.getElementById("try-subject");
+const tryBody = document.getElementById("try-body");
+const tryWho = document.getElementById("try-who");
+const trySend = document.getElementById("try-send");
+const tryState = document.getElementById("try-state");
+const tryActions = document.getElementById("try-actions");
+const tryStream = document.getElementById("try-stream");
+let tryEmail = TRY_EXAMPLES[0].customer_email;
+
+// Selecting an example FILLS the fields rather than replacing them: D-06 is "prefilled
+// and editable", so what gets sent is whatever the fields hold at submit time, not the
+// example's frozen copy.
+function chooseExample(i) {
+  const ex = TRY_EXAMPLES[i];
+  trySubject.value = ex.subject;
+  tryBody.value = ex.body;
+  tryEmail = ex.customer_email;
+  tryWho.textContent = "Sent as the seeded customer " + ex.customer_email + " · " +
+                       ex.expect;
+  Array.prototype.forEach.call(tryExamplesEl.children, (chip, n) => {
+    chip.className = n === i ? "chip on" : "chip";
+  });
+}
+
+function renderExamples() {
+  clear(tryExamplesEl);
+  TRY_EXAMPLES.forEach((ex, i) => {
+    const chip = el("button", { class: "chip", type: "button" },
+                    ex.label + " · " + ex.subject);
+    chip.addEventListener("click", () => chooseExample(i));
+    tryExamplesEl.append(chip);
+  });
+}
+
+function setupTryIt() {
+  renderExamples();
+  chooseExample(0);
+  if (!TRY_CONFIGURED) {
+    // Disabled WITH copy, and the copy says which of the two it is: a dead button and
+    // silence reads as a broken page, which is the opposite of what this page is for.
+    trySend.disabled = true;
+    trySubject.disabled = true;
+    tryBody.disabled = true;
+    tryState.textContent = "This deployment publishes no demo key, so the form is"
+      + " read-only. Everything else on this page is live.";
+    return;
+  }
+  trySend.addEventListener("click", submitTryIt);
+}
+
+async function submitTryIt() {
+  trySend.disabled = true;
+  clear(tryStream);
+  clear(tryActions);
+  tryState.textContent = "creating the ticket…";
+  const created = await fetch("/tickets", {
+    method: "POST",
+    headers: { "X-API-Key": DEMO_KEY, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      customer_email: tryEmail,
+      subject: trySubject.value,
+      body: tryBody.value,
+    }),
+  });
+  const ticket = await created.json();
+  tryState.textContent = "ticket #" + ticket.id + " created";
+  trySend.disabled = false;
+}
+
+setupTryIt();
+// --- try it — end ---
 
 // --- live feed (/events) — begin ---
 // The aggregate numbers above still poll; this ADDS the live half DASH-01 names.
