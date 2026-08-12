@@ -16,6 +16,7 @@ import asyncio
 import inspect
 import itertools
 import json
+import logging
 import sqlite3
 import time
 from pathlib import Path
@@ -253,6 +254,48 @@ async def test_publish_drops_oldest_and_never_blocks():
     # A subscriber whose queue is full and whose get also fails still cannot break a run.
     broker._subs.add(_HostileQueue())
     assert broker.publish({"type": "usage", "n": 4}) is None
+
+
+async def test_dropped_frames_are_counted_and_logged(caplog):
+    """WR-09: a lossy feed is observable, and the drop path still never raises.
+
+    D-10 requires dropping rather than blocking. It does not require dropping silently,
+    and silence is what makes this undiagnosable: a viewer sees a feed with a hole it
+    cannot detect, and an operator has no signal that the demo is dropping frames at
+    all. The double-failure branch was a bare `pass` — the closest thing in this
+    codebase to an empty catch.
+
+    MUTATION 1 that must turn this red: delete `self.dropped += 1` from _record_drop —
+    the count stays 0 while frames are demonstrably being lost.
+    MUTATION 2 that must turn this red: restore the bare `pass` in the requeue-failed
+    branch — the hostile subscriber's drop goes uncounted and the last assertion fails.
+    """
+    broker = RunEventBroker(maxsize=2)
+    q = broker.subscribe()
+    caplog.set_level(logging.WARNING, logger="relay.events")
+
+    for n in range(5):
+        assert broker.publish({"type": "usage", "n": n}) is None
+
+    assert q.qsize() == 2, "the queue grew past maxsize — this test is not measuring drops"
+    assert broker.dropped == 3, f"three frames were lost and {broker.dropped} were counted"
+    dropped_logs = [r for r in caplog.records if r.getMessage() == "events.frame_dropped"]
+    assert dropped_logs, "frames were dropped with nothing in the logs to say so"
+    # Structured context, per CLAUDE.md — never interpolated into the message.
+    ctx = dropped_logs[0].ctx
+    assert ctx["reason"] == "queue_full"
+    assert ctx["dropped"] == 1
+    assert ctx["subscribers"] == 1
+    # Rate-limited: one line for the first drop, not one per dropped frame, or a slow
+    # browser becomes a second cost on the paid run that is publishing to it.
+    assert len(dropped_logs) == 1, f"the drop log is not rate limited: {len(dropped_logs)}"
+
+    # The double-failure path counts too, and still cannot raise into a paid run.
+    broker._subs.add(_HostileQueue())
+    assert broker.publish({"type": "usage", "n": 99}) is None
+    assert broker.dropped == 5, (
+        "the requeue-failed branch swallowed its drop — the bare `pass` is back"
+    )
 
 
 def test_publish_is_synchronous():

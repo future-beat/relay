@@ -69,6 +69,10 @@ class RunEventBroker:
         self._maxsize = settings.events_queue_maxsize if maxsize is None else maxsize
         self._max_subscribers = max_subscribers
         self.closed = False
+        # Frames this broker has dropped, for the life of the process. A counter and not
+        # a per-subscriber tally: a queue is dropped along with its viewer, and the
+        # question an operator asks is "is the demo lossy right now", not "which tab".
+        self.dropped = 0
 
     @property
     def max_subscribers(self) -> int:
@@ -130,6 +134,13 @@ class RunEventBroker:
         Never blocks and never raises. The dropped frame belongs to a viewer who is
         not keeping up; the alternative — making the run wait — charges the cost of a
         slow browser to the ticket being processed.
+
+        D-10 says drop rather than block; it does not say drop INVISIBLY (WR-09). Every
+        drop is counted and the first — plus every hundredth after it — is logged, so a
+        viewer watching a feed with a hole in it is something an operator can see rather
+        than something only the viewer half-notices. Rate-limited because a queue that
+        is full stays full: a log line per dropped frame would turn one slow browser
+        into a second, louder cost on the same paid run.
         """
         try:
             q.put_nowait(frame)
@@ -139,8 +150,22 @@ class RunEventBroker:
                 q.put_nowait(frame)
             except (asyncio.QueueEmpty, asyncio.QueueFull):
                 # A concurrent reader drained it between the two calls, or filled it
-                # again. Either way the viewer is fine and the run must not care.
-                pass
+                # again. The viewer is fine and the run must not care — but the frame is
+                # gone either way, so it is counted with the rest rather than swallowed.
+                self._record_drop(reason="requeue_failed")
+            else:
+                self._record_drop(reason="queue_full")
+
+    def _record_drop(self, *, reason: str) -> None:
+        """Count one dropped frame and log at a rate limit. Must never raise (D-10)."""
+        self.dropped += 1
+        if self.dropped == 1 or self.dropped % 100 == 0:
+            logger.warning("events.frame_dropped", extra={"ctx": {
+                "reason": reason,
+                "dropped": self.dropped,
+                "subscribers": len(self._subs),
+                "queue_maxsize": self._maxsize,
+            }})
 
     def publish(self, frame: dict) -> None:
         """Fire-and-forget fan-out. A plain def on purpose (D-10).
