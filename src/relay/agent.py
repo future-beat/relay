@@ -363,13 +363,18 @@ async def run_ticket(
                         # nothing in the feed to show it happened, or the reverse.
                         # Read tools and everything else have no sibling write to nest
                         # into and are persisted by _persisted() at their yield.
+                        #
+                        # `tool_result_persisted` comes back False when the call was
+                        # denied by a guardrail: nothing was written, so there is
+                        # nothing to be atomic with, and the row is written below —
+                        # AFTER the guardrail event — so the durable record reads in
+                        # causal order rather than inverted (05-REVIEW CR-02).
                         if recorder is not None and spec is not None and spec.tier == "write":
-                            result, is_error = await asyncio.to_thread(
+                            result, is_error, tool_result_persisted = await asyncio.to_thread(
                                 recorder.execute_and_record,
                                 execute_bound, spec, block.name, block.input, policy,
                                 event_type="tool_result",
                             )
-                            tool_result_persisted = True
                         else:
                             result, is_error = await asyncio.to_thread(
                                 execute_bound, spec, block.name, block.input, policy
@@ -448,11 +453,10 @@ async def run_ticket(
                             "tool": block.name,
                             "supplied_ticket_id": payload["supplied_ticket_id"],
                         }})
-                        # Cause before effect: the stream shows the denial, then its result.
-                        # (In `run_events` a denied WRITE tool is the one place those two
-                        # invert: its tool_result row is written inside the offload, so it
-                        # takes the lower seq. The price of D-04 atomicity, and only ever
-                        # visible on a denial, where nothing was written to be atomic with.)
+                        # Cause before effect, in the stream AND in `run_events`: a
+                        # denied write tool skips the recorder's in-transaction insert
+                        # (nothing was written to be atomic with), so this row takes the
+                        # lower seq and the tool_result below follows it.
                         yield await _persisted(AgentEvent(
                             type="guardrail",
                             data={

@@ -261,7 +261,9 @@ class RunRecorder:
     One instance per run, holding the run's uid, its ticket and its own `seq`
     counter — the counter is what makes phase 6's drill-down renderable in order
     without trusting `created_at` to break ties between two rows in the same
-    millisecond.
+    millisecond (it is `datetime('now')`, second resolution, so there is no tie to
+    break with). The counter therefore has to advance in the order the run yielded
+    its events, on EVERY path including a guardrail denial: see execute_and_record.
     """
 
     def __init__(self, conn: Database, *, run_uid: str, ticket_id: int) -> None:
@@ -299,8 +301,12 @@ class RunRecorder:
 
     def execute_and_record(
         self, execute_bound, spec, name: str, raw_input: dict, policy, *, event_type: str
-    ) -> tuple[str, bool]:
+    ) -> tuple[str, bool, bool]:
         """Run one WRITE-tier tool and record it in the same transaction (D-04).
+
+        Returns (result_json, is_error, recorded). `recorded` is False on the one path
+        that deliberately writes no row — see below — and the caller must then persist
+        the tool_result itself, at its own yield site.
 
         This is the seam the whole atomicity guarantee rests on. The tool's executor
         opens its own `transaction()`, which nests as a SAVEPOINT inside this one; the
@@ -315,10 +321,24 @@ class RunRecorder:
         """
         with self.conn.transaction():
             result, is_error = execute_bound(spec, name, raw_input, policy)
+            payload = json.loads(result)
+            if is_error and payload.get("denied_by"):
+                # A guardrail denial: every `denied_by` in _execute_guarded (policy,
+                # ticket_binding, citation) returns BEFORE spec.execute, so nothing was
+                # written and there is nothing for this row to be atomic with. Recording
+                # it here anyway is what inverted the record: the row lands inside this
+                # offload, taking a lower seq than the `guardrail` event that explains
+                # it, which the caller only reaches afterwards — an audit trail showing
+                # a denied send_reply's result BEFORE the denial that produced it, with
+                # created_at at second resolution and no third signal to recover the
+                # true order from. So the row is left to the caller, which writes it
+                # after the guardrail event, in causal order. D-04 is untouched: it
+                # applies to calls that wrote something, and this one did not.
+                return result, is_error, False
             self._insert_event(
                 event_type,
                 # json.loads to match agent.py's own tool_result event, which carries
                 # the parsed payload rather than the wire string.
-                {"tool": name, "result": json.loads(result), "is_error": is_error},
+                {"tool": name, "result": payload, "is_error": is_error},
             )
-        return result, is_error
+        return result, is_error, True

@@ -421,9 +421,11 @@ def test_send_reply_and_its_event_row_commit_atomically(db, tmp_path, monkeypatc
     ).fetchone()["status"] == "open"
 
     # Case 1, the same call unmutated: both rows land and both survive a reconnect.
-    result, is_error = recorder.execute_and_record(execute_bound, **call)
+    result, is_error, recorded = recorder.execute_and_record(execute_bound, **call)
 
     assert is_error is False
+    # The write path records in-transaction; only a denial (which wrote nothing) defers.
+    assert recorded is True
     assert json.loads(result)["status"] == "resolved"
 
     reopened = connect(tmp_path / "relay.db")
@@ -437,6 +439,43 @@ def test_send_reply_and_its_event_row_commit_atomically(db, tmp_path, monkeypatc
         assert payload["result"]["status"] == "resolved"
     finally:
         reopened.close()
+
+
+def test_a_denied_write_tool_writes_no_event_row_of_its_own(db, monkeypatch):
+    """CR-02, at the seam: a guardrail denial defers its row instead of taking a seq.
+
+    The unit half of the ordering fix. A denial returns before the tool ever executes,
+    so there is no write for the row to be atomic with — recording it here is what put
+    the effect (`tool_result`) at a LOWER seq than the cause (`guardrail`), which the
+    caller only records afterwards.
+
+    MUTATION that must turn this red: delete the `if is_error and payload.get(
+    "denied_by"): return result, is_error, False` early return from execute_and_record —
+    the row lands inside the transaction again, `recorded` is True, and run_events grows
+    a tool_result row nobody will follow with the denial that caused it.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    registry = build_registry(db, KB_DIR)
+    ticket_id = _seed_ticket(db)
+    recorder = RunRecorder(db, run_uid="u1", ticket_id=ticket_id)
+
+    result, is_error, recorded = recorder.execute_and_record(
+        bind_to_ticket(ticket_id),
+        spec=registry["send_reply"],
+        name="send_reply",
+        # Bound to ticket_id, so naming another one is denied by the ticket_binding guard.
+        raw_input={"ticket_id": ticket_id + 1, "body": "Refunded — it lands in 3-5 days."},
+        policy=ToolPolicy(),
+        event_type="tool_result",
+    )
+
+    assert is_error is True
+    assert json.loads(result)["denied_by"] == "ticket_binding"
+    assert recorded is False, "the denial recorded its own row and took the lower seq"
+    assert db.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == 0
+    # Nothing was written, which is why deferring the row costs no atomicity: there is
+    # no sibling write that could survive without it.
+    assert db.execute("SELECT COUNT(*) FROM replies").fetchone()[0] == 0
 
 
 def test_recorder_is_synchronous():
@@ -538,6 +577,71 @@ def test_a_run_persists_its_full_event_sequence(client, capture_frames, monkeypa
     # rather than a count so a row landing under the wrong type still fails.
     assert [r["type"] for r in rows] == streamed
     assert [r["seq"] for r in rows] == list(range(1, len(streamed) + 1))
+
+
+def test_a_denied_write_tool_persists_cause_before_effect(client, capture_frames, monkeypatch):
+    """CR-02: on a guardrail denial, run_events records the denial BEFORE its result.
+
+    The suite scripted no denial at all before this, which is exactly why the inversion
+    was invisible: `created_at` is datetime('now') (second resolution), so `seq` is the
+    only tiebreaker phase 6 has, and it used to run backwards on the one path where
+    order carries meaning — a safety control firing. An audit row showing a send_reply's
+    result ahead of the denial that produced it is the wrong record of that event.
+
+    MUTATION that must turn this red: delete the `if is_error and payload.get(
+    "denied_by")` early return from RunRecorder.execute_and_record, so the denied call
+    inserts its tool_result row inside the offload again. The row takes seq 3, the
+    guardrail event that explains it takes seq 4, and the ordering assertions below
+    fail while the SSE stream keeps showing the opposite (correct) order.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    app.state.client = FakeClient([
+        # A write-tier tool naming a ticket that is not this run's: denied by the
+        # ticket_binding guard, before the tool executes, so nothing is written.
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id + 1, "body": "z" * 40,
+        })]),
+        response([text_block("giving up")], stop_reason="end_turn"),
+    ])
+
+    body, frames = asyncio.run(capture_frames(ticket_id))
+
+    streamed = _streamed_event_types(body)
+    assert "guardrail" in streamed, (
+        "the scripted call was not denied — every assertion below would be vacuous"
+    )
+    # The stream's order is the deliberate one and was never wrong; it is the reference.
+    assert streamed.index("guardrail") < streamed.index("tool_result")
+
+    reopened = connect(settings.db_path)
+    try:
+        run_uid = reopened.execute("SELECT run_uid FROM runs").fetchone()["run_uid"]
+        rows = reopened.execute(
+            "SELECT seq, type, payload FROM run_events WHERE run_uid = ? ORDER BY seq",
+            (run_uid,),
+        ).fetchall()
+    finally:
+        reopened.close()
+
+    types = [r["type"] for r in rows]
+    # Whole-sequence equality, not just the pair: a fix that reordered these two by
+    # dropping a row or writing one twice would still pass a narrower check.
+    assert types == streamed
+    assert [r["seq"] for r in rows] == list(range(1, len(streamed) + 1))
+    assert types.index("guardrail") < types.index("tool_result"), (
+        "run_events recorded the denied call's result BEFORE the denial that caused it"
+    )
+    # The right two rows, and the denial is the one that fired: seq is a tiebreaker only
+    # if the rows it orders are the ones this run actually produced.
+    denial = rows[types.index("guardrail")]
+    denied_result = rows[types.index("tool_result")]
+    assert json.loads(denial["payload"])["guard"] == "ticket_binding"
+    assert json.loads(denied_result["payload"])["is_error"] is True
+    assert denial["seq"] + 1 == denied_result["seq"]
+    # The public feed carries the same order (it is published as each event surfaces).
+    published = [f["type"] for f in frames]
+    assert published.index("guardrail") < published.index("tool_result")
 
 
 def test_broker_never_leads_the_database(client, monkeypatch):
