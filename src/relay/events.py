@@ -326,10 +326,34 @@ def attribute_to_run(frame: dict, *, run_uid: str, ticket_id: int) -> dict:
     project() already built and adds two fields, so nothing reaches a subscriber
     without having passed the allowlist first.
 
-    Neither field is a new disclosure: `ticket_id` is already published by /events'
-    own connect snapshot and by /metrics' last_runs, and `run_uid` by the same
-    /metrics rows. The identity is written LAST so no event field can ever overwrite
-    it — a frame that lies about which run it came from is worse than no frame.
+    `ticket_id` is not a new disclosure: /events' own connect snapshot and /metrics'
+    last_runs both already carry it.
+
+    `run_uid` IS a disclosure this function makes and /metrics deliberately does not.
+    That is the current, deliberate position, and it is stated here because this
+    docstring used to claim /metrics published the uid too — true when this function
+    landed, false three commits later when `telemetry._PUBLIC_RUN_COLUMNS` replaced
+    `SELECT *` and dropped it, on the reasoning that the uid is the key into
+    `run_events`, a table filled with unredacted customer data. Two tests now pin the
+    two halves: `test_metrics_does_not_publish_run_uid` and
+    `test_concurrent_runs_are_attributable_in_the_feed`.
+
+    The two are coherent, on one condition, and it is the condition phase 6 inherits:
+
+    - Here the uid is a CORRELATION token. Concurrent runs interleave, so without it a
+      cost figure has no ticket and a resolution has no run — and the listener already
+      holds every frame the uid identifies. It buys nothing it did not just receive.
+    - On /metrics the uid would be a HANDLE to the back catalogue: last_runs is history,
+      so stamping it there hands an anonymous caller keys to runs it never watched.
+
+    The condition: `run_uid` must stay a correlation token and never become a bearer
+    credential. It is already broadcast to every anonymous listener for the runs they
+    watch, so a phase 6 drill-down keyed on it has to be authenticated (or itself
+    redacted) — knowing a uid must grant nothing. If that is ever not true, this is the
+    line to delete, not the reasoning to widen.
+
+    The identity is written LAST so no event field can ever overwrite it — a frame that
+    lies about which run it came from is worse than no frame.
     """
     return {**frame, "run_uid": run_uid, "ticket_id": ticket_id}
 
