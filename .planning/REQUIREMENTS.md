@@ -18,7 +18,7 @@
 
 - [x] **DATA-01**: All SQLite access is async-safe (thread offload at the `_execute_guarded`/handler seam, per-connection ownership fixed, WAL + busy_timeout on file databases); the sync `ToolSpec.execute` contract is preserved for MCP and tests
 - [x] **DATA-02**: Graceful shutdown drains in-flight SSE runs before closing the database; `record_run` persists even when a run is interrupted (moved to a `finally` path)
-- [ ] **DATA-03**: A `run_events` table persists per-run step events (tool calls, results, retrieval, denials, usage) written during the stream, enabling per-run drill-down
+- [x] **DATA-03**: A `run_events` table persists per-run step events (tool calls, results, retrieval, denials, usage) written during the stream, enabling per-run drill-down
 
 ### Semantic Retrieval
 
@@ -36,7 +36,7 @@
 
 ### Dashboard
 
-- [ ] **DASH-01**: The dashboard receives a live run feed over a public, projection-only SSE `/events` endpoint (no polling; no sensitive data)
+- [x] **DASH-01**: The dashboard receives a live run feed over a public, projection-only SSE `/events` endpoint (no polling; no sensitive data)
 - [ ] **DASH-02**: Aggregate cards and outcome distribution (resolved/escalated/error/budget_exceeded/step_limit) render from `/metrics`, computed via SQL aggregation
 - [ ] **DASH-03**: Per-run drill-down shows the full trace from `run_events`: tool calls with inputs/outputs/timings, retrieval chunks with scores and cited-vs-not highlighting, and guardrail denials
 - [ ] **DASH-04**: Cost/latency-over-time renders as hand-rolled inline SVG; a gauge shows remaining daily demo budget — no CDN scripts, no build step
@@ -85,8 +85,8 @@ Mapped by roadmap creation 2026-08-06 — 22/22 v1 requirements, no orphans.
 | EVAL-01 | Phase 4 | Complete |
 | EVAL-02 | Phase 4 | Complete |
 | EVAL-03 | Phase 4 | Complete |
-| DATA-03 | Phase 5 | Pending |
-| DASH-01 | Phase 5 | Pending |
+| DATA-03 | Phase 5 | Complete |
+| DASH-01 | Phase 5 | Complete |
 | DASH-02 | Phase 6 | Pending |
 | DASH-03 | Phase 6 | Pending |
 | DASH-04 | Phase 6 | Pending |
