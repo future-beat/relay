@@ -2056,3 +2056,105 @@ def test_charts_have_an_empty_state(client):
     assert block.count('class: "empty"') >= 2
     assert "no runs yet" in block
     assert "None" not in html
+
+
+# --- Wave 5: the drill-down panel (DASH-03) ------------------------------------------
+#
+# NOTE ON STRENGTH, restated for this wave: there is still no DOM in this suite — no
+# jsdom, no headless browser — so nothing below executes openDrill, opens a <dialog> or
+# renders a step. These are grep-level regression guards on the served HTML: they see
+# that the branch, the field read or the class is present in the shipped block, not that
+# a browser does anything with it. The DOM-level proof is deferred to 06-07's human
+# checkpoint, which 06-VALIDATION.md already records. Every assertion below is scoped to
+# a marker-delimited block via `_block`, and every ABSENCE assertion runs over
+# `_code_only`, because the comments in that block name what it must not do on purpose.
+
+_DRILL = "drill-down (/runs/{uid})"
+
+
+def test_the_runs_table_opens_the_drill_down(client):
+    """D-05: a run row is the control that opens that run's panel, keyed on run_uid.
+
+    06-05 stamped `row.dataset.uid` from `last_runs.run_uid` with nothing reading it.
+    This is the handle being used: the row carries a control that calls openDrill, and
+    openDrill fetches the public JSON route rather than navigating anywhere — the panel
+    is a client-rendered view on the same page, not a route split.
+
+    MUTATION that must turn this red: delete the `if (!r.run_uid)` branch from
+    runCell — a pre-Phase-5 row (whose uid is null) then gets a control that fetches
+    `/runs/null` and opens a dialog reading "no such run", which looks like the page is
+    broken rather than like history that predates step recording.
+
+    WEAK BY CONSTRUCTION: grep over served HTML, as the wave header says.
+    """
+    html = client.get("/dashboard").text
+    assert '<dialog id="drill">' in html, "the panel is not a native <dialog> (D-05)"
+
+    drill = _block(html, _DRILL)
+    poll = _block(html, "metrics poll (/metrics)")
+    drill_code, poll_code = _code_only(drill), _code_only(poll)
+
+    # The table side: the uid is read, and it decides whether a control exists at all.
+    assert "r.run_uid" in poll_code
+    assert "openDrill(r.run_uid)" in poll_code, "no row opens the drill-down"
+    assert "if (!r.run_uid)" in poll_code, (
+        "no null-uid branch — a legacy row would get a control that opens nothing"
+    )
+
+    # The panel side: one definition, one fetch of the public route, one showModal.
+    assert "function openDrill(" in drill_code
+    assert 'fetch("/runs/" +' in drill_code, "openDrill does not read GET /runs/{uid}"
+    assert "showModal()" in drill_code, "the panel never opens as a modal dialog"
+    # A dialog, not a page: nothing here navigates.
+    assert "location.href" not in drill_code and "window.open" not in drill_code
+
+
+def test_the_drill_panel_renders_the_run_states(client):
+    """All four documented states are DESIGNED states, and a 404 is a fifth.
+
+    06-04's absence matrix answers `complete | in_flight | swept | unrecorded`, all 200,
+    plus one 404 for a uid this service never minted. A panel that only knows "complete"
+    renders three of those five as an empty box, which reads as a broken page.
+
+    MUTATION that must turn this red: delete the `"swept"` branch — a 30-day-old run
+    then renders as an empty panel, so retention working correctly is indistinguishable
+    from the page failing.
+
+    WEAK BY CONSTRUCTION: grep-level; the branch is present, not proven to execute.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _DRILL))
+
+    for status in ("complete", "in_flight", "swept", "unrecorded"):
+        assert f'"{status}"' in code, f"the panel has no {status} state"
+    # The not-ok branch, with 404 named: it is the only 404 the route emits and it
+    # means the uid is unknown, which is a different sentence from "swept".
+    assert "resp.ok" in code, "a non-200 response is not handled at all"
+    assert "404" in code
+    # The swept branch renders the SERVER's note (it names the retention window), not a
+    # window length hardcoded here that a settings change would silently falsify.
+    assert "d.note" in code
+    assert "None" not in html
+
+
+def test_the_drill_panel_renders_values_as_text_never_html(client):
+    """T-06-23: the panel is the widest surface model-influenced strings reach.
+
+    Tool names, argument keys, doc ids, guard names and error reasons all land here.
+    The server clamps the tool name to the registry and intersects arg keys with the
+    declared schema (06-03), but `doc`, `id`, `denied_by` and the demo branch's raw
+    input are strings — so the rendering rule is the control that stands regardless.
+
+    MUTATION that must turn this red: render one step through a markup sink
+    (`li.innerHTML = "<div>" + s.tool + "</div>"`) inside the drill block.
+
+    WEAK BY CONSTRUCTION: grep over served HTML. It cannot see a sink reached through
+    an alias; the whole-page test above has the same limit and the same value.
+    """
+    html = client.get("/dashboard").text
+    drill = _block(html, _DRILL)
+
+    for sink in _MARKUP_SINKS:
+        assert sink not in drill, f"{sink} reached the drill panel — T-06-23"
+    assert "textContent" in drill, "the panel writes no value as text at all"
+    assert "el(" in drill, "the panel does not build its nodes through the el() helper"
