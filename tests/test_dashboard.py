@@ -9,12 +9,26 @@ gate share — are Phase 6's, and belong where a reader looking for Phase 6 will
 import asyncio
 import json
 import re
+from datetime import datetime
+
+import pytest
+from fastapi import HTTPException
 
 from helpers import FakeClient, response, text_block, tool_use_block
 from relay import db as db_module
 from relay.config import settings
 from relay.db import connect, init_db
 from relay.main import app
+from relay.ratelimit import (
+    _LIMIT_SETTINGS,
+    _limit_item,
+    budget_snapshot,
+    enforce_daily_budget,
+    release_run,
+    reserve_run,
+    spent_today,
+)
+from relay.telemetry import record_run
 
 
 def _create_table_block(table: str) -> str:
@@ -164,3 +178,84 @@ def test_run_events_carry_elapsed_ms(client, capture_frames, monkeypatch):
     # added at the record() call site instead of in _insert_event would have missed.
     assert isinstance(by_tool.get("send_reply"), int)
     assert by_tool["send_reply"] >= by_tool["lookup_customer"]
+
+
+def test_budget_snapshot_and_the_gate_cannot_disagree(conn, monkeypatch):
+    """One arithmetic, two consumers (D-11): the gauge's number IS the gate's number.
+
+    The /metrics gauge renders what enforce_daily_budget refuses on. Two producers
+    means the page can show budget remaining while the gate is already refusing —
+    on a page whose entire purpose is credibility.
+
+    MUTATION that must turn this red: give budget_snapshot its own
+    `SELECT COALESCE(SUM(cost_usd), 0.0) FROM runs WHERE ...` instead of calling
+    spent_today. The reservation below then vanishes from the snapshot while the gate
+    still counts it, and the equality against spent_today() fails. That equality is
+    what does the work here — asserting the 503 body matches the snapshot alone would
+    stay green under the mutation, because the rewritten gate reads the same (wrong)
+    snapshot.
+    """
+    monkeypatch.setattr(settings, "max_daily_cost_usd", 5.0)
+    monkeypatch.setattr(settings, "max_run_cost_usd", 0.5)
+    record_run(conn, ticket_id=1, model="m", duration_ms=10, steps=1,
+               input_tokens=1, output_tokens=1, cost_usd=1.0, outcome="send_reply")
+
+    # A run admitted but not yet written to `runs`. The gate compares against this, so
+    # a gauge that summed only committed rows would read 0.5 low and promise a visitor
+    # budget the very next request refuses.
+    token = reserve_run()
+    try:
+        snap = budget_snapshot(conn)
+        assert snap["spent_today_usd"] == round(spent_today(conn), 4) == 1.5
+        assert snap["daily_ceiling_usd"] == 5.0
+        assert snap["remaining_usd"] == 3.5
+        assert snap["exhausted"] is False
+        # A JSON-serialisable string for the route, and a real instant: the 503 path
+        # parses this back rather than re-deriving midnight on its own clock.
+        assert snap["resets_at"].endswith("+00:00")
+        assert datetime.fromisoformat(snap["resets_at"]).hour == 0
+
+        # Below the ceiling the gate is silent, from the same numbers.
+        enforce_daily_budget(conn)
+
+        record_run(conn, ticket_id=2, model="m", duration_ms=10, steps=1,
+                   input_tokens=1, output_tokens=1, cost_usd=4.0, outcome="send_reply")
+        exhausted = budget_snapshot(conn)
+        assert exhausted["exhausted"] is True
+        assert exhausted["remaining_usd"] == 0.0  # floored, never negative
+
+        with pytest.raises(HTTPException) as exc:
+            enforce_daily_budget(conn)
+    finally:
+        release_run(token)
+
+    assert exc.value.status_code == 503
+    detail = exc.value.detail
+    # The three keys tests/test_ratelimit.py asserts by name, unmoved — and each one
+    # EXACTLY the snapshot's, not a rounding of the same float computed twice.
+    assert detail["spent_usd"] == exhausted["spent_today_usd"]
+    assert detail["limit_usd"] == exhausted["daily_ceiling_usd"]
+    assert detail["resets_at"] == exhausted["resets_at"]
+    assert int(exc.value.headers["Retry-After"]) >= 1
+
+
+def test_run_detail_limit_bucket_resolves(conn):
+    """The Wave-3 drill-down's bucket exists before the route that reads it.
+
+    _LIMIT_SETTINGS is a hard KeyError inside _limit_item, not a default: a missing
+    entry is a 500 on the new route's FIRST request, in production, with no local
+    signal. So the bucket and its settings attribute land in the same commit.
+
+    MUTATION that must turn this red: delete the ("run_detail", "anon") entry from
+    _LIMIT_SETTINGS — _limit_item raises KeyError.
+    """
+    item = _limit_item("run_detail", "anon")
+    assert item.amount >= 1
+
+    # Deliberately NOT the events bucket: a drill-down flood must not spend the live
+    # feed's reconnect allowance and silently break the feed for that visitor.
+    assert (
+        _LIMIT_SETTINGS[("run_detail", "anon")] != _LIMIT_SETTINGS[("events", "anon")]
+    )
+    assert settings.run_detail_max_events > 0
+    assert settings.metrics_window_days > 0
