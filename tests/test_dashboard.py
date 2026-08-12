@@ -975,3 +975,206 @@ def test_cited_is_false_when_no_reply_was_accepted(client, capture_frames, monke
     assert search_step["results"], "the run retrieved nothing"
     assert all(r["cited"] is False for r in search_step["results"])
     assert next(s for s in steps if s["type"] == "resolution")["via"] == "create_escalation"
+
+
+# --- Wave 3: the drill-down route and the plumbing that makes it usable --------------
+
+DEMO_HEADERS = {"X-API-Key": "test-demo-key"}
+
+
+def _demo_ticket(client, email: str, body: str, subject: str = "API limits") -> int:
+    """Create a ticket as the DEMO tier, so tickets.origin is 'demo'.
+
+    The counterpart to _make_ticket above, which rides the client fixture's default
+    OWNER header. D-02's full-fidelity exception is anchored on the CREATION tier, so
+    which key posted /tickets is the whole of the difference these tests turn on.
+    """
+    created = client.post(
+        "/tickets",
+        json={"customer_email": email, "subject": subject, "body": body},
+        headers=DEMO_HEADERS,
+    )
+    assert created.status_code == 201
+    return created.json()["id"]
+
+
+def _origin_of(ticket_id: int) -> str | None:
+    row = app.state.conn.execute(
+        "SELECT origin FROM tickets WHERE id = ?", (ticket_id,)
+    ).fetchone()
+    assert row is not None, f"ticket {ticket_id} does not exist"
+    return row["origin"]
+
+
+def test_ticket_origin_is_the_creation_tier(client):
+    """Which key created the ticket is recorded on the row, server-side (D-02).
+
+    This is the ONLY signal that a ticket is visitor-authored, and every later
+    full-fidelity decision reads it. Three rows, three tiers:
+
+    MUTATION that must turn this red: leave `dependencies=[Depends(create_gate)]` on
+    the decorator and hardcode `origin` to a literal in the INSERT — the demo/owner
+    distinction collapses and one of the first two assertions fails whichever literal
+    is chosen. The tier has to be RETURNED by the gate and taken as a parameter; a gate
+    declared in `dependencies=[...]` throws its own return value away.
+
+    SECOND, INDEPENDENT MUTATION (threat T-06-15, elevation of privilege): anchor the
+    flag on the /PROCESS tier instead — set origin when the run starts, from the key
+    that called /tickets/{id}/process. An owner-created ticket containing a real
+    customer's email and body then becomes full fidelity the moment ANYONE runs it with
+    the published demo key, which is a disclosure reachable by one curl. The owner
+    assertion below is what catches it: this ticket is never processed at all, so a
+    process-anchored flag cannot be 'owner'. `test_a_demo_originated_run_is_full_fidelity`
+    and the leak test are the behavioural half of the same property.
+    """
+    owner_id = _make_ticket(client, "owner@acmecorp.com", "created with the owner key")
+    demo_id = _demo_ticket(client, "visitor@example.com", "created with the demo key")
+
+    assert _origin_of(owner_id) == "owner"
+    assert _origin_of(demo_id) == "demo"
+
+    # A row written by code that predates the column — i.e. what is on the Fly volume.
+    # NULL, and NULL reads as NOT demo everywhere (fail-closed, 06-01). Asserted by
+    # identity rather than falsiness: `origin == "demo"` is the check the route makes,
+    # and a truthiness check here would not notice if the route used one too.
+    cur = app.state.conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+        ("legacy@acmecorp.com", "legacy", "written before origin existed"),
+    )
+    app.state.conn.commit()
+    assert _origin_of(cur.lastrowid) is None
+
+
+def test_create_gate_is_not_charged_twice(client, monkeypatch):
+    """Moving the gate into the signature must not leave a second copy metering.
+
+    With the demo create allowance at exactly one, the FIRST demo POST has to succeed.
+    A gate declared BOTH in `dependencies=[...]` and as a parameter default runs twice
+    per request, so the single request spends two units and 429s itself — the perimeter
+    silently halving every demo limit in D-04.
+
+    STATED PLAINLY: this is a REGRESSION GUARD, not proof of new behaviour. It passes
+    against the pre-change code too (one declaration, charged once). Its whole value is
+    that it fails the moment someone adds the parameter without deleting the decorator.
+    """
+    monkeypatch.setattr(settings, "demo_create_limit", "1/hour")
+    first = client.post(
+        "/tickets",
+        json={
+            "customer_email": "visitor@example.com",
+            "subject": "one shot",
+            "body": "the first demo create must be admitted",
+        },
+        headers=DEMO_HEADERS,
+    )
+    assert first.status_code == 201, (
+        "the first demo POST /tickets was refused — the create gate was charged twice"
+        f" for one request: {first.text}"
+    )
+    assert _origin_of(first.json()["id"]) == "demo"
+
+    # And the allowance really was 1, so the assertion above was not vacuous.
+    second = client.post(
+        "/tickets",
+        json={
+            "customer_email": "visitor@example.com",
+            "subject": "two shots",
+            "body": "the second demo create must be refused",
+        },
+        headers=DEMO_HEADERS,
+    )
+    assert second.status_code == 429
+
+
+def test_process_returns_the_run_uid_to_the_submitter(client, monkeypatch):
+    """POST /process hands back X-Relay-Run-Uid — the run's own identity (Finding 2).
+
+    Try-it streams /process with `fetch` and simultaneously watches the ambient
+    /events feed, which carries the REDACTED projection of the same run. Without the
+    uid the page renders one run twice, in two fidelities, with no way to connect
+    them — and cannot deep-link its own drill-down.
+
+    MUTATION that must turn this red: mint `run_uid = uuid.uuid4().hex` back inside
+    `event_stream` (where it was) — the handler has no uid to put on the response and
+    the header is absent. The uid must be minted in the HANDLER and closed over.
+
+    The header, not a new SSE frame: the milestone's compatibility constraint keeps the
+    event contract byte-unchanged, and `scripts/demo.sh` would print an extra frame.
+    Same-origin `fetch` reads response headers with no CORS allowlist needed.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    app.state.client = FakeClient([
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id,
+            "body": "Your Pro plan allows 600 requests/minute per workspace.",
+        })]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    assert resp.status_code == 200
+    assert "event: error" not in resp.text
+
+    uid = resp.headers.get("X-Relay-Run-Uid")
+    assert uid, "POST /process returned no X-Relay-Run-Uid header"
+    assert re.fullmatch(r"[0-9a-f]{32}", uid), uid
+
+    # The header is not merely present, it is THE run's key: the same value on both
+    # sides of the soft join the drill-down reads. A uid minted for the header and a
+    # second one minted for the rows would satisfy a presence check and nothing else.
+    reopened = connect(settings.db_path)
+    try:
+        assert reopened.execute(
+            "SELECT run_uid FROM runs WHERE ticket_id = ?", (ticket_id,)
+        ).fetchone()["run_uid"] == uid
+        rows = reopened.execute(
+            "SELECT seq FROM run_events WHERE run_uid = ?", (uid,)
+        ).fetchall()
+    finally:
+        reopened.close()
+    assert rows, "no run_events row carried the uid the header advertised"
+
+    # And the SSE contract is untouched: no new event name appeared alongside it.
+    streamed = {
+        line[len("event: "):] for line in resp.text.splitlines()
+        if line.startswith("event: ")
+    }
+    assert "run" not in streamed and "run_uid" not in streamed, streamed
+
+
+def test_streaming_routes_are_not_buffered(client, monkeypatch):
+    """Both SSE routes tell proxies and caches to let the bytes through (05-REVIEW IN-02).
+
+    `X-Accel-Buffering: no` is nginx's opt-out and is honoured by the Fly proxy chain;
+    without it a buffering hop collects the whole stream and delivers it at once, which
+    is the difference between "the feed is live" and "the page hangs for 20 seconds and
+    then dumps everything". `Cache-Control: no-cache` stops an intermediary serving a
+    second visitor the first one's run.
+
+    MUTATION that must turn this red: drop the `headers={...}` argument from either
+    StreamingResponse.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    # So /events closes on its own instead of holding the TestClient for its 300s
+    # ceiling — this test is about the response headers, not the stream.
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.01)
+    monkeypatch.setattr(settings, "events_idle_seconds", 0.02)
+
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    app.state.client = FakeClient([
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id,
+            "body": "Your Pro plan allows 600 requests/minute per workspace.",
+        })]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    for resp in (
+        client.post(f"/tickets/{ticket_id}/process"),
+        client.get("/events"),
+    ):
+        assert resp.status_code == 200
+        assert resp.headers["content-type"].startswith("text/event-stream")
+        assert resp.headers.get("cache-control") == "no-cache", resp.headers
+        assert resp.headers.get("x-accel-buffering") == "no", resp.headers
