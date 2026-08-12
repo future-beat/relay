@@ -41,6 +41,7 @@ from .events import RunRecorder
 from .guardrails import RunBudget, ToolInputError, ToolPolicy, validate_tool_input
 from .models import AgentEvent
 from .prompts import SYSTEM_PROMPT, ticket_prompt
+from .retrieval import normalise_citation
 from .tools import ToolSpec
 
 TERMINAL_TOOLS = {"send_reply", "create_escalation"}
@@ -151,10 +152,13 @@ def _execute_guarded(
     if name == "send_reply" and retrieved_ids is not None:
         # Compared case- and whitespace-insensitively: every id in the set is already
         # lowercase (a filename plus a slug), so drift in how the model retypes one it
-        # was shown is a formatting difference, not a fabricated source.
-        allowed = {i.strip().lower() for i in retrieved_ids}
+        # was shown is a formatting difference, not a fabricated source. The
+        # normalisation is retrieval's, not this function's, because phase 6's
+        # drill-down highlights cited-vs-not against the same accept-set: two copies
+        # would let the audit view contradict the control it audits.
+        allowed = {normalise_citation(i) for i in retrieved_ids}
         missing = [
-            c for c in (validated.get("citations") or []) if c.strip().lower() not in allowed
+            c for c in (validated.get("citations") or []) if normalise_citation(c) not in allowed
         ]
         if missing:
             # A retry instruction that names the valid ids, not a refusal. A refusal

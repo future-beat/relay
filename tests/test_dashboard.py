@@ -16,8 +16,10 @@ from fastapi import HTTPException
 
 from helpers import FakeClient, response, text_block, tool_use_block
 from relay import db as db_module
+from relay.agent import _execute_guarded
 from relay.config import settings
 from relay.db import connect, init_db
+from relay.guardrails import ToolPolicy
 from relay.main import app
 from relay.ratelimit import (
     _LIMIT_SETTINGS,
@@ -28,6 +30,7 @@ from relay.ratelimit import (
     reserve_run,
     spent_today,
 )
+from relay.retrieval import normalise_citation
 from relay.telemetry import record_run
 
 
@@ -259,3 +262,79 @@ def test_run_detail_limit_bucket_resolves(conn):
     )
     assert settings.run_detail_max_events > 0
     assert settings.metrics_window_days > 0
+
+
+# --- Wave 2: the drill-down redactor ------------------------------------------------
+
+CITED_TICKET = {
+    "id": 4101,
+    "customer_email": "cite@brightco.io",
+    "subject": "refunds",
+    "body": "how do refunds work?",
+}
+GROUNDED_REPLY = "Refunds are issued to the original payment method within 14 days."
+
+
+def _seed_ticket(conn, ticket=CITED_TICKET) -> int:
+    conn.execute(
+        "INSERT INTO tickets (id, customer_email, subject, body) VALUES (?, ?, ?, ?)",
+        (ticket["id"], ticket["customer_email"], ticket["subject"], ticket["body"]),
+    )
+    conn.commit()
+    return ticket["id"]
+
+
+def test_normalise_citation_is_the_guards_normalisation(conn, registry):
+    """One normalisation, shared by the citation guard and the drill-down's highlight.
+
+    Two halves. (1) The helper itself: whitespace and case are the only things it
+    removes, because every retrieved id is already a lowercase filename plus a slug.
+    (2) The substitution changed no behaviour — the guard, driven through
+    `_execute_guarded` with a citation that differs from a retrieved id only in case
+    and surrounding whitespace, still ACCEPTS and the reply still lands. Without (2)
+    the helper could be correct in isolation while the guard quietly kept its own
+    open-coded copy, which is the drift this exists to make impossible.
+
+    MUTATION that must turn this red: make normalise_citation return `value`
+    unchanged. The case-differing citation is then absent from the guard's accept-set,
+    the call is denied with `denied_by: "citation"`, and (2)'s acceptance fails.
+    """
+    assert normalise_citation(" API.md#Rate-Limits ") == "api.md#rate-limits"
+    # Idempotent, so the drill-down may normalise an already-normalised id.
+    assert normalise_citation("api.md#rate-limits") == "api.md#rate-limits"
+
+    ticket_id = _seed_ticket(conn)
+    retrieved_ids = {"billing.md", "billing.md#refunds"}
+    result, is_error = _execute_guarded(
+        registry["send_reply"],
+        "send_reply",
+        {
+            "ticket_id": ticket_id,
+            "body": GROUNDED_REPLY,
+            # Same id the run retrieved, retyped by the model with different case and
+            # stray whitespace — a formatting difference, not a fabricated source.
+            "citations": ["  BILLING.md#Refunds\n"],
+        },
+        ToolPolicy(),
+        bound_ticket_id=ticket_id,
+        retrieved_ids=retrieved_ids,
+    )
+    assert is_error is False, result
+    assert json.loads(result)["status"] == "resolved"
+
+    # And the guard still denies a source this run never retrieved — the acceptance
+    # above is a normalisation, not a hole.
+    denied, denied_is_error = _execute_guarded(
+        registry["send_reply"],
+        "send_reply",
+        {
+            "ticket_id": ticket_id,
+            "body": GROUNDED_REPLY,
+            "citations": ["api.md#rate-limits"],
+        },
+        ToolPolicy(),
+        bound_ticket_id=ticket_id,
+        retrieved_ids=retrieved_ids,
+    )
+    assert denied_is_error is True
+    assert json.loads(denied)["denied_by"] == "citation"
