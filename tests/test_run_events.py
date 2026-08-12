@@ -50,6 +50,7 @@ from relay.events import (
 from relay.guardrails import RunBudget, ToolPolicy
 from relay.main import app, events, process_ticket
 from relay.models import AgentEvent
+from relay.ratelimit import reserved_usd
 from relay.runs import ActiveRun
 from relay.telemetry import record_run
 from relay.tools import build_registry
@@ -859,6 +860,77 @@ def test_a_run_persists_its_full_event_sequence(client, capture_frames, monkeypa
     # rather than a count so a row landing under the wrong type still fails.
     assert [r["type"] for r in rows] == streamed
     assert [r["seq"] for r in rows] == list(range(1, len(streamed) + 1))
+
+
+def test_a_failed_event_write_ends_the_run_with_a_structured_error(
+    client, capture_frames, monkeypatch
+):
+    """W-2: a failed run_events INSERT ends the run — as an `error` event, not a traceback.
+
+    This phase introduced the only way a DB hiccup can abort a run in flight: before it,
+    no per-event write existed. `_persisted` awaits `recorder.record`, so a transient
+    "database is locked" (busy_timeout is 5s; the MCP server runs against the same file)
+    propagated straight out of the SSE generator. The caller got a truncated stream with
+    NO explanation, and the money already spent with Anthropic was unaccounted for —
+    against this codebase's own rule that a run's failures reach the caller as a
+    structured event and never as a stack trace.
+
+    Fail-closed is kept on purpose (D-01: the database is the source of truth, and D-06
+    only publishes what is committed), so what is asserted here is the SAYING of it: a
+    terminal `error` frame in the existing reason-string form, the generator returning
+    normally, and every cleanup in the finally still running.
+
+    MUTATION that must turn this red: delete the `except sqlite3.Error:` block from
+    event_stream in main.py. The OperationalError then escapes `capture_frames`, the
+    test errors out before its first assertion, and the run's row is never written.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": "liam@brightco.io"})]),
+        response([tool_use_block("send_reply", {"ticket_id": ticket_id, "body": "z" * 40})]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    # Fails on the SECOND event, not the first: mid-run is the case that matters — a run
+    # that dies before it has done anything costs nothing and proves nothing. The first
+    # write is left to succeed so the failure is genuinely an interruption.
+    real_record = RunRecorder.record
+    calls = itertools.count(1)
+
+    def flaky_record(self, event):
+        if next(calls) == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return real_record(self, event)
+
+    monkeypatch.setattr(RunRecorder, "record", flaky_record)
+
+    # No pytest.raises anywhere: the whole claim is that this returns.
+    body, _frames = asyncio.run(capture_frames(ticket_id))
+
+    streamed = _streamed_event_types(body)
+    assert len(streamed) >= 2, (
+        "the run died before the injected failure — this test would prove nothing"
+    )
+    # Terminal, and the LAST thing the client sees: an error followed by more steps would
+    # mean the run carried on writing nothing down.
+    assert streamed[-1] == "error"
+    assert "event: done" not in body
+    error_payload = json.loads(body.rsplit("data: ", 1)[1].strip())
+    assert error_payload["reason"] == "persistence_failed"
+    assert error_payload["note"], "the terminal error carries no explanation for a visitor"
+
+    # The finally still ran, all three of it. Re-opened from disk so an uncommitted
+    # telemetry row cannot pass.
+    reopened = connect(settings.db_path)
+    try:
+        run_row = reopened.execute("SELECT outcome, run_uid FROM runs").fetchone()
+    finally:
+        reopened.close()
+    assert run_row is not None, "record_run never ran — the spend is invisible to the ceiling"
+    assert run_row["outcome"] == "error:persistence_failed"
+    assert app.state.runs.active == 0, "the failed run leaked a registry entry — drains stall"
+    assert reserved_usd() == 0.0, "the failed run leaked its reservation against the daily cap"
 
 
 def test_a_denied_write_tool_persists_cause_before_effect(client, capture_frames, monkeypatch):

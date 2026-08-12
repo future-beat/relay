@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -318,6 +319,45 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                 # broadcast fan-out above is redacted.
                 yield f"event: {event.type}\ndata: {json.dumps(event.data)}\n\n"
             yield "event: done\ndata: {}\n\n"
+        except sqlite3.Error:
+            # A run_events INSERT failed. This phase introduced the only way that can
+            # happen mid-run — before it, no per-event DB write existed, so a lock could
+            # not abort a run in flight. busy_timeout is 5s and the MCP server runs
+            # against the same file, so a cross-process "database is locked" is a real
+            # path here, as is "Cannot operate on a closed database" if a drain times out.
+            #
+            # The run still ENDS: D-01 makes the database the source of truth and D-06
+            # only publishes what is already committed, so carrying on after a failed
+            # write would leave the live feed and phase 6's drill-down describing a run
+            # that was recorded with a hole in it. A durability failure is not a logging
+            # hiccup to swallow.
+            #
+            # What must not happen — and what this phase regressed — is the exception
+            # leaving this generator. That truncated the caller's stream with no
+            # explanation at all, against this codebase's rule that a run's failures
+            # reach the caller as a structured event and never as a stack trace. So the
+            # same fail-closed decision is made, and it is now said out loud in the
+            # stream, in the same reason-string form as api_connection_error and
+            # budget_exceeded.
+            #
+            # Caught by type and narrowly: sqlite3.Error is the persistence layer's own
+            # base class, and _execute_guarded already absorbs anything a TOOL raises, so
+            # the only thing that reaches here is the recorder. It is deliberately NOT
+            # published to the broker — the one publish site is the projection above, and
+            # a lossy mirror missing a frame is exactly what D-01 allows it to be.
+            outcome = "error:persistence_failed"
+            logger.exception("run.persistence_failed", extra={"ctx": {
+                "ticket_id": ticket.id, "run_uid": run_uid,
+            }})
+            failure = {
+                "reason": "persistence_failed",
+                "note": (
+                    "Relay could not durably record this run's steps, so it stopped"
+                    " rather than continue unrecorded. Work already done is charged;"
+                    " retry the ticket."
+                ),
+            }
+            yield f"event: error\ndata: {json.dumps(failure)}\n\n"
         finally:
             # A plain finally, never a context manager: run_ticket suspends at every
             # yield, and anything held across a yield leaks into whatever coroutine
