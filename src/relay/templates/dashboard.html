@@ -46,6 +46,25 @@ dialog#drill::backdrop { background: rgba(0, 0, 0, .35); }
          margin: 0 0 .6rem; }
 .drill-ticket p { white-space: pre-wrap; background: #fafafa; padding: .4rem .6rem;
                   border-radius: 6px; }
+.steps { list-style: none; padding: 0; margin: 0; }
+.steps .step { border-left: 2px solid #e2e2e2; padding: .1rem 0 .5rem .7rem; }
+.step-head { display: flex; gap: .5rem; align-items: baseline; }
+.step-head .seq { color: #999; } .step-head .kind { font-weight: bold; }
+.step-head .at { color: #666; margin-left: auto; font-size: .75rem; }
+.step .line { color: #333; }
+.chips { display: flex; flex-wrap: wrap; gap: .3rem; margin: .2rem 0; }
+.chip { background: #f0f0f0; border-radius: 10px; padding: .05rem .5rem; font-size: .75rem; }
+.chip.other { background: #fff3d6; }
+.chunks { margin: .3rem 0; }
+.chunk { display: grid; grid-template-columns: 9rem 1fr 3.5rem; gap: .4rem;
+         padding: .15rem .4rem; border-radius: 4px; font-size: .78rem; }
+.chunk .score { text-align: right; color: #666; }
+.chunk.cited { background: #eaf4ea; border-left: 3px solid #2c6e2c; }
+.chunk.cited .tag { color: #2c6e2c; font-weight: bold; }
+.chunk.uncited { background: #f7f7f7; border-left: 3px solid #ccc; }
+.chunk.uncited .tag { color: #888; }
+.raw { margin: .3rem 0 0; color: #444; font-size: .78rem; }
+.raw .line { word-break: break-all; }
 </style></head><body>
 <header>
 <h1>Relay — agent runs</h1>
@@ -495,21 +514,135 @@ function renderDrillBody(d) {
   renderSteps(d.steps);
 }
 
+// The type names the server sends are terse; these are what a visitor reads. The map
+// is a display concern only — the dispatch below is on the server's own strings.
+const STEP_LABELS = {
+  usage: "usage", text: "reasoning", tool_use: "tool call", tool_result: "tool result",
+  guardrail: "guardrail", notice: "notice", resolution: "resolution", error: "error",
+};
+
 // The ordered trace. `seq` carries the causal order and `elapsed_ms` the offset from
 // the run's start; a gap in seq is expected (the server drops an unreadable row rather
-// than failing the whole run's history), so nothing here indexes by it.
+// than failing a whole run's history), so nothing here indexes by it.
 function renderSteps(steps) {
   const list = el("ol", { class: "steps" });
   steps.forEach(s => {
     const li = el("li", { class: "step" });
     const head = el("div", { class: "step-head" });
     head.append(el("span", { class: "seq" }, "#" + dash(s.seq)));
-    head.append(el("span", { class: "kind" }, s.type));
+    head.append(el("span", { class: "kind" }, STEP_LABELS[s.type] || s.type));
     head.append(el("span", { class: "at" }, ms(s.elapsed_ms)));
     li.append(head);
+    renderStepBody(s, li);
+    renderRawDetail(s, li);
     list.append(li);
   });
   drillSteps.append(list);
+}
+
+function line(host, text, cls) {
+  host.append(el("div", { class: cls || "line" }, text));
+}
+
+// One branch per published type. All eight are here on purpose: a type with no branch
+// renders as a bare timed row, which looks deliberate and is not — the guardrail step
+// in particular IS the prompt-injection story, and losing it would cost the demo its
+// best moment with nothing failing.
+function renderStepBody(s, host) {
+  if (s.type === "tool_use") {
+    line(host, "-> " + s.tool);
+    // KEYS, never values. This is what the server sent: each key is intersected with
+    // the tool's declared schema server-side, and whatever that excluded arrives as a
+    // count — a number cannot carry a payload.
+    const chips = el("div", { class: "chips" });
+    (s.arg_keys || []).forEach(k => chips.append(el("span", { class: "chip" }, k)));
+    if (s.unknown_arg_count) {
+      chips.append(el("span", { class: "chip other" },
+                     "+" + s.unknown_arg_count + " undeclared"));
+    }
+    host.append(chips);
+  } else if (s.type === "tool_result") {
+    line(host, (s.is_error ? "x " : "<- ") + s.tool +
+               (s.denied_by ? " · denied by " + s.denied_by : "") +
+               " · " + ms(s.duration_ms));
+    if (s.results) renderChunks(s.results, host);
+    if (s.reply_id) line(host, "reply " + s.reply_id + " · " + s.status);
+    if (s.escalation_id) line(host, "escalation " + s.escalation_id + " · " + s.status);
+    if (s.category) line(host, "category " + s.category);
+  } else if (s.type === "guardrail") {
+    line(host, "guard " + s.guard + " -> " + s.action + " on " + s.tool);
+    // The two ids ARE the payoff: a ticket body that named another ticket, and the
+    // guard that refused to act on it.
+    if (s.expected_ticket_id || s.supplied_ticket_id) {
+      line(host, "expected ticket #" + dash(s.expected_ticket_id) +
+                 ", the model supplied #" + dash(s.supplied_ticket_id));
+    }
+    if (s.missing_count) {
+      line(host, s.missing_count + " citation(s) the reply claimed but never retrieved");
+    }
+  } else if (s.type === "notice") {
+    line(host, "notice · " + s.kind + " on " + s.tool + " · " + s.cause);
+    line(host, "retrieval mode " + dash(s.retrieval_mode) +
+               " · " + dash(s.result_count) + " results");
+  } else if (s.type === "usage") {
+    line(host, "step " + dash(s.steps) + " · " + dash(s.input_tokens) + " in / " +
+               dash(s.output_tokens) + " out · $" + dash(s.cost_usd));
+  } else if (s.type === "resolution") {
+    line(host, "resolved via " + s.via + " · " + dash(s.steps) + " steps · $" +
+               dash(s.cost_usd));
+  } else if (s.type === "error") {
+    // `reason` is enumerated and `error_type` is the API's own class name. The error
+    // MESSAGE is not published — it echoes model output and ticket text — so there is
+    // nothing here to show and nothing here to ask for.
+    line(host, "error · " + s.reason +
+               (s.status ? " · HTTP " + s.status : "") +
+               (s.error_type ? " · " + s.error_type : ""));
+  } else if (s.type === "text") {
+    line(host, dash(s.char_count) + " characters of reasoning");
+  }
+}
+
+// The grounding, rendered as the SERVER decided it. `cited` is stamped per result by
+// project_run_detail using the citation guard's own normalisation, so the highlight and
+// the control that enforces it cannot disagree. Nothing here re-derives that comparison
+// — a view that contradicts its control is worse than no view at all.
+function renderChunks(results, host) {
+  if (!results.length) {
+    line(host, "no chunks retrieved", "line empty");
+    return;
+  }
+  const box = el("div", { class: "chunks" });
+  results.forEach(r => {
+    const cited = r.cited === true;
+    const chunk = el("div", { class: cited ? "chunk cited" : "chunk uncited" });
+    chunk.append(el("span", { class: "tag" },
+                    cited ? "cited in the reply" : "retrieved, not cited"));
+    chunk.append(el("span", { class: "doc" }, r.doc + " · " + r.id));
+    chunk.append(el("span", { class: "score" }, dash(r.score)));
+    box.append(chunk);
+  });
+  host.append(box);
+}
+
+// D-02's exception, rendered: for a run the visitor submitted themselves, the server
+// also sends the raw tool input, the raw result, the model's prose and the citations a
+// guard refused. Secondary and collapsed — the trace above is the story, this is the
+// receipt. Every field is optional and asked for by name, so a redacted run renders
+// with no empty holes where these would have been.
+function renderRawDetail(s, host) {
+  const raw = [];
+  if (s.input !== undefined) raw.push(["input", s.input]);
+  if (s.result !== undefined) raw.push(["result", s.result]);
+  if (s.text !== undefined) raw.push(["text", s.text]);
+  if (s.missing_citations !== undefined) raw.push(["invented citations", s.missing_citations]);
+  if (!raw.length) return;
+  const box = el("details", { class: "raw" });
+  box.append(el("summary", {}, "raw — your own run"));
+  raw.forEach(([label, value]) => {
+    box.append(el("div", { class: "line" }, label + ": " +
+      (typeof value === "string" ? value : JSON.stringify(value))));
+  });
+  host.append(box);
 }
 // --- drill-down (/runs/{uid}) — end ---
 
