@@ -15,10 +15,12 @@ default), so every seed here inserts through `_insert_run` with an explicit
 """
 
 import math
+import random
 import sqlite3
 
 from relay.config import settings
 from relay.telemetry import (
+    DAILY_BUCKETS_SQL,
     GLOBAL_PERCENTILE_SQL,
     _percentile,
     run_metrics,
@@ -260,3 +262,152 @@ def test_metrics_window_days_is_a_setting():
     # The window is configuration, not a literal buried in the SQL — 06-01 put it in
     # config.py precisely so the chart's span is deployable.
     assert settings.metrics_window_days >= 1
+
+
+# ---------------------------------------------------------------------------
+# Task 3: the dense daily series (DASH-04 / D-10)
+# ---------------------------------------------------------------------------
+
+
+def _day_string(conn, offset: int) -> str:
+    """The day label SQLite will produce for `offset` days ago, from SQLite's clock.
+
+    Not `datetime.now()`: `created_at` and the window predicate are both UTC via
+    SQLite, so a Python-side date would drift with the process timezone and this
+    oracle would be comparing against the wrong day.
+    """
+    return conn.execute("SELECT date('now', ?) AS d", (f"{offset:+d} days",)).fetchone()["d"]
+
+
+def test_daily_series_is_dense_and_empty_safe(conn):
+    """Every day in the window is a point, including the days with no runs.
+
+    MUTATION that must turn this red: return the query's rows straight out of
+    run_metrics without densifying. Only days that have runs come back from SQL, so
+    the series shrinks to 2 entries — the length assertion fails, and on the page a
+    quiet Tuesday would be a missing point that the chart draws straight through
+    instead of a visible zero.
+    """
+    window = settings.metrics_window_days
+    _insert_run(conn, day_offset=0, duration_ms=100, cost_usd=0.02)
+    _insert_run(conn, day_offset=-3, duration_ms=300, cost_usd=0.05)
+
+    daily = run_metrics(conn)["daily"]
+
+    assert len(daily) == window, "the series is the window, not just the days with runs"
+    days = [d["day"] for d in daily]
+    assert days == sorted(days), "ascending by day — the chart plots left to right"
+    assert len(set(days)) == window, "each day appears exactly once"
+    assert days[-1] == _day_string(conn, 0), "the series ends today"
+    assert days[0] == _day_string(conn, -(window - 1)), "and starts window-1 days back"
+
+    by_day = {d["day"]: d for d in daily}
+    assert by_day[_day_string(conn, 0)] == {
+        "day": _day_string(conn, 0), "runs": 1,
+        "cost_usd": 0.02, "p50_ms": 100, "p95_ms": 100,
+    }
+    assert by_day[_day_string(conn, -3)]["runs"] == 1
+    assert by_day[_day_string(conn, -3)]["p50_ms"] == 300
+
+    empty = by_day[_day_string(conn, -1)]
+    assert empty == {
+        "day": _day_string(conn, -1), "runs": 0,
+        "cost_usd": 0.0, "p50_ms": None, "p95_ms": None,
+    }
+    # A day with no runs has no latency — 0 would draw a spike to the floor and read
+    # as "every run was instant on Tuesday". None is the chart's gap.
+    assert sum(d["runs"] for d in daily) == 2
+
+
+def test_daily_series_on_an_empty_database(conn):
+    window = settings.metrics_window_days
+    daily = run_metrics(conn)["daily"]
+
+    assert len(daily) == window, "the chart has an x-axis before the first run"
+    assert all(d["runs"] == 0 and d["cost_usd"] == 0.0 for d in daily)
+    assert all(d["p50_ms"] is None and d["p95_ms"] is None for d in daily)
+
+
+def test_daily_percentiles_match_the_oracle(conn):
+    """The SQL per-day percentiles equal a half-up nearest-rank Python oracle.
+
+    Randomised over the whole window with a fixed seed so the small-n days — where
+    rank formulas differ — are actually hit rather than assumed.
+
+    MUTATION that must turn this red: change the rank expression in DAILY_BUCKETS_SQL
+    from `1 + MIN(n - 1, CAST(ROUND(? * (n - 1)) AS INTEGER))` to the common
+    off-by-one form `CAST(? * n AS INTEGER)`. Days with small n disagree immediately
+    (n=1 gives rank 0, which matches no row, so p50 goes NULL).
+    """
+    rng = random.Random(20260812)
+    window = settings.metrics_window_days
+    # Counts are drawn first so the fixture's shape (and the n=0/n=1 coverage asserted
+    # below) does not depend on how many durations happened to be drawn before it.
+    counts = {offset: rng.randrange(0, 7) for offset in range(0, -window, -1)}
+    seeded: dict[int, list[int]] = {}
+    for offset, count in counts.items():
+        durations = [rng.randrange(50, 5000) for _ in range(count)]
+        seeded[offset] = durations
+        for ms in durations:
+            _insert_run(conn, day_offset=offset, duration_ms=ms, cost_usd=0.01)
+
+    assert any(len(v) == 1 for v in seeded.values()), "the n=1 case must be exercised"
+    assert any(len(v) == 0 for v in seeded.values()), "and so must an empty day"
+
+    by_day = {d["day"]: d for d in run_metrics(conn)["daily"]}
+
+    for offset, durations in seeded.items():
+        row = by_day[_day_string(conn, offset)]
+        assert row["runs"] == len(durations)
+        if not durations:
+            assert row["p50_ms"] is None and row["p95_ms"] is None
+            continue
+        assert row["p50_ms"] == _oracle(durations, 0.50), f"p50 mismatch at {offset}"
+        assert row["p95_ms"] == _oracle(durations, 0.95), f"p95 mismatch at {offset}"
+        assert row["p50_ms"] == _percentile(sorted(durations), 0.50), (
+            "the daily chart and the p50 card must be one definition of median"
+        )
+        assert row["cost_usd"] == round(0.01 * len(durations), 4)
+
+
+def test_the_window_bounds_the_chart_not_the_ledger(conn):
+    """A run older than the window leaves the chart but stays in the totals.
+
+    The `WHERE created_at >= ...` is what keeps this route's cost flat for the life of
+    the Fly volume (it is ungated and polled every 5s per tab). It must not also
+    quietly rewrite the cost ledger the cards show.
+
+    MUTATION: replace the WHERE in DAILY_BUCKETS_SQL with a tautology. The query is
+    asserted DIRECTLY below, not only through run_metrics — densifying the result
+    onto the window's day list drops out-of-window days anyway, so a test that only
+    read run_metrics()["daily"] would stay green while the read went unbounded. That
+    is precisely the shape of vacuous test this project keeps producing, so the query
+    plan and the query's own rows are what is asserted.
+    """
+    window = settings.metrics_window_days
+    _insert_run(conn, day_offset=-(window + 6), duration_ms=9999, cost_usd=0.40)
+    _insert_run(conn, day_offset=0, duration_ms=100, cost_usd=0.02)
+
+    # The WHERE prunes at the source, and does it through the index (T-06-07: this
+    # route is ungated and polled every 5s per tab, so the read must stay flat as the
+    # Fly volume fills).
+    offset = f"-{window - 1} days"
+    from_sql = conn.execute(DAILY_BUCKETS_SQL, (offset,)).fetchall()
+    assert [r["day"] for r in from_sql] == [_day_string(conn, 0)], (
+        "the out-of-window run reached the daily query — the WHERE is not pruning"
+    )
+    plan = " ".join(
+        r["detail"] for r in
+        conn.execute("EXPLAIN QUERY PLAN " + DAILY_BUCKETS_SQL, (offset,)).fetchall()
+    )
+    assert "idx_runs_created_at" in plan, f"the window fell back to a scan: {plan}"
+
+    payload = run_metrics(conn)
+
+    assert len(payload["daily"]) == settings.metrics_window_days
+    assert sum(d["runs"] for d in payload["daily"]) == 1, "the old run is off the chart"
+    assert all(d["p95_ms"] != 9999 for d in payload["daily"])
+    # ...but it is still money that was spent and a run that happened.
+    assert payload["runs"] == 2
+    assert payload["cost_usd"]["total"] == 0.42
+    assert payload["latency_ms"]["max"] == 9999
