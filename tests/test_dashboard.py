@@ -2294,3 +2294,68 @@ def test_the_drill_panel_renders_demo_fidelity_when_present(client):
     assert "!== undefined" in code
     # ...and nothing is appended at all when the server sent none of them.
     assert "if (!raw.length) return;" in code
+
+
+def test_the_live_feed_can_open_a_drill_down(client):
+    """An in-flight run is drillable while it runs, not only after it lands.
+
+    Every feed frame carries `run_uid` (CR-03 stamps it), and GET /runs/{uid} answers
+    `status: "in_flight"` for a run whose summary row does not exist yet — so the feed's
+    per-run node can open the same panel the table does, and a visitor who watches a run
+    start can look inside it immediately.
+
+    This also restates every identifier Phase 5's own test asserts inside that block.
+    MUTATION named for that half: drop any one of them (the EventSource constructor, the
+    snapshot listener, a FEED_TYPES entry, the run_uid/ticket_id reads, the CLOSED
+    branch) — tests/test_run_events.py goes red, which is exactly why they are repeated
+    here: this plan ADDS a control to a block a shipped test owns, and must not rewrite
+    it. MUTATION for the new half: delete the openDrill control from runNode — the feed
+    becomes watch-only again and an in-flight run is undrillable until it finishes.
+
+    WEAK BY CONSTRUCTION: grep over served HTML; no DOM, no click, no dialog.
+    """
+    html = client.get("/dashboard").text
+    feed = _block(html, "live feed (/events)")
+    code = _code_only(feed)
+
+    # The new half.
+    assert "openDrill(f.run_uid)" in code, "the live feed cannot open a run's trace"
+
+    # The Phase-5 half, unchanged.
+    assert 'new EventSource("/events")' in code
+    assert 'es.addEventListener("snapshot"' in code
+    subscribed = code.split("const FEED_TYPES = [", 1)[1].split("]", 1)[0]
+    for frame_type in _STEP_TYPES:
+        assert f'"{frame_type}"' in subscribed, f"the page stopped listening for {frame_type}"
+    assert "f.run_uid" in code and "f.ticket_id" in code
+    assert "EventSource.CLOSED" in code
+    assert "setInterval(refresh, 5000)" in html
+
+
+def test_the_page_never_asks_for_full_fidelity(client):
+    """T-06-24 / Pitfall 8: the fidelity decision is server-side, and the page says so.
+
+    Which runs are shown in detail is derived from `tickets.origin`, written by the
+    CREATION tier — the route takes one path parameter and there is nothing in its
+    signature to tamper with. The actual control is server-side and 06-04's tampering
+    test is what proves it. This asserts the weaker, still-worth-having property: the
+    page does not even APPEAR to ask, because a page that asks is a page whose next
+    author assumes asking works and builds a toggle on top of it.
+
+    MUTATION named for it: append `?full=1` to openDrill's fetch. The server ignores it
+    (06-04 pins that by byte comparison), so nothing about the rendered page changes —
+    which is precisely why this grep, and not a behavioural test, is the guard here.
+
+    STATED PLAINLY: this test passed the moment it was written; the drill-down never
+    had such a parameter. Its whole value is failing the day someone adds one. That is
+    the same shape as 06-04's test_create_gate_is_not_charged_twice, and it is named
+    rather than dressed up as discovery.
+    """
+    html = client.get("/dashboard").text
+    for token in ("full=", "fidelity=", "X-Demo", "raw=1", "?full", "&full"):
+        assert token not in html, f"the page asks the server for more with {token}"
+    # No header is set on the drill fetch at all: the route takes a path parameter and
+    # nothing else, so a headers bag here could only be an attempt to widen it.
+    drill_code = _code_only(_block(html, _DRILL))
+    assert "headers" not in drill_code
+    assert 'fetch("/runs/" + encodeURIComponent(uid))' in drill_code
