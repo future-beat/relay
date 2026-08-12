@@ -9,6 +9,7 @@
 
 import json
 import logging
+import math
 import os
 from datetime import UTC, datetime
 from typing import Any
@@ -92,50 +93,116 @@ def record_run(
 
 
 def _percentile(sorted_values: list[int], pct: float) -> int:
+    """Nearest-rank percentile, half-up — this codebase's one definition of "median".
+
+    Half-up, not Python's `round()`, which is banker's rounding. The percentiles on
+    /metrics are now computed by SQL (below), and SQLite's `ROUND` is half-up: ship
+    both roundings and the p50 card and the p50 line on the latency chart show
+    different numbers for the same runs, on a page whose entire purpose is looking
+    credible. Research measured the two disagreeing on 16 of 177 sampled (n, pct)
+    pairs, so this is not a theoretical tie-break.
+
+    Its production role is now to be that statement of the definition in Python:
+    tests/test_metrics.py::test_percentile_is_half_up asserts this function and
+    GLOBAL_PERCENTILE_SQL agree for every sampled pair, which is what stops the two
+    from drifting apart the next time either is touched.
+    """
     if not sorted_values:
         return 0
-    index = min(len(sorted_values) - 1, round(pct * (len(sorted_values) - 1)))
+    index = min(len(sorted_values) - 1, math.floor(pct * (len(sorted_values) - 1) + 0.5))
     return sorted_values[index]
 
 
 # The public shape of /metrics, named rather than taken from `SELECT *` (WR-10). The
-# star used to mean every column of `runs` was published: phase 5's `run_uid` joined
-# the payload the moment it was added, and it is the key into `run_events` — a table
-# deliberately filled with unredacted customer data, whose access model phase 6 has not
-# decided yet. Naming the columns also makes the next one somebody adds a decision
-# rather than a silent public API change.
+# star meant every column of `runs` was published, so phase 5's `run_uid` joined the
+# payload the moment the column was added — an undecided disclosure, made silently.
+# The explicit tuple is what makes the NEXT column somebody adds to `runs` a decision
+# taken here rather than a silent change to a public API.
+#
+# `run_uid` is on the list deliberately, reversing WR-10's removal. WR-10 was right
+# while the uid was a handle into `run_events`' raw payloads with no decided access
+# model; phase 6 decided that model (D-01/D-03): the drill-down the uid opens is
+# public and server-redacted, and its full-fidelity branch keys off `tickets.origin`,
+# read server-side and unreachable from the request. Holding the uid therefore grants
+# nothing that is not already redacted — and it is the one thing that makes a row in
+# the last-runs table clickable.
 _PUBLIC_RUN_COLUMNS = (
     "id", "ticket_id", "model", "duration_ms", "steps",
     "input_tokens", "output_tokens", "cost_usd", "outcome", "created_at",
+    "run_uid",
 )
 
 
+# --- /metrics aggregation ---------------------------------------------------------
+# Named module-level constants, following ratelimit.DAILY_SPEND_SQL's precedent: these
+# run on an ungated route polled every 5s per open tab, so they are the queries you
+# want to be able to grep for. Every one of them replaces a Python aggregation over a
+# full materialisation of `runs` — a read whose cost grew for the life of the volume.
+
+TOTALS_SQL = (
+    "SELECT COUNT(*)                        AS runs,"
+    "       COALESCE(SUM(input_tokens), 0)  AS input_tokens,"
+    "       COALESCE(SUM(output_tokens), 0) AS output_tokens,"
+    "       COALESCE(SUM(cost_usd), 0.0)    AS cost_usd,"
+    "       COALESCE(MAX(duration_ms), 0)   AS max_ms"
+    " FROM runs"
+)
+
+# The raw outcome strings, kept alongside outcome_distribution: it is one cheap
+# GROUP BY, it is part of /metrics' published shape, and nothing on the page reads it.
+OUTCOMES_SQL = "SELECT outcome, COUNT(*) AS n FROM runs GROUP BY outcome"
+
+# Nearest-rank percentile in SQL. `MIN(n - 1, ...)` is the two-argument scalar min;
+# `MAX(CASE ...)` is the aggregate picking the single ranked row out. Empty table ->
+# one row of NULL, which the caller floors to 0. The `? * (n - 1)` rank must stay
+# identical to _percentile's index, and test_percentile_is_half_up pins that.
+GLOBAL_PERCENTILE_SQL = (
+    "WITH ranked AS ("
+    " SELECT duration_ms,"
+    "        ROW_NUMBER() OVER (ORDER BY duration_ms) AS rn,"
+    "        COUNT(*)     OVER ()                     AS n"
+    " FROM runs)"
+    " SELECT MAX(CASE WHEN rn = 1 + MIN(n - 1, CAST(ROUND(? * (n - 1)) AS INTEGER))"
+    "                 THEN duration_ms END) AS value"
+    " FROM ranked"
+)
+
+LAST_RUNS_LIMIT = 20
+
+# ORDER BY id DESC LIMIT 20 in SQL, not `rows[-20:][::-1]` in Python: the slice was
+# the last unbounded read left on this route.
+LAST_RUNS_SQL = (
+    f"SELECT {', '.join(_PUBLIC_RUN_COLUMNS)} FROM runs"
+    f" ORDER BY id DESC LIMIT {LAST_RUNS_LIMIT}"
+)
+
+
+def _sql_percentile(conn: Database, pct: float) -> int:
+    row = conn.execute(GLOBAL_PERCENTILE_SQL, (pct,)).fetchone()
+    value = row["value"] if row is not None else None
+    return int(value) if value is not None else 0
+
+
 def run_metrics(conn: Database) -> dict[str, Any]:
-    rows = [
-        dict(r) for r in conn.execute(
-            f"SELECT {', '.join(_PUBLIC_RUN_COLUMNS)} FROM runs ORDER BY id"
-        ).fetchall()
-    ]
-    durations = sorted(r["duration_ms"] for r in rows)
-    outcomes: dict[str, int] = {}
-    for r in rows:
-        outcomes[r["outcome"]] = outcomes.get(r["outcome"], 0) + 1
-    total_cost = sum(r["cost_usd"] for r in rows)
+    totals = conn.execute(TOTALS_SQL).fetchone()
+    n_runs = int(totals["runs"])
+    total_cost = float(totals["cost_usd"])
+    outcomes = {r["outcome"]: r["n"] for r in conn.execute(OUTCOMES_SQL).fetchall()}
     return {
-        "runs": len(rows),
+        "runs": n_runs,
         "outcomes": outcomes,
         "tokens": {
-            "input": sum(r["input_tokens"] for r in rows),
-            "output": sum(r["output_tokens"] for r in rows),
+            "input": int(totals["input_tokens"]),
+            "output": int(totals["output_tokens"]),
         },
         "cost_usd": {
             "total": round(total_cost, 4),
-            "mean_per_run": round(total_cost / len(rows), 4) if rows else 0.0,
+            "mean_per_run": round(total_cost / n_runs, 4) if n_runs else 0.0,
         },
         "latency_ms": {
-            "p50": _percentile(durations, 0.50),
-            "p95": _percentile(durations, 0.95),
-            "max": durations[-1] if durations else 0,
+            "p50": _sql_percentile(conn, 0.50),
+            "p95": _sql_percentile(conn, 0.95),
+            "max": int(totals["max_ms"]),
         },
-        "last_runs": rows[-20:][::-1],
+        "last_runs": [dict(r) for r in conn.execute(LAST_RUNS_SQL).fetchall()],
     }

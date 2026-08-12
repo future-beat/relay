@@ -123,19 +123,29 @@ def test_record_run_persists_run_uid(conn):
     assert conn.execute("SELECT run_uid FROM runs").fetchone()["run_uid"] == "abc123"
 
 
-def test_metrics_does_not_publish_run_uid(client):
-    """WR-10: the join key into the PII table is not on the public endpoint.
+def test_metrics_publishes_exactly_these_columns(client):
+    """The public shape of /metrics' last_runs, asserted as an exact set.
 
-    /metrics is ungated (D-07 keeps it public beside /health and /dashboard) and was
-    built with `SELECT * FROM runs`, so phase 5's new `run_uid` column joined the public
-    payload the moment it was added — the key into `run_events`, which this phase
-    deliberately fills with unredacted customer data, published before phase 6 has
-    decided the drill-down's access model.
+    This is WR-10's test, restated rather than deleted. WR-10 removed `run_uid` from
+    the payload because `run_metrics` was built on `SELECT * FROM runs`, so phase 5's
+    new column joined an ungated endpoint the moment it was added — a handle into
+    `run_events`, a table deliberately filled with unredacted customer data, published
+    before phase 6 had decided the drill-down's access model.
 
-    MUTATION that must turn this red: restore `SELECT * FROM runs` in run_metrics — the
-    uid reappears in last_runs and both assertions fail. The exact key set is asserted
-    rather than just the uid's absence, so the NEXT column somebody adds to `runs` is a
-    decision here rather than a silent public API change.
+    Phase 6 has now decided it (D-01/D-03): the drill-down is public and
+    server-redacted, and its full-fidelity branch is gated on `tickets.origin`, read
+    server-side and unreachable from the request. So the uid is no longer a key to
+    anything undisclosed — it is a correlation token, and it is what makes a row in
+    the table clickable. Publishing it is the deliberate reversal, which is why this
+    test asserts the uid's VALUE arrives rather than merely tolerating the key.
+
+    What does NOT change is the mechanism WR-10 actually bought: the column list is
+    explicit and asserted as an exact set, so the next column somebody adds to `runs`
+    is a decision taken here rather than a silent public API change.
+
+    MUTATION that must turn this red: restore `SELECT * FROM runs` in run_metrics.
+    Extra columns appear in last_runs and the exact-set assertion fails — the
+    exactness, not the uid's absence, is the guard.
     """
     record_run(app.state.conn, ticket_id=1, model="claude-sonnet-5", duration_ms=100,
                steps=2, input_tokens=10, output_tokens=5, cost_usd=0.002,
@@ -143,19 +153,20 @@ def test_metrics_does_not_publish_run_uid(client):
 
     payload = client.get("/metrics").json()
 
-    assert "JOIN-KEY-SENTINEL" not in json.dumps(payload), (
-        "/metrics published the run_uid — the join key into the raw run_events payloads"
-    )
     assert payload["last_runs"], "no run reached /metrics — this test would prove nothing"
     assert set(payload["last_runs"][0]) == {
         "id", "ticket_id", "model", "duration_ms", "steps",
         "input_tokens", "output_tokens", "cost_usd", "outcome", "created_at",
+        "run_uid",
     }
+    # The reversal is observable, not just tolerated: the drill-down link needs the
+    # value, so a payload carrying the key with a stripped value would be a regression.
+    assert payload["last_runs"][0]["run_uid"] == "JOIN-KEY-SENTINEL"
+    assert "JOIN-KEY-SENTINEL" in json.dumps(payload)
     # The dashboard's own fields still arrive: an endpoint tuned to leak nothing by
     # publishing nothing is not a metrics endpoint.
     assert payload["last_runs"][0]["outcome"] == "send_reply"
     assert payload["runs"] == 1
-    # The uid is still WRITTEN — it is the phase's join key — it is just not published.
     assert app.state.conn.execute(
         "SELECT run_uid FROM runs"
     ).fetchone()["run_uid"] == "JOIN-KEY-SENTINEL"
