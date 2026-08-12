@@ -22,6 +22,10 @@ th, td { text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; 
 .dist .fill { background: #444; border-radius: 4px; height: .8rem; min-width: 1px; }
 .dist .n { text-align: right; color: #666; }
 .empty { color: #666; font-size: .8rem; }
+h3 { font-size: .8rem; font-weight: normal; color: #666; margin: 1rem 0 .2rem; }
+#charts svg { display: block; max-width: 100%; }
+.gauge-labels { font-size: .8rem; } .gauge-labels b { font-size: 1.1rem; }
+.gauge-note { color: #666; font-size: .75rem; margin: .2rem 0 0; }
 #feed-status { color: #666; font-size: .8rem; }
 #feed-list { list-style: none; padding: 0; margin: .6rem 0 0; font-size: .85rem; }
 #feed-list li { border: 1px solid #eee; border-radius: 6px; padding: .4rem .7rem;
@@ -180,10 +184,157 @@ async function refresh() {
   const m = await (await fetch("/metrics")).json();
   renderCards(m);
   renderDistribution(m.outcome_distribution);
+  // One poll feeds the cards, the bars, both charts and the gauge — D-05/D-09 keep
+  // this page on one data route, so no renderer here opens a fetch of its own.
+  renderCharts(m);
   renderRuns(m.last_runs);
 }
 refresh(); setInterval(refresh, 5000);
 // --- metrics poll (/metrics) — end ---
+
+// --- charts (SVG) — begin ---
+// DASH-04: cost over time, latency over time, and the remaining daily budget — drawn
+// by hand with createElementNS. No chart library, no <script src>, no CDN and no build
+// step: this page is one file the server reads and substitutes a key into, and adding
+// a third-party script to the public landing surface would be a supply chain on the
+// one page whose whole job is credibility.
+const SVGNS = "http://www.w3.org/2000/svg";
+
+function svg(tag, attrs, text) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text !== undefined) n.textContent = text;   // textContent, always
+  return n;
+}
+
+function frame(w, h) {
+  return svg("svg", { viewBox: "0 0 " + w + " " + h, width: "100%", height: String(h) });
+}
+
+const CHART_W = 640, CHART_H = 160, CHART_PAD = 24;
+
+// Daily cost: one bar per entry of m.daily. The server densifies that series, so an
+// idle Tuesday arrives as a zero bar rather than as a missing point, and the x axis is
+// a plain map with no date arithmetic in the browser.
+function renderCostChart(series) {
+  const host = document.getElementById("chart-cost");
+  clear(host);
+  host.append(el("h3", {}, "Cost per day"));
+  if (!series.length || series.every(d => d.runs === 0)) {
+    host.append(el("p", { class: "empty" },
+                   "no runs yet — bars appear as tickets arrive"));
+    return;
+  }
+  const w = CHART_W, h = CHART_H, pad = CHART_PAD;
+  const max = Math.max(1e-9, ...series.map(d => d.cost_usd));
+  const bw = (w - pad * 2) / series.length;
+  const root = frame(w, h);
+  series.forEach((d, i) => {
+    const bh = (h - pad * 2) * (d.cost_usd / max);
+    root.append(svg("rect", {
+      x: pad + i * bw + 1, y: h - pad - bh,
+      width: Math.max(bw - 2, 1), height: Math.max(bh, 0), fill: "#444",
+    }));
+  });
+  root.append(svg("text", { x: pad, y: 12, "font-size": "10", fill: "#666" },
+                  "peak $" + max.toFixed(4) + "/day"));
+  root.append(svg("text", { x: pad, y: h - 6, "font-size": "10", fill: "#666" },
+                  series[0].day));
+  root.append(svg("text", { x: w - pad, y: h - 6, "font-size": "10", fill: "#666",
+                            "text-anchor": "end" }, series[series.length - 1].day));
+  host.append(root);
+}
+
+// Daily p50/p95. Days with no runs carry a null percentile from the server (a zero
+// would draw a spike to the floor and read as "every run was instant"), so they are
+// skipped, and a segment is drawn only between adjacent days that both have a value —
+// a line straight across an idle week would be an invention.
+function renderLatencyChart(series) {
+  const host = document.getElementById("chart-latency");
+  clear(host);
+  host.append(el("h3", {}, "Latency per day (p50 / p95)"));
+  const points = series
+    .map((d, i) => ({ i: i, p50: d.p50_ms, p95: d.p95_ms }))
+    .filter(p => p.p50 !== null && p.p50 !== undefined);
+  if (!points.length) {
+    host.append(el("p", { class: "empty" },
+                   "no runs yet — timings appear after the first ticket"));
+    return;
+  }
+  const w = CHART_W, h = CHART_H, pad = CHART_PAD;
+  const max = Math.max(1, ...points.map(p => p.p95 || p.p50));
+  const step = (w - pad * 2) / Math.max(series.length - 1, 1);
+  const x = i => pad + i * step;
+  const y = v => h - pad - (h - pad * 2) * (v / max);
+  const root = frame(w, h);
+  [["p95", "#999"], ["p50", "#444"]].forEach(([key, colour]) => {
+    points.forEach((p, n) => {
+      const value = key === "p95" ? (p.p95 || p.p50) : p.p50;
+      const prev = points[n - 1];
+      if (prev && p.i - prev.i === 1) {
+        const prevValue = key === "p95" ? (prev.p95 || prev.p50) : prev.p50;
+        root.append(svg("line", {
+          x1: x(prev.i), y1: y(prevValue), x2: x(p.i), y2: y(value),
+          stroke: colour, "stroke-width": 2,
+        }));
+      }
+      root.append(svg("circle", { cx: x(p.i), cy: y(value), r: 2.5, fill: colour }));
+    });
+  });
+  root.append(svg("text", { x: pad, y: 12, "font-size": "10", fill: "#666" },
+                  "peak " + max + " ms"));
+  host.append(root);
+}
+
+// --- budget gauge — begin ---
+// D-11: the fraction is the SERVER's, read straight off /metrics.budget. It is not
+// re-derived from last_runs here and must not be: budget_snapshot includes the spend
+// RESERVED by runs still in flight, because that is what the gate compares before it
+// answers 503. A gauge summing committed rows would read low by up to
+// concurrency x max_run_cost_usd and promise budget the very next request refuses.
+function arcPath(cx, cy, r, fromDeg, toDeg) {
+  const p = deg => [cx + r * Math.cos(Math.PI * deg / 180),
+                    cy + r * Math.sin(Math.PI * deg / 180)];
+  const [x1, y1] = p(fromDeg), [x2, y2] = p(toDeg);
+  return "M " + x1 + " " + y1 + " A " + r + " " + r + " 0 " +
+         ((toDeg - fromDeg) > 180 ? 1 : 0) + " 1 " + x2 + " " + y2;
+}
+
+function renderGauge(budget) {
+  const host = document.getElementById("gauge");
+  clear(host);
+  host.append(el("h3", {}, "Daily budget"));
+  const spent = budget.spent_today_usd;
+  const ceiling = budget.daily_ceiling_usd;
+  const fraction = ceiling > 0 ? Math.min(1, Math.max(0, spent / ceiling)) : 0;
+  const w = 240, h = 130, cx = 120, cy = 110, r = 88;
+  const root = frame(w, h);
+  root.append(svg("path", { d: arcPath(cx, cy, r, 180, 360), fill: "none",
+                            stroke: "#eee", "stroke-width": 14 }));
+  if (fraction > 0) {
+    root.append(svg("path", {
+      d: arcPath(cx, cy, r, 180, 180 + 180 * fraction), fill: "none",
+      stroke: budget.exhausted ? "#a33" : "#444", "stroke-width": 14,
+    }));
+  }
+  host.append(root);
+  const labels = el("div", { class: "gauge-labels" });
+  labels.append(el("b", {}, "$" + spent + " / $" + ceiling));
+  labels.append(el("div", {}, "$" + budget.remaining_usd + " left today"));
+  labels.append(el("div", {}, "resets at " + budget.resets_at));
+  host.append(labels);
+  host.append(el("p", { class: "gauge-note" },
+                 "Includes runs in flight — this is the figure the spend gate compares,"
+                 + " reservations and all, so it can move while a run is working."));
+}
+// --- budget gauge — end ---
+
+function renderCharts(m) {
+  renderCostChart(m.daily);
+  renderLatencyChart(m.daily);
+  renderGauge(m.budget);
+}
+// --- charts (SVG) — end ---
 
 // --- live feed (/events) — begin ---
 // The aggregate numbers above still poll; this ADDS the live half DASH-01 names.

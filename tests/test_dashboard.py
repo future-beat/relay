@@ -1899,6 +1899,18 @@ def _block(html: str, name: str) -> str:
     return html.split(begin, 1)[1].split(end, 1)[0]
 
 
+def _code_only(block: str) -> str:
+    """A JS block with its `//` comment lines dropped.
+
+    For assertions about what the code does NOT do: the comments in this file name the
+    forbidden constructs on purpose (that is how the next reader learns why they are
+    forbidden), so an absence assertion over the raw block would be about prose.
+    """
+    return "\n".join(
+        line for line in block.splitlines() if not line.strip().startswith("//")
+    )
+
+
 def test_dashboard_never_renders_through_a_markup_sink(client):
     """T-06-19: one rendering rule, the WHOLE page — not just the feed block.
 
@@ -1965,3 +1977,82 @@ def test_dashboard_renders_without_a_demo_key(client, monkeypatch):
     assert resp.status_code == 200
     assert "(not configured)" in resp.text
     assert "None" not in resp.text
+
+
+# --- Wave 4: the charts and the budget gauge (DASH-04) -------------------------------
+
+
+def test_charts_are_built_as_inline_svg_without_a_library(client):
+    """DASH-04 / T-06-20: hand-built SVG, and no third-party script on the page.
+
+    MUTATION that must turn this red: add a CDN chart library
+    (`<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>`) and draw with it
+    — the charts block loses createElementNS and the page gains a remote script, which
+    is a supply chain on the public landing surface.
+
+    WEAK BY CONSTRUCTION: grep over served HTML; nothing here executes the drawing.
+    """
+    html = client.get("/dashboard").text
+    block = _block(html, "charts (SVG)")
+
+    assert "createElementNS" in block
+    assert 'SVGNS = "http://www.w3.org/2000/svg"' in block
+    # Page-wide, not block-scoped: a remote script anywhere on the document is the
+    # thing DASH-04 forbids, and it would not be added inside the charts block.
+    for forbidden in ("<script src=", "cdn.", "unpkg", "import(", "importScripts"):
+        assert forbidden not in html, f"{forbidden} reached the dashboard"
+    assert not re.search(r"https://\S+\.(js|css)", html)
+
+
+def test_the_gauge_reads_the_servers_budget_object(client):
+    """D-11: the gauge renders the gate's arithmetic, never a second derivation.
+
+    MUTATION that must turn this red: compute the fraction from last_runs
+    (`m.last_runs.reduce((a, r) => a + r.cost_usd, 0) / ceiling`) — the spend RESERVED
+    by runs in flight vanishes, the gauge reads up to concurrency x max_run_cost_usd
+    low, and the page promises budget the next /process answers 503 to.
+
+    WEAK BY CONSTRUCTION, and worth naming precisely: this greps the block for the
+    server's keys and for the absence of a client-side sum. It cannot prove the two
+    numbers agree — that proof is server-side, in
+    test_budget_gauge_matches_what_the_gate_refuses_on (plan 06-04), which is where the
+    single arithmetic is actually pinned.
+    """
+    html = client.get("/dashboard").text
+    gauge = _block(html, "budget gauge")
+
+    assert "spent_today_usd" in gauge and "daily_ceiling_usd" in gauge
+    assert "remaining_usd" in gauge and "resets_at" in gauge
+    # No re-derivation inside the gauge: no reduction, no accumulation, and no reading
+    # of the per-run list at all — asserted over the CODE, with the `//` lines dropped,
+    # because the comment explaining why the sum is forbidden names it too.
+    code = _code_only(gauge)
+    assert "last_runs" not in code
+    assert "reduce(" not in code
+    assert not re.search(r"\+=\s*\w+\.cost_usd", code)
+    # The copy has to explain the jump, or the in-flight reservation reads as a bug.
+    assert "in flight" in gauge
+
+
+def test_charts_have_an_empty_state(client):
+    """A demo whose volume was just created must render empty charts, not broken ones.
+
+    Both daily charts and the distribution take an explicit no-data branch before any
+    scale is computed: a max over an empty series is -Infinity, and every bar height
+    downstream of it is NaN — which SVG renders as nothing at all, with no clue why.
+
+    MUTATION that must turn this red: delete the `!series.length || series.every(...)`
+    guard from renderCostChart.
+
+    WEAK BY CONSTRUCTION: grep-level. It sees that the branch is present and that its
+    label is not the string Python stringifies a missing value into; it does not see it
+    execute.
+    """
+    html = client.get("/dashboard").text
+    block = _block(html, "charts (SVG)")
+
+    assert "series.every(d => d.runs === 0)" in block, "no empty branch in the cost chart"
+    assert "!points.length" in block, "no empty branch in the latency chart"
+    assert block.count('class: "empty"') >= 2
+    assert "no runs yet" in block
+    assert "None" not in html
