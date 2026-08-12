@@ -6,11 +6,16 @@ that watches it, and each one fails in a way the others cannot catch:
 - `RunEventBroker` fans a frame out to every watching browser. It is bounded and
   drop-oldest so a stalled viewer's queue can never backpressure the run that is
   paying Anthropic for the step (D-10).
-- `project()` is the only path raw event data may take to become a public frame. It
+- `project()` is the only path raw EVENT data may take to become a public frame. It
   is an allowlist, built field by field: a denylist leaks the first field someone
   adds later, and the fields flowing past here include customer emails, ticket
   bodies and reply text (D-07). `attribute_to_run()` stamps the run's identity onto
   a frame project() has already built — it is not a second path to one.
+- `snapshot_frame()` is the only other public serialiser on the whole surface: the
+  connect frame (D-14), whose input is registry state rather than a run event. It
+  lives HERE, beside project(), because "the redaction boundary" has to be one file a
+  reviewer can open (WR-04) — it used to sit in main.py while this docstring claimed
+  project() was the only path, which is the kind of gap an audit finds by luck.
 - `RunRecorder` writes one `run_events` row per step. For a write-tier tool the row
   goes in the tool's OWN transaction as a savepoint, so the reply and the record of
   the reply commit or roll back together (D-04).
@@ -23,11 +28,13 @@ broker is built in `lifespan` and held on `app.state`, like `RunRegistry`.
 import asyncio
 import json
 import logging
+import time
 from typing import Any
 
 from .config import settings
 from .db import Database
 from .models import AgentEvent
+from .runs import ActiveRun
 
 logger = logging.getLogger("relay.events")
 
@@ -300,6 +307,33 @@ def attribute_to_run(frame: dict, *, run_uid: str, ticket_id: int) -> dict:
     it — a frame that lies about which run it came from is worse than no frame.
     """
     return {**frame, "run_uid": run_uid, "ticket_id": ticket_id}
+
+
+def snapshot_frame(runs: list[ActiveRun]) -> str:
+    """The one frame a new subscriber gets before any live event (D-14).
+
+    Without it a tab opened mid-run shows an empty feed until the next step happens,
+    which on a quiet demo can be minutes — the visitor concludes nothing is running.
+
+    Built field by field from ActiveRun, for the same reason project() is: this is a
+    public boundary, and `asdict()` here would publish whatever field someone adds to
+    ActiveRun later. There are exactly two fields today and neither is a secret —
+    ticket_id is already public on /metrics (last_runs), and started_at is deliberately
+    NOT published raw: it is a monotonic clock reading, meaningless off this process, so
+    it is rendered as the elapsed time a viewer can actually use.
+
+    Not routed through project(): that function's input is an AgentEvent, and this is
+    registry state, not a run event. It is still an allowlist, written out below — and
+    it lives in this module rather than in main.py so that both public serialisers are
+    in the file whose docstring claims to hold the redaction boundary (WR-04). It takes
+    the snapshot rather than reading `app.state`, so nothing here knows about the app.
+    """
+    now = time.monotonic()
+    rendered = [
+        {"ticket_id": run.ticket_id, "running_for_ms": int((now - run.started_at) * 1000)}
+        for run in runs
+    ]
+    return f"event: snapshot\ndata: {json.dumps({'type': 'snapshot', 'runs': rendered})}\n\n"
 
 
 class RunRecorder:

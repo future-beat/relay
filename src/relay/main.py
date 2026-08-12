@@ -22,6 +22,7 @@ from .events import (
     RunRecorder,
     attribute_to_run,
     project,
+    snapshot_frame,
 )
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
@@ -357,30 +358,6 @@ async def metrics() -> dict:
     return await asyncio.to_thread(run_metrics, app.state.conn)
 
 
-def _snapshot_frame() -> str:
-    """The one frame a new subscriber gets before any live event (D-14).
-
-    Without it a tab opened mid-run shows an empty feed until the next step happens,
-    which on a quiet demo can be minutes — the visitor concludes nothing is running.
-
-    Built field by field from ActiveRun, for the same reason project() is: this is a
-    public boundary, and `asdict()` here would publish whatever field someone adds to
-    ActiveRun later. There are exactly two fields today and neither is a secret —
-    ticket_id is already public on /metrics (last_runs), and started_at is deliberately
-    NOT published raw: it is a monotonic clock reading, meaningless off this process,
-    so it is rendered as the elapsed time a viewer can actually use.
-
-    Not routed through project(): that function's input is an AgentEvent, and this is
-    registry state, not a run event. It is still an allowlist, written out below.
-    """
-    now = time.monotonic()
-    runs = [
-        {"ticket_id": run.ticket_id, "running_for_ms": int((now - run.started_at) * 1000)}
-        for run in app.state.runs.snapshot()
-    ]
-    return f"event: snapshot\ndata: {json.dumps({'type': 'snapshot', 'runs': runs})}\n\n"
-
-
 @app.get("/events", dependencies=[Depends(events_gate)])
 async def events() -> StreamingResponse:
     """The public live feed: every run's redacted steps, as they happen (D-11, SC-2).
@@ -440,7 +417,10 @@ async def events() -> StreamingResponse:
         # ceiling exists to guarantee.
         try:
             idle_deadline = time.monotonic() + settings.events_idle_seconds
-            yield _snapshot_frame()
+            # Both serialisers this generator may use live in events.py, beside the
+            # allowlist they belong to (WR-04). Nothing else may be yielded here that is
+            # not an SSE comment — see test_events_output_comes_only_from_two_serialisers.
+            yield snapshot_frame(app.state.runs.snapshot())
             while True:
                 try:
                     frame = await asyncio.wait_for(

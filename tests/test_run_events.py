@@ -18,6 +18,7 @@ import itertools
 import json
 import sqlite3
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,7 @@ from helpers import (
     text_block,
     tool_use_block,
 )
+from relay import main
 from relay.agent import bind_to_ticket
 from relay.config import settings
 from relay.db import connect, init_db
@@ -39,10 +41,12 @@ from relay.events import (
     RunEventBroker,
     RunRecorder,
     project,
+    snapshot_frame,
 )
 from relay.guardrails import ToolPolicy
 from relay.main import app, events, process_ticket
 from relay.models import AgentEvent
+from relay.runs import ActiveRun
 from relay.telemetry import record_run
 from relay.tools import build_registry
 
@@ -1151,7 +1155,7 @@ def test_events_delivers_a_live_run(client, monkeypatch):
 def test_events_sends_initial_snapshot_on_connect(client):
     """D-14: the FIRST frame is what is running right now, before any live event.
 
-    MUTATION that must turn this red: delete the `yield _snapshot_frame()` line before
+    MUTATION that must turn this red: delete the `yield snapshot_frame(...)` line before
     the receive loop in main.py's stream(). The first chunk is then the live frame
     published below (or nothing at all until one is), and both assertions fail — a tab
     opened mid-run would sit on an empty feed until the next step happened.
@@ -1187,6 +1191,130 @@ def test_events_sends_initial_snapshot_on_connect(client):
     assert set(payload["runs"][0]) == {"ticket_id", "running_for_ms"}
     # And the live event is second, not first.
     assert second.startswith("event: usage\ndata: ")
+
+
+def test_events_output_comes_only_from_two_serialisers(client, monkeypatch):
+    """WR-04: nothing reaches a subscriber except project() or snapshot_frame() output.
+
+    The redaction boundary is only a boundary if it is the WHOLE boundary. Both
+    serialisers now live in events.py, and this asserts the /events generator has no
+    third path: every non-comment chunk it yields must be traceable to one of the two.
+
+    Done by tagging each serialiser's output and following the tags, rather than by
+    reading main.py: a source-level check ("no other f-string in stream()") passes the
+    moment someone yields a helper's return value instead, which is exactly how a third
+    path gets added.
+
+    Two independent properties, because the first mutation I ran survived the tag check
+    alone: (1) every non-comment chunk carries a tag, so nothing but the two serialisers
+    sourced it, and (2) each chunk's SSE event NAME equals its own payload's `type` and
+    its key set is exactly what its serialiser produced, so no path may reframe or
+    re-shape a frame on the way out either.
+
+    MUTATION 1 that must turn this red: yield registry state directly from stream(),
+    e.g. `yield f"event: runs\\ndata: {json.dumps([asdict(r) for r in
+    app.state.runs.snapshot()])}\\n\\n"` — an untagged chunk, named by (1).
+    MUTATION 2 that must turn this red: re-emit the projected frame under a second
+    header, `yield f"event: raw\\ndata: {json.dumps(frame)}\\n\\n"` — tagged, since it is
+    the same frame, but caught by (2)'s name check. That is the one the tag check alone
+    survived, and it is why (2) exists.
+
+    HONEST LIMIT: this pins the /events generator, not the broker. A frame published to
+    the broker without going through project() would be tagged-looking here; that path
+    is pinned separately by there being exactly one publish call site in src/.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.02)
+    monkeypatch.setattr(settings, "events_idle_seconds", 5.0)
+    ticket_id = _make_ticket(client, EMAIL_SENTINEL, f"charged twice. {BODY_SENTINEL}")
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": EMAIL_SENTINEL})]),
+        response([tool_use_block("send_reply", {
+            "ticket_id": ticket_id, "body": f"Refunded. {REPLY_SENTINEL}",
+        })]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    # Tagged stand-ins for the two sanctioned serialisers. Same shapes, so the route is
+    # driven exactly as in production; the marker is the only thing added.
+    monkeypatch.setattr(
+        main, "snapshot_frame",
+        lambda runs: 'event: snapshot\ndata: {"type": "snapshot", "via": "SNAPSHOT-MARKER"}\n\n',
+    )
+    monkeypatch.setattr(
+        main, "project", lambda event: {"type": "usage", "via": "PROJECT-MARKER"}
+    )
+
+    async def drive():
+        stream = await events()
+        it = stream.body_iterator
+        chunks = [await _next_chunk(it)]  # the connect frame
+        run = await process_ticket(ticket_id)
+        async for _chunk in run.body_iterator:
+            await asyncio.sleep(0)
+        # Read until a keep-alive proves the queue is drained, rather than racing a
+        # concurrent reader: liveness is another test's claim, and every frame the run
+        # published has to be in `chunks` for the "no third path" check to be complete.
+        while True:
+            chunk = await _next_chunk(it)
+            chunks.append(chunk)
+            if chunk.startswith(":"):
+                break
+        await it.aclose()
+        return chunks
+
+    chunks = asyncio.run(drive())
+
+    # Comments are transport, not content: they carry no run data by construction and
+    # are the one thing this route may emit that neither serialiser produced.
+    frames = [c for c in chunks if not c.startswith(":")]
+    assert frames, "the feed carried nothing — this test would prove nothing"
+    untagged = [c for c in frames if "SNAPSHOT-MARKER" not in c and "PROJECT-MARKER" not in c]
+    assert untagged == [], (
+        f"/events yielded output neither serialiser produced — a third path exists: {untagged}"
+    )
+    # And each chunk is still shaped exactly as its own serialiser built it: the SSE
+    # event name is the payload's own `type` (never a name the route invented) and the
+    # keys are the serialiser's, plus the two identity fields attribute_to_run stamps.
+    expected_keys = {
+        "SNAPSHOT-MARKER": {"type", "via"},
+        "PROJECT-MARKER": {"type", "via", "run_uid", "ticket_id"},
+    }
+    for chunk in frames:
+        header, data = chunk.split("\ndata: ", 1)
+        payload = json.loads(data.strip())
+        assert header == f"event: {payload['type']}", (
+            f"a chunk was framed under a name its own payload does not claim: {chunk!r}"
+        )
+        assert set(payload) == expected_keys[payload["via"]], (
+            f"a chunk was re-shaped between its serialiser and the wire: {chunk!r}"
+        )
+    # Both were genuinely exercised, or "only two paths" would hold vacuously for a
+    # route that never published a live frame.
+    assert any("SNAPSHOT-MARKER" in c for c in frames)
+    assert any("PROJECT-MARKER" in c for c in frames)
+
+
+def test_snapshot_frame_is_an_allowlist_over_registry_state():
+    """WR-04: the second serialiser, tested where it now lives.
+
+    Takes `list[ActiveRun]` and nothing else — no app, no request, no registry — which
+    is what let it move out of main.py and sit beside project().
+
+    MUTATION that must turn this red: build the frame with `asdict(run)` instead of
+    naming the two fields — `started_at` (a raw monotonic clock reading, meaningless off
+    this process) is published, and the exact-key assertion fails. That spread is the
+    same denylist-in-allowlist's-clothing project() refuses.
+    """
+    frame = snapshot_frame([ActiveRun(ticket_id=4242, started_at=time.monotonic() - 1.5)])
+
+    assert frame.startswith("event: snapshot\ndata: ")
+    payload = json.loads(frame.split("data: ", 1)[1].strip())
+    assert payload["type"] == "snapshot"
+    assert set(payload["runs"][0]) == {"ticket_id", "running_for_ms"}
+    assert payload["runs"][0]["ticket_id"] == 4242
+    assert payload["runs"][0]["running_for_ms"] >= 1500
+    assert snapshot_frame([]).endswith('{"type": "snapshot", "runs": []}\n\n')
 
 
 def test_events_disconnect_unsubscribes(client):
