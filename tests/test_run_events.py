@@ -17,7 +17,6 @@ import inspect
 import itertools
 import json
 import sqlite3
-import subprocess
 import time
 from pathlib import Path
 
@@ -33,7 +32,7 @@ from helpers import (
     tool_use_block,
 )
 from relay import main
-from relay.agent import bind_to_ticket
+from relay.agent import _execute_guarded, bind_to_ticket, run_ticket
 from relay.config import settings
 from relay.db import connect, init_db, purge_expired_run_events
 from relay.events import (
@@ -1106,27 +1105,81 @@ def test_no_projection_leaks_sensitive_data(client, capture_frames, monkeypatch)
     assert leaks == [], f"published frames leaked seeded secrets: {leaks}"
 
 
-def test_recorder_untouched_files():
-    """The frozen-caller contract, as a fact about the repo rather than a promise.
+async def test_the_frozen_callers_call_shapes_still_work_with_no_recorder(conn, monkeypatch):
+    """The frozen-caller contract, as BEHAVIOUR rather than as a fact about git (WR-06).
 
-    recorder defaults to None, so evals.py and mcp_server.py — which call run_ticket
-    and _execute_guarded with neither a recorder nor any knowledge of one — must not
-    have needed a single byte changed. If they did, the optional-collaborator design
-    broke and the fix belongs in agent.py, not here. ci.yml is included because a
-    green suite bought by loosening the gate is not a green suite.
+    This replaces a test that ran `git diff --quiet HEAD -- <frozen files>`. That check
+    could not fail for the thing it named — working tree against HEAD is empty on any
+    committed state, so it went green the moment a violating change was committed — and
+    it failed for things it did not name: an unrelated uncommitted edit to evals.py
+    reddened the suite, and outside a git checkout (the Dockerfile's `pip install .`)
+    `git diff` exits 128 and the suite fails with a misleading message.
+
+    What actually has to hold is that `recorder` is an OPTIONAL collaborator: evals.py
+    and mcp_server.py invoke these two functions with no recorder and no knowledge of
+    one, so both call shapes below are copied verbatim from those call sites —
+    positional arity and all. If phase 5 had broken either, the fix belongs in agent.py
+    and not in a frozen file.
+
+    MUTATION 1 that must turn this red: make `recorder` a required collaborator of
+    run_ticket (move it ahead of `policy` as `recorder: RunRecorder,`) — the
+    evals-shaped call raises `TypeError: run_ticket() missing 1 required positional
+    argument: 'recorder'`, exactly as evals.py would at runtime.
+    MUTATION 2 that must turn this red: make `_execute_guarded`'s `recorder`/any new
+    collaborator required, or move `policy` behind a `*` — the mcp-shaped call below
+    stops binding.
+    MUTATION 3 that must turn this red: persist unconditionally in `_persisted` (drop
+    the `if recorder is not None` guard) — an AttributeError on None, and if it were
+    written to survive that, the run_events assertion catches the write.
     """
-    repo = Path(__file__).parent.parent
-    frozen = ["src/relay/mcp_server.py", "src/relay/evals.py", ".github/workflows/ci.yml"]
-    # --name-only first purely so the failure names the file; --quiet is the assertion,
-    # because its exit code is the same one a reviewer would run by hand.
-    changed = subprocess.run(
-        ["git", "diff", "--name-only", "HEAD", "--", *frozen],
-        cwd=repo, capture_output=True, text=True, check=False,
-    ).stdout.strip()
-    result = subprocess.run(
-        ["git", "diff", "--quiet", "HEAD", "--", *frozen], cwd=repo, check=False
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    registry = build_registry(conn, KB_DIR)
+    ticket_id = _seed_ticket(conn)
+    conn.commit()
+
+    # --- evals.py:352 — positional client/registry/ticket, no policy, no budget, no
+    # recorder, one keyword-only probe flag.
+    client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": "ava@acmecorp.com"})]),
+        response([tool_use_block("send_reply", {"ticket_id": ticket_id, "body": "z" * 40})]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+    ticket = {
+        "id": ticket_id,
+        "customer_email": "ava@acmecorp.com",
+        "subject": "Refund",
+        "body": "I was charged twice for March.",
+    }
+    events_seen = [
+        e async for e in run_ticket(client, registry, ticket, seed_citation_denial=False)
+    ]
+
+    types = [e.type for e in events_seen]
+    assert "resolution" in types, f"the recorder-less run did not complete: {types}"
+    assert [e for e in events_seen if e.type == "error"] == []
+    # Recorder-less means recorder-less: nothing was persisted, so the loop is what it
+    # was before phase 5 for every caller that does not pass one.
+    assert conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0] == 0, (
+        "a run driven with no recorder wrote run_events rows — evals.py and the MCP"
+        " server would be persisting runs they know nothing about"
     )
-    assert result.returncode == 0, f"phase 5 modified a frozen file: {changed}"
+
+    # --- mcp_server.py:120 — four positional args, no bound ticket, no retrieved ids.
+    result, is_error = _execute_guarded(
+        registry.get("search_docs"), "search_docs", {"query": "refund"}, ToolPolicy()
+    )
+    assert is_error is False
+    assert "results" in json.loads(result)
+    # The unbound path stays unbound: no run to bind to is a legitimate caller, not a
+    # fail-open, and the write gate still answers on it.
+    denied, denied_is_error = _execute_guarded(
+        registry.get("send_reply"),
+        "send_reply",
+        {"ticket_id": ticket_id, "body": "z" * 40},
+        ToolPolicy(allow_writes=False),
+    )
+    assert denied_is_error is True
+    assert json.loads(denied)["denied_by"] == "policy"
 
 
 # --------------------------------------------------------------------------------------
