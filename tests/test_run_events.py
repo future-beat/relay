@@ -281,6 +281,71 @@ def test_project_search_docs_keeps_ids_not_text():
     assert "Refunds are issued within 14 days" not in json.dumps(frame)
 
 
+def test_project_marks_a_denied_write_tool_as_an_error_not_a_null_success():
+    """WR-01: a guardrail denial must not publish as a success-shaped frame.
+
+    A denied send_reply returns a DICT (`{"error": ..., "denied_by": ...}`), so it used
+    to take the send_reply branch and publish `{"reply_id": null, "status": null}` —
+    byte-identical in shape to a successful reply whose fields happened to be missing,
+    with no error signal anywhere in the frame.
+
+    MUTATION that must turn this red: move the `if is_error or not isinstance(...)`
+    branch in _project_tool_result BELOW the per-tool dispatch (or drop `is_error` from
+    the send_reply branch) — the denial is published as a null-shaped success again and
+    both the flag and the guard name disappear.
+    """
+    denied = project(AgentEvent(type="tool_result", data={
+        "tool": "send_reply",
+        "result": {
+            "error": "ticket_id 42 is not this run's ticket. Retry with ticket_id=7.",
+            "denied_by": "ticket_binding",
+            "expected_ticket_id": 7,
+            "supplied_ticket_id": 42,
+        },
+        "is_error": True,
+    }))
+    ok = project(AgentEvent(type="tool_result", data={
+        "tool": "send_reply",
+        "result": {"reply_id": 3, "status": "resolved"},
+        "is_error": False,
+    }))
+
+    assert denied["is_error"] is True
+    assert denied["denied_by"] == "ticket_binding"
+    assert ok["is_error"] is False
+    assert denied != ok, "a refusal and an action publish as the same frame"
+    # That it was denied, never WHAT was denied: the reply body, the model's supplied
+    # ticket id and the retry instruction are all the model's own output.
+    for leaked in ("42", "Retry with", "not this run's ticket"):
+        assert leaked not in json.dumps(denied)
+
+
+def test_project_distinguishes_a_failed_search_from_an_empty_one():
+    """WR-01: an errored search_docs must not render as "the KB has nothing".
+
+    An empty result set is the signal that makes the model escalate. A search that blew
+    up returns `{"error": ...}`, whose `results` key is absent — so the search_docs
+    branch used to coerce it to `[]` and publish the two as the same frame.
+
+    MUTATION that must turn this red: move the is_error branch below the search_docs
+    dispatch — the failed search publishes `{"results": []}` with is_error absent, and
+    the inequality assertion fails.
+    """
+    failed = project(AgentEvent(type="tool_result", data={
+        "tool": "search_docs",
+        "result": {"error": "index unavailable"},
+        "is_error": True,
+    }))
+    empty = project(AgentEvent(type="tool_result", data={
+        "tool": "search_docs", "result": {"results": []}, "is_error": False,
+    }))
+
+    assert failed["is_error"] is True
+    assert empty == {"type": "tool_result", "tool": "search_docs",
+                     "is_error": False, "results": []}
+    assert failed != empty, "a broken retriever and an empty KB publish identically"
+
+
 def test_project_text_is_dropped():
     # Model prose restates whatever it just read — the customer's plan, their email, the
     # ticket body. The viewer still sees that the model spoke; it does not see what it said.
@@ -649,6 +714,51 @@ def test_a_denied_write_tool_persists_cause_before_effect(client, capture_frames
     # The public feed carries the same order (it is published as each event surfaces).
     published = [f["type"] for f in frames]
     assert published.index("guardrail") < published.index("tool_result")
+
+
+def test_the_feed_distinguishes_a_denied_write_from_a_successful_one(
+    client, capture_frames, monkeypatch
+):
+    """WR-01, end to end: one run, one denied send_reply and one that lands.
+
+    Both take the same projection branch, so the only thing separating "the guardrail
+    refused this" from "the customer was emailed" in the public feed is the error flag
+    the branch carries. Driven through a real run rather than asserted on project()
+    alone because the denial's dict shape — the thing that made it look like a success —
+    is produced by _execute_guarded, not by the test.
+
+    MUTATION that must turn this red: drop `"is_error": False` from the send_reply
+    success branch of _project_tool_result and move the is_error branch below the
+    dispatch — the two frames collapse to the same shape and the inequality fails.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _make_ticket(client, "liam@brightco.io", "What are my rate limits?")
+    app.state.client = FakeClient([
+        # Denied: a write-tier tool naming a ticket that is not this run's.
+        response([tool_use_block("send_reply", {"ticket_id": ticket_id + 1, "body": "z" * 40})]),
+        # Accepted: the same tool, this run's ticket.
+        response([tool_use_block("send_reply", {"ticket_id": ticket_id, "body": "y" * 40})]),
+        response([text_block("replied")], stop_reason="end_turn"),
+    ])
+
+    _body, frames = asyncio.run(capture_frames(ticket_id))
+
+    replies = [f for f in frames if f["type"] == "tool_result" and f["tool"] == "send_reply"]
+    assert len(replies) == 2, f"the run did not publish both calls: {replies}"
+    denied, sent = replies
+    assert denied["is_error"] is True, (
+        "the denied reply published as a success — a viewer cannot tell a guardrail"
+        " firing from an action the agent actually took"
+    )
+    assert denied["denied_by"] == "ticket_binding"
+    assert sent["is_error"] is False
+    assert sent["status"] == "resolved"
+    assert denied["is_error"] != sent["is_error"]
+    # The denial's payload stays out: the model's supplied ticket id and the retry
+    # instruction are its own output, echoed from a ticket body we do not control. An
+    # exact key set, so a field added to the failure branch later has to be a decision.
+    assert set(denied) == {"type", "tool", "is_error", "denied_by", "run_uid", "ticket_id"}
+    assert "not this run's ticket" not in json.dumps(denied)
 
 
 def test_broker_never_leads_the_database(client, monkeypatch):

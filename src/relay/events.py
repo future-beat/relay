@@ -166,12 +166,28 @@ def _project_tool_result(d: dict) -> dict:
     Every branch names its own fields, and the fallthrough for an unrecognised tool
     keeps only the name and the error flag — so a tool added later is redacted by
     default and someone has to come here on purpose to publish more of it.
+
+    The failure branch comes FIRST, before any dispatch on the tool name (WR-01). A
+    denied send_reply returns `{"error": ..., "denied_by": "ticket_binding"}` — which
+    IS a dict — so it used to take the send_reply branch and publish
+    `{"reply_id": null, "status": null}`: a success-shaped frame with no error signal
+    at all, which told a viewer a guardrail firing and a rendering blank were the same
+    event. `denied_by` is the guard's own enumerated name (policy / ticket_binding /
+    citation), the same disclosure the `guardrail` frame already carries — never the
+    denied payload, which is the model's output echoed from a ticket body.
     """
     tool = d.get("tool")
     result = d.get("result")
-    if not isinstance(result, dict):
-        # An error string or a non-JSON result: publish that it happened, not what.
-        return {"type": "tool_result", "tool": tool, "is_error": d.get("is_error")}
+    # Coerced, not forwarded: `is_error` is a boolean everywhere it is produced, and a
+    # frame whose error flag is None reads as "unknown" to every consumer of the feed.
+    is_error = bool(d.get("is_error"))
+    if is_error or not isinstance(result, dict):
+        # An error, an error string, or a non-JSON result: publish THAT it failed and
+        # which guard refused it, never what was refused.
+        return {
+            "type": "tool_result", "tool": tool, "is_error": is_error,
+            "denied_by": result.get("denied_by") if isinstance(result, dict) else None,
+        }
     if tool == "search_docs":
         # ids + scores make the feed legibly grounded (D-07); `text` and `heading` are
         # the retrieved prose and stay out of the frame entirely.
@@ -179,6 +195,7 @@ def _project_tool_result(d: dict) -> dict:
         return {
             "type": "tool_result",
             "tool": tool,
+            "is_error": False,
             "results": [
                 {"doc": r.get("doc"), "id": r.get("id"), "score": r.get("score")}
                 for r in results
@@ -187,20 +204,23 @@ def _project_tool_result(d: dict) -> dict:
         }
     if tool == "send_reply":
         return {
-            "type": "tool_result", "tool": tool,
+            "type": "tool_result", "tool": tool, "is_error": False,
             "reply_id": result.get("reply_id"), "status": result.get("status"),
         }
     if tool == "create_escalation":
         return {
-            "type": "tool_result", "tool": tool,
+            "type": "tool_result", "tool": tool, "is_error": False,
             "escalation_id": result.get("escalation_id"), "status": result.get("status"),
         }
     if tool == "set_category":
         # The category, not the ticket_id echo — the id is already the run's own.
-        return {"type": "tool_result", "tool": tool, "category": result.get("category")}
+        return {
+            "type": "tool_result", "tool": tool, "is_error": False,
+            "category": result.get("category"),
+        }
     # lookup_customer lands here with the rest: its result is a whole customer row plus
     # ten ticket subjects, and there is no safe subset of that to show.
-    return {"type": "tool_result", "tool": tool, "is_error": d.get("is_error")}
+    return {"type": "tool_result", "tool": tool, "is_error": False}
 
 
 def project(event: AgentEvent) -> dict | None:
