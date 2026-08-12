@@ -682,6 +682,14 @@ function runNode(f) {
     head.textContent = "ticket #" + f.ticket_id + " · run " +
                        String(f.run_uid).slice(0, 8);
     node.append(head);
+    // The frames already carry the uid — which is why CR-03 stamps it — and
+    // GET /runs/{uid} answers status "in_flight" for a run whose summary row does not
+    // exist yet. So a run is drillable WHILE it works, not only once it lands in the
+    // table below. An addition to this block and nothing else: everything else in here
+    // is asserted by a shipped Phase-5 test.
+    const open = el("button", { class: "drill-open", type: "button" }, "open trace");
+    open.addEventListener("click", () => openDrill(f.run_uid));
+    node.append(open);
     runNodes.set(f.run_uid, node);
     feedEl.prepend(node);
     while (feedEl.children.length > 6) {
