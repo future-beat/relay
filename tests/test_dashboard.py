@@ -1305,11 +1305,12 @@ def test_run_detail_404s_on_a_malformed_or_unknown_uid(client, monkeypatch):
             raise AssertionError(f"a malformed uid reached the database (conn.{name})")
 
     malformed = [
-        "../../etc/passwd",
         "abc",
         "Z" * 32,                 # 32 chars, not hex
         "0" * 31,                 # right alphabet, wrong length
         "0123456789ABCDEF" * 2,   # uppercase hex — uuid4().hex is lowercase
+        "' OR 1=1 --",
+        "0" * 32 + "; DROP TABLE runs",
     ]
     app.state.conn = _ExplodingConn()
     try:
@@ -1319,7 +1320,14 @@ def test_run_detail_404s_on_a_malformed_or_unknown_uid(client, monkeypatch):
                 assert resp.status_code == 404, (uid, resp.status_code)
                 # The short-string domain form, not the perimeter's dict — and it names
                 # no uid back, so the 404 body cannot be used as an echo oracle.
-                assert resp.json()["detail"] == "unknown run", resp.json()
+                assert resp.json()["detail"] == "unknown run", (uid, resp.json())
+            # Traversal never even reaches this route: httpx (like curl) removes dot
+            # segments client-side, and a %2f-encoded separator is decoded before
+            # routing, so neither matches the single-segment /runs/{run_uid}. Still a
+            # 404, one hop earlier — asserted on the status alone, and still with the
+            # exploding connection installed, so the DB is untouched on this path too.
+            assert anon.get("/runs/../../etc/passwd").status_code == 404
+            assert anon.get("/runs/%2e%2e%2f%2e%2e%2fetc%2fpasswd").status_code == 404
     finally:
         app.state.conn = real_conn
 

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import time
 import uuid
@@ -23,11 +24,18 @@ from .events import (
     RunRecorder,
     attribute_to_run,
     project,
+    project_run_detail,
     snapshot_frame,
 )
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
-from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
+from .ratelimit import (
+    budget_snapshot,
+    enforce,
+    enforce_daily_budget,
+    release_run,
+    reserve_run,
+)
 from .runs import RegistryDraining, RunRegistry
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
@@ -175,6 +183,26 @@ process_gate = _gate("process", meter_spend=True)
 # Public (D-11) but not unmetered: /events holds a connection open for its whole idle
 # ceiling, which is exactly what a reconnect loop needs to keep the machine awake.
 events_gate = _gate("events", public=True)
+# The per-run drill-down, public for the same reason and bounded for a different one.
+# Its OWN bucket, deliberately not the feed's: a visitor clicking through the back
+# catalogue would otherwise spend the live feed's reconnect allowance and silently break
+# their own feed, and a drill-down flood has to be visible as itself in the logs rather
+# than hidden inside the feed's line.
+run_detail_gate = _gate("run_detail", public=True)
+
+# uuid4().hex, which is what process_ticket mints. Lowercase hex, exactly 32 — the shape
+# is known precisely, so a scripted walk of made-up keys can be refused for the cost of a
+# regex instead of a query (T-06-17).
+_RUN_UID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+# The `runs` columns the drill-down envelope publishes. Explicit for the same reason
+# _PUBLIC_RUN_COLUMNS is: what a public route discloses is a list someone wrote down.
+# `run_uid` is not here (the caller already holds it, and the envelope carries it) and
+# neither is `id`, the local autoincrement nobody outside this database needs.
+_DETAIL_RUN_COLUMNS = (
+    "outcome", "cost_usd", "duration_ms", "steps",
+    "input_tokens", "output_tokens", "model", "created_at", "ticket_id",
+)
 
 # Declared once at module level for the same reason _ANY_TIER/_API_KEY are: ruff's B008
 # rightly rejects a call in an argument default. create_ticket takes the gate as a
@@ -453,9 +481,152 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
 
 @app.get("/metrics")
 async def metrics() -> dict:
-    # Offloaded because the dashboard polls this every 5s per open tab, so it is the
-    # last place that may hold the loop while a worker thread has Database's lock.
-    return await asyncio.to_thread(run_metrics, app.state.conn)
+    def _read() -> dict:
+        payload = run_metrics(app.state.conn)
+        # Composed HERE rather than inside run_metrics, so telemetry does not import
+        # ratelimit — the aggregation layer has no business knowing about the
+        # perimeter. And it is budget_snapshot's own arithmetic, never a second
+        # derivation: the gauge renders the number that refuses the visitor's next run
+        # (D-11), which includes the spend reserved by runs still in flight. A gauge
+        # summing committed `runs` rows alone reads up to concurrency x max_run_cost_usd
+        # low and promises budget the very next request answers 503 to.
+        payload["budget"] = budget_snapshot(app.state.conn)
+        return payload
+
+    # ONE offload for both reads: two would take Database's lock twice for a route the
+    # dashboard polls every 5s per open tab, which is the last place that may hold the
+    # loop that also answers the 3s container HEALTHCHECK.
+    return await asyncio.to_thread(_read)
+
+
+@app.get("/runs/{run_uid}", dependencies=[Depends(run_detail_gate)])
+async def run_detail(run_uid: str) -> dict:
+    """One run's steps, redacted server-side (D-01, DASH-03).
+
+    Public and keyless, like /events and /metrics, and safe for the same reason:
+    content control, not access control. Every step below came out of
+    project_run_detail's field-by-field allowlist, so holding a uid grants nothing that
+    is not already redacted (D-03).
+
+    The one exception is a DEMO-originated ticket, where the visitor authored the
+    content themselves and D-02 makes the raw trace the payoff. That decision is made
+    HERE, from `tickets.origin`, and is unreachable from the request: this signature
+    takes no query parameter, reads no header and no cookie, and the comparison is
+    `origin == "demo"` by equality — NULL (a legacy row) and anything else fail closed
+    (T-06-14). `customer_email` is withheld even on the demo branch: /tickets accepts an
+    arbitrary address from anyone holding the published key, so it is the one field a
+    visitor could use to publish a third party's identifier.
+
+    A run whose steps the 30-day retention swept is NOT a 404. `purge_expired_run_events`
+    deliberately spares the `runs` row, so "no steps" is the normal end state of the back
+    catalogue, and a visitor following a link into it has to be able to tell "this run
+    happened and its detail expired" from "this uid is a lie" (T-06-18). The status
+    string discloses nothing about content.
+    """
+    if not _RUN_UID_RE.match(run_uid):
+        # Refused before the database is touched: the uid shape is known exactly, so a
+        # 404 for a malformed key costs a regex where a 404 for an absent key costs a
+        # query. The log carries a truncated echo only — enough to correlate a scan,
+        # never enough to be a mirror for arbitrary client text.
+        logger.info("run_detail.rejected_uid", extra={"ctx": {"uid": run_uid[:12]}})
+        raise HTTPException(404, "unknown run")
+
+    def _read():
+        conn = app.state.conn
+        # Events FIRST. Every event row is committed before the `runs` row exists (it is
+        # written in event_stream's finally), so a run that finishes between these two
+        # reads renders complete-with-all-its-steps rather than complete-with-a-hole.
+        # The LIMIT is what keeps one run's response bounded: nothing caps a single
+        # run's step count except the agent's own step limit, which is configuration.
+        rows = conn.execute(
+            "SELECT seq, type, payload, elapsed_ms, ticket_id FROM run_events"
+            " WHERE run_uid = ? ORDER BY seq LIMIT ?",
+            (run_uid, settings.run_detail_max_events),
+        ).fetchall()
+        run = conn.execute(
+            f"SELECT {', '.join(_DETAIL_RUN_COLUMNS)} FROM runs WHERE run_uid = ?",
+            (run_uid,),
+        ).fetchone()
+        expired = False
+        if run is not None and not rows:
+            # Asked of SQLite with the same expression purge_expired_run_events uses,
+            # rather than re-derived from a Python clock: the two must agree about what
+            # "older than the retention window" means or the page contradicts the sweep.
+            expired = bool(conn.execute(
+                "SELECT ? < datetime('now', ?) AS expired",
+                (run["created_at"], f"-{settings.events_retention_days} days"),
+            ).fetchone()["expired"])
+        ticket_id = rows[0]["ticket_id"] if rows else (run["ticket_id"] if run else None)
+        origin, ticket = None, None
+        if ticket_id is not None:
+            got = conn.execute(
+                "SELECT origin FROM tickets WHERE id = ?", (ticket_id,)
+            ).fetchone()
+            origin = got["origin"] if got else None
+            if origin == "demo":
+                # Read at all ONLY on the branch that publishes it. A single SELECT
+                # naming subject/body unconditionally would work identically today and
+                # leave the redacted path holding the text in a local, one edit away
+                # from disclosing it.
+                ticket = dict(conn.execute(
+                    "SELECT subject, body FROM tickets WHERE id = ?", (ticket_id,)
+                ).fetchone())
+        # fetchall()/fetchone() all happen in here, never after: Database materialises
+        # rows while its lock is held.
+        return rows, run, expired, ticket_id, origin, ticket
+
+    rows, run, expired, ticket_id, origin, ticket = await asyncio.to_thread(_read)
+    if run is None and not rows:
+        raise HTTPException(404, "unknown run")
+
+    demo = origin == "demo"
+    note = None
+    if rows and run is not None:
+        status = "complete"
+    elif rows:
+        # The `runs` row lands in event_stream's finally, so this is what every run
+        # looks like while it is still streaming.
+        status = "in_flight"
+    elif expired:
+        status = "swept"
+        note = (
+            f"Step detail is kept for {settings.events_retention_days} days."
+            " This run's steps have expired; its summary is kept."
+        )
+        logger.info("run_detail.swept", extra={"ctx": {
+            "uid": run_uid[:12], "status": status,
+        }})
+    else:
+        # A legacy pre-Phase-5 run, or one whose per-step writes failed. Nothing
+        # expired, so calling it "swept" would be a lie about retention.
+        status = "unrecorded"
+
+    detail = {
+        "run_uid": run_uid,
+        "ticket_id": ticket_id,
+        # The FLAG is not secret — the page labels "you submitted this" with it. The
+        # CONTENT it gates is.
+        "demo": demo,
+        "status": status,
+        "run": dict(run) if run is not None else None,
+        "steps": project_run_detail(
+            rows,
+            full_fidelity=demo,
+            # Each registered tool's DECLARED input keys — the schema the model was
+            # shown. The projector clamps model-chosen tool names and argument keys
+            # against this, so neither can carry a payload into a browser.
+            known_tools={
+                name: frozenset(spec.schema["input_schema"]["properties"])
+                for name, spec in app.state.registry.items()
+            },
+        ),
+    }
+    if note is not None:
+        detail["note"] = note
+    if demo and ticket is not None:
+        # The visitor's own words back, and only these two fields by name (Q3).
+        detail["ticket"] = {"subject": ticket["subject"], "body": ticket["body"]}
+    return detail
 
 
 @app.get("/events", dependencies=[Depends(events_gate)])
