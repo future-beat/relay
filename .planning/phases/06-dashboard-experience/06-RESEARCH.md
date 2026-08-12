@@ -881,7 +881,12 @@ function arcPath(cx, cy, r, fromDeg, toDeg) {
 
 ---
 
-## Open Questions
+## Open Questions (RESOLVED)
+
+> Resolutions (2026-08-12, orchestrator + planner): Q1 — run_uid RESTORED to /metrics
+> (plan 06-02; test restated, attribute_to_run docstring corrected in 06-03). Q2 —
+> `text` included in the demo branch (06-03/06-06). Q3 — customer_email excluded even
+> on the demo branch (06-07). Q4 — "your run" badge rather than feed suppression (06-07).
 
 **Q1 — Does `run_uid` go back onto `/metrics`?** *(the one decision the planner must make explicitly)*
 - **What we know:** WR-10 removed it because "phase 6 has not decided the drill-down's access model". 05-VERIFICATION routed the contradiction to Phase 6 as a human decision: *"Either `run_uid` is public (then /metrics may carry it again and the WR-10 test's rationale needs restating) or it is not (then /events must stop stamping it, or Phase 6 must never build an unauthenticated `run_uid`→`run_events` lookup)."* D-01 + D-03 answer it: the lookup **is** unauthenticated and **is** redacted, so a uid grants nothing — for a non-demo run.
