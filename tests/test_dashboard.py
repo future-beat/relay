@@ -2359,3 +2359,159 @@ def test_the_page_never_asks_for_full_fidelity(client):
     drill_code = _code_only(_block(html, _DRILL))
     assert "headers" not in drill_code
     assert 'fetch("/runs/" + encodeURIComponent(uid))' in drill_code
+
+
+# --- Wave 6: the Try-it form (DASH-05) -----------------------------------------------
+
+_TRY = "try it"
+
+_GOLDEN = Path(__file__).parent.parent / "evals" / "golden.jsonl"
+
+# The three cases D-06 asks for — billing, technical/bug, how-to — by their golden ids.
+# `evals/golden.jsonl` is DATA and is read here on purpose: the page is supposed to
+# carry these cases VERBATIM, and a copy that has drifted from the dataset is a demo
+# whose examples are no longer the ones the eval suite proves the agent handles.
+# `src/relay/evals.py` is frozen this phase and is not imported.
+_TRY_EXAMPLE_IDS = ("refund-monthly", "rate-limits-pro", "password-reset")
+
+
+def _golden_cases() -> dict:
+    cases = {}
+    for line in _GOLDEN.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            case = json.loads(line)
+            cases[case["id"]] = case
+    return cases
+
+
+def _section(html: str, ident: str) -> str:
+    """One `<section id="...">` of the served page — MARKUP only, no script.
+
+    The Try-it assertions split in two, and the split is load-bearing: what the markup
+    OFFERS (the editable fields, and the absence of an address input) is a different
+    question from what the script DOES, and the script names `customer_email` in the
+    request body it builds — which is exactly the string the no-address-field assertion
+    is about. A grep over the whole document would let one satisfy the other.
+    """
+    begin = f'<section id="{ident}">'
+    assert begin in html, (
+        f"the {ident!r} section is gone — every assertion below would be vacuous"
+    )
+    return html.split(begin, 1)[1].split("</section>", 1)[0]
+
+
+def test_try_it_offers_three_editable_examples(client):
+    """D-06: three prefilled examples — billing, technical, how-to — editable before send.
+
+    The subjects, bodies and customer addresses are asserted against `evals/golden.jsonl`
+    itself rather than against string literals repeated here: these three cases are
+    already grounded in `kb/` and already cover both terminal actions (an escalation and
+    two replies), which is why they were chosen. A page carrying its own paraphrase would
+    be demoing something the eval suite does not measure.
+
+    MUTATION that must turn this red: delete one entry from TRY_EXAMPLES (or reword one
+    body) — the visitor loses a whole category, and the demo stops covering the
+    escalation path that is the drill-down's best moment.
+
+    SECOND MUTATION: render the chosen example as static text instead of into the input
+    and textarea — D-06's "editable before submitting" quietly disappears while the page
+    still looks complete.
+
+    WEAK BY CONSTRUCTION: there is no DOM in this suite — no jsdom, no headless browser.
+    This greps the served HTML and the try-it block; nothing here clicks a chip or reads
+    an input's value back. The DOM-level proof is 06-07's human checkpoint.
+    """
+    html = client.get("/dashboard").text
+    section = _section(html, "try-it")
+    code = _code_only(_block(html, _TRY))
+    cases = _golden_cases()
+
+    for case_id in _TRY_EXAMPLE_IDS:
+        case = cases[case_id]
+        assert f'"{case["subject"]}"' in code, f"{case_id}'s subject is not on the page"
+        assert case["body"] in code, f"{case_id}'s body is not on the page"
+        # Pinned to a SEEDED customer: the only rows lookup_customer can find.
+        assert f'"{case["customer_email"]}"' in code, (
+            f"{case_id} does not pin its seeded customer"
+        )
+
+    # Three, and exactly three — a fourth chip pointing at an unseeded address would
+    # give the agent a customer lookup that always misses.
+    assert code.count("customer_email:") == 3, (
+        "the try-it block does not carry exactly three examples"
+    )
+    for label in ("billing", "technical", "how-to"):
+        assert label in code, f"the {label} example is not offered"
+
+    # Editable: the example fills fields the visitor can rewrite before sending (D-06).
+    assert '<input id="try-subject"' in section
+    assert '<textarea id="try-body"' in section
+    assert "trySubject.value = ex.subject" in code
+    assert "tryBody.value = ex.body" in code
+    # ...and what is sent is what the fields hold, not the example's frozen copy.
+    assert "trySubject.value" in code and "tryBody.value" in code
+
+
+def test_try_it_exposes_no_email_field(client):
+    """T-06-27: the visitor cannot type an address, because the address is pinned.
+
+    A demo-origin ticket's drill-down is FULL FIDELITY (D-02) and is retained for the
+    sweep window, publicly readable by anyone with the run's uid. An address input would
+    therefore let one visitor publish a third party's email address into a 30-day,
+    world-readable record — with the site's own form as the publishing mechanism. The
+    seeded customers are also the only rows `lookup_customer` can find, so a typed
+    address would additionally make the run's first tool call miss.
+
+    MUTATION that must turn this red: add `<input id="try-email" type="email">` to the
+    section and read it in the submit path. Everything still works, the run still
+    streams, and the threat register's T-06-27 mitigation is gone.
+
+    WEAK BY CONSTRUCTION: grep over the served markup and the try-it code.
+    """
+    html = client.get("/dashboard").text
+    section = _section(html, "try-it")
+    code = _code_only(_block(html, _TRY))
+
+    assert "email" not in section, (
+        "the try-it markup mentions an address — the address is pinned, not typed"
+    )
+    assert 'type="email"' not in html
+    assert "try-email" not in html
+    # The section really does have inputs, so the assertion above is about the ABSENCE
+    # of an address field rather than about a section with no fields at all.
+    assert "<input " in section and "<textarea " in section
+
+    # The address the request carries comes from the chosen example, server-seeded.
+    assert "ex.customer_email" in code, "the address is not taken from the example"
+    assert "customer_email: tryEmail" in code
+
+
+def test_try_it_renders_disabled_without_a_demo_key(client, monkeypatch):
+    """Pitfall 14: an unconfigured deployment renders the form disabled, not a broken page.
+
+    `/dashboard` is hit anonymously with NO keys configured by two shipped tests, and it
+    is the public landing surface. A setup path that reads the key and wires the submit
+    handler unguarded would throw during page setup — and because the script is one
+    block, a throw there takes the live feed, the charts and the drill-down with it. A
+    naive 200 check would still pass, which is why the disabled BRANCH is asserted in
+    the source as well as the response.
+
+    MUTATION that must turn this red: delete the `(not configured)` guard and wire the
+    submit handler unconditionally.
+
+    The "None" assertion is tests/test_auth.py's whole-document check, restated because
+    this plan adds a block full of new copy and a stray "None yet" label is exactly how
+    it goes red.
+    """
+    monkeypatch.setattr(settings, "demo_key", None)
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert "(not configured)" in resp.text
+    assert '<section id="try-it">' in resp.text, "the form vanished instead of disabling"
+    assert "None" not in resp.text
+
+    code = _code_only(_block(resp.text, _TRY))
+    assert '"(not configured)"' in code, "nothing on the page notices an unconfigured key"
+    assert ".disabled = true" in code, "the form is never disabled"
+    # Copy, not silence: a dead button with no explanation reads as a broken page.
+    assert "TRY_CONFIGURED" in code
