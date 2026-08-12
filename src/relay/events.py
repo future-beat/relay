@@ -407,6 +407,11 @@ class RunRecorder:
         self.run_uid = run_uid
         self.ticket_id = ticket_id
         self._seq = 0
+        # Monotonic, per run: the drill-down needs sub-second step timings and
+        # created_at is datetime('now') — whole seconds, which is also why seq exists.
+        # Monotonic rather than wall-clock so an NTP step mid-run cannot make one step
+        # appear to finish before it started.
+        self._t0 = time.monotonic()
 
     def _insert_event(self, type: str, data: dict) -> None:
         """One INSERT. Assumes a transaction is already open — see both callers.
@@ -414,14 +419,27 @@ class RunRecorder:
         `data` is stored RAW. The private table is the full-fidelity record phase 6's
         drill-down reads; `project()` is the transform on the way out to the public
         feed. Redacting here instead would leave nothing to drill into.
+
+        `elapsed_ms` is stamped HERE and nowhere else, so both callers are covered by
+        construction rather than by remembering. For a write tool the row is inserted
+        after `execute_bound` returns, inside the tool's own transaction, so
+        `elapsed_ms(tool_result) - elapsed_ms(tool_use)` is that tool's wall time —
+        which is exactly what phase 6's drill-down projector subtracts.
         """
         self._seq += 1
         self.conn.execute(
-            "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload)"
-            " VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload, elapsed_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
             # default=str so a stray datetime or Decimal in an event cannot take down
             # the run it was only meant to describe.
-            (self.run_uid, self.ticket_id, self._seq, type, json.dumps(data, default=str)),
+            (
+                self.run_uid,
+                self.ticket_id,
+                self._seq,
+                type,
+                json.dumps(data, default=str),
+                int((time.monotonic() - self._t0) * 1000),
+            ),
         )
 
     def record(self, event: AgentEvent) -> None:
