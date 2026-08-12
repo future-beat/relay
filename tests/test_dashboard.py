@@ -12,6 +12,7 @@ import json
 import re
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
@@ -1810,3 +1811,68 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
     # ...and the email is withheld even here, by key AND by value.
     assert "customer_email" not in json.dumps(detail)
     assert ticket_address not in json.dumps(detail)
+
+
+# --- Wave 4: the packaged template (D-04) --------------------------------------------
+#
+# NOTE ON STRENGTH, stated once for every grep-level assertion in this wave: this suite
+# has no DOM — no jsdom, no headless browser — so nothing below executes the dashboard's
+# JavaScript. Assertions over the served HTML are regression guards on what was shipped,
+# not evidence that a browser renders anything. Whether the cards, the charts and the
+# gauge actually appear is a human check, and 06-07's checkpoint is where it closes.
+# The two tests immediately below are the exception: they are genuine integration
+# assertions over the response body and the installed package's own file.
+
+
+def _packaged_template() -> Path:
+    """The template as the INSTALLED package sees it.
+
+    Resolved from `relay.__file__` and never from the repo root: a path like
+    `Path(__file__).parent.parent / "src" / ...` passes in this checkout and says
+    nothing about the wheel, which is the artifact the container actually runs.
+    """
+    import relay
+
+    return Path(relay.__file__).parent / "templates" / "dashboard.html"
+
+
+def test_dashboard_is_served_from_the_packaged_template(client):
+    """The page comes out of a file that ships inside the package (D-04).
+
+    MUTATION that must turn this red: point `_TEMPLATE_PATH` at a repo-root path
+    (`Path(__file__).parent.parent.parent / "src" / "relay" / "templates" / ...`), or
+    delete the template — the served body stops matching the packaged file's text.
+    Hatchling honours .gitignore, so a future ignore rule can drop this file from the
+    wheel with no build error; this test sees the path, and the CI docker smoke sees
+    the artifact.
+    """
+    path = _packaged_template()
+    assert path.is_file(), f"the template is not inside the installed package: {path}"
+
+    raw = path.read_text(encoding="utf-8")
+    assert "__RELAY_DEMO_KEY__" in raw, "the placeholder is gone from the file on disk"
+
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert resp.text == raw.replace("__RELAY_DEMO_KEY__", "test-demo-key")
+
+
+def test_dashboard_substitutes_the_key_per_request(client, monkeypatch):
+    """The read is at import; the substitution is per request.
+
+    MUTATION that must turn this red: bake the key at import
+    (`DASHBOARD_HTML = _TEMPLATE_PATH.read_text().replace("__RELAY_DEMO_KEY__", ...)`)
+    and return it unmodified — the second request below serves the first request's key.
+    That is not a test-only failure: it is what ships a stale published key after a
+    `fly secrets set`, on the one page whose job is to hand out a working key.
+    """
+    first = client.get("/dashboard").text
+    assert "test-demo-key" in first
+
+    monkeypatch.setattr(settings, "demo_key", "rotated-key-91c4de")
+    second = client.get("/dashboard").text
+    assert "rotated-key-91c4de" in second
+    assert "test-demo-key" not in second
+
+    # ...and the file on disk was never rewritten to do it.
+    assert "__RELAY_DEMO_KEY__" in _packaged_template().read_text(encoding="utf-8")

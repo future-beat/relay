@@ -7,6 +7,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from html import escape
+from pathlib import Path
 
 from anthropic import AsyncAnthropic
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
@@ -733,130 +734,14 @@ async def events() -> StreamingResponse:
     )
 
 
-DASHBOARD_HTML = """<!doctype html>
-<html><head><title>Relay dashboard</title><style>
-body { font-family: ui-monospace, monospace; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
-h1 { font-size: 1.2rem; } .cards { display: flex; gap: 1rem; flex-wrap: wrap; }
-.card { border: 1px solid #ccc; border-radius: 8px; padding: .8rem 1.2rem; min-width: 140px; }
-.card b { display: block; font-size: 1.4rem; } .card span { color: #666; font-size: .8rem; }
-table { border-collapse: collapse; width: 100%; margin-top: 1.5rem; font-size: .85rem; }
-th, td { text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; }
-.demo { border: 1px solid #ccc; border-left: 4px solid #444; border-radius: 8px;
-        padding: .8rem 1.2rem; margin-bottom: 1.5rem; font-size: .85rem; }
-.demo code { background: #f4f4f4; padding: .1rem .3rem; border-radius: 4px; }
-.demo em { color: #666; font-style: normal; }
-h2 { font-size: 1rem; margin: 2rem 0 .4rem; }
-#feed-status { color: #666; font-size: .8rem; }
-#feed { list-style: none; padding: 0; margin: .6rem 0 0; font-size: .85rem; }
-#feed li { border: 1px solid #eee; border-radius: 6px; padding: .4rem .7rem;
-           margin: 0 0 .4rem; }
-#feed b { display: block; margin-bottom: .2rem; }
-#feed .step { color: #444; }
-</style></head><body>
-<h1>Relay — agent runs</h1>
-<div class="demo">
-Try it yourself — this key is published on purpose:
-<code>X-API-Key: __RELAY_DEMO_KEY__</code><br>
-<em>Deliberately limited: 5 runs/hour per IP, and the demo caps Claude spend at $5/day.</em>
-</div>
-<div class="cards" id="cards"></div>
-<h2>Live feed <span id="feed-status">connecting</span></h2>
-<ul id="feed"></ul>
-<table id="runs"><thead><tr><th>id</th><th>ticket</th><th>outcome</th><th>steps</th>
-<th>tokens in/out</th><th>cost</th><th>ms</th><th>at</th></tr></thead><tbody></tbody></table>
-<script>
-async function refresh() {
-  const m = await (await fetch("/metrics")).json();
-  document.getElementById("cards").innerHTML = [
-    ["runs", m.runs], ["p50 ms", m.latency_ms.p50], ["p95 ms", m.latency_ms.p95],
-    ["total cost", "$" + m.cost_usd.total], ["mean cost", "$" + m.cost_usd.mean_per_run],
-    ["tokens in", m.tokens.input], ["tokens out", m.tokens.output],
-  ].map(([label, value]) => `<div class="card"><b>${value}</b><span>${label}</span></div>`).join("");
-  document.querySelector("#runs tbody").innerHTML = m.last_runs.map(r =>
-    `<tr><td>${r.id}</td><td>#${r.ticket_id}</td><td>${r.outcome}</td><td>${r.steps}</td>
-     <td>${r.input_tokens}/${r.output_tokens}</td><td>$${r.cost_usd.toFixed(4)}</td>
-     <td>${r.duration_ms}</td><td>${r.created_at}</td></tr>`).join("");
-}
-refresh(); setInterval(refresh, 5000);
-
-// --- live feed (/events) — begin ---
-// The aggregate numbers above still poll; this ADDS the live half DASH-01 names.
-// Everything below renders frames off the PUBLIC feed. They are allowlisted by
-// project(), but `tool` is a model-chosen string that reaches this page verbatim,
-// so every value from a frame is written with textContent and never as markup.
-// That is the one rule this block may not break — a test greps this block for the
-// markup sinks and fails if one appears.
-const FEED_TYPES = ["usage", "resolution", "error", "tool_use", "tool_result",
-                    "guardrail", "notice", "text"];
-const feedEl = document.getElementById("feed");
-const feedStatus = document.getElementById("feed-status");
-const runNodes = new Map();
-
-function describe(f) {
-  if (f.type === "tool_use") return "-> " + f.tool;
-  if (f.type === "tool_result") return (f.is_error ? "x " : "<- ") + f.tool +
-    (f.denied_by ? " denied by " + f.denied_by : "");
-  if (f.type === "guardrail") return "guardrail " + f.guard + " -> " + f.action;
-  if (f.type === "usage") return "step " + f.steps + " · $" + f.cost_usd;
-  if (f.type === "resolution") return "resolved via " + f.via + " · $" + f.cost_usd;
-  if (f.type === "error") return "error · " + f.reason;
-  if (f.type === "notice") return "notice · " + f.kind + " · " + f.tool;
-  return f.type;
-}
-
-// Grouped by run_uid, which is why CR-03 stamps it: several runs are in flight at
-// once on a live demo, and a flat list interleaves them into nonsense.
-function runNode(f) {
-  let node = runNodes.get(f.run_uid);
-  if (!node) {
-    node = document.createElement("li");
-    node.dataset.uid = f.run_uid;
-    const head = document.createElement("b");
-    head.textContent = "ticket #" + f.ticket_id + " · run " +
-                       String(f.run_uid).slice(0, 8);
-    node.append(head);
-    runNodes.set(f.run_uid, node);
-    feedEl.prepend(node);
-    while (feedEl.children.length > 6) {
-      const gone = feedEl.lastElementChild;
-      runNodes.delete(gone.dataset.uid);
-      gone.remove();
-    }
-  }
-  return node;
-}
-
-function onFrame(ev) {
-  const f = JSON.parse(ev.data);
-  const line = document.createElement("div");
-  line.className = "step";
-  line.textContent = describe(f);
-  runNode(f).append(line);
-}
-
-const es = new EventSource("/events");
-es.addEventListener("open", () => { feedStatus.textContent = "live"; });
-// D-14: the runs already in flight when this tab connects, so a viewer joining a
-// quiet moment mid-run sees them rather than a blank list until the next step.
-es.addEventListener("snapshot", ev => {
-  const runs = JSON.parse(ev.data).runs || [];
-  feedStatus.textContent = runs.length
-    ? "live · in flight: " + runs.map(r => "#" + r.ticket_id).join(", ")
-    : "live · nothing running";
-});
-// Every frame carries an `event:` name, so a page listening only for the default
-// `message` event would receive nothing at all.
-FEED_TYPES.forEach(t => es.addEventListener(t, onFrame));
-// D-09 closes an idle stream on purpose and EventSource reconnects on its own, so a
-// disconnect is this page's normal resting state, not a fault. No console noise and
-// no error styling unless the browser has genuinely given up (readyState CLOSED).
-es.onerror = () => {
-  feedStatus.textContent = es.readyState === EventSource.CLOSED
-    ? "feed closed — reload to watch again"
-    : "live · reconnecting";
-};
-// --- live feed (/events) — end ---
-</script></body></html>"""
+_TEMPLATE_PATH = Path(__file__).parent / "templates" / "dashboard.html"
+# Read once at import (D-04), not per request: /dashboard is the public landing
+# surface and this would otherwise be a syscall per visitor. Not in lifespan either —
+# nothing here binds to a loop, and an import-time failure is the loud, early signal
+# that the template did not make it into the image. The path is relative to the
+# PACKAGE, not to a settings value: db_path and kb_dir are deployment-configurable
+# data, whereas the page is package code and travels with the wheel.
+DASHBOARD_HTML = _TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
