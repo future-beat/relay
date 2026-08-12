@@ -135,6 +135,19 @@ class Settings(BaseSettings):
     # with a 503 rather than growing: a viewer turned away costs nothing, a viewer
     # admitted costs every run that publishes afterwards.
     events_max_subscribers: int = 50
+    # How long a run's per-step rows are kept before the startup sweep deletes them.
+    #
+    # `run_events.payload` is stored RAW by design (D-01) — it is the full-fidelity
+    # record phase 6 drills into — so it holds customer emails, ticket bodies, reply
+    # text and every tool argument. Without a window that is unbounded personal data
+    # accumulating on the Fly volume for the life of the deployment, on a demo anyone
+    # can drive, plus a disk-exhaustion path on a 512MB machine (WR-05).
+    #
+    # 30 days: long enough that the drill-down is useful for any run a visitor or an
+    # operator would still be looking at, short enough that the demo is not a long-term
+    # store of other people's support tickets. The `runs` summary table is NOT swept —
+    # it carries no message content and /metrics is built from it.
+    events_retention_days: int = 30
 
 
 settings = Settings()

@@ -237,6 +237,34 @@ def connect(db_path: str | Path) -> Database:
     return Database(conn)
 
 
+def purge_expired_run_events(conn: Database, *, retention_days: int) -> int:
+    """Delete run_events rows older than the retention window. Returns how many went.
+
+    `payload` is raw by design (D-01): it is the record phase 6 drills into, so it holds
+    customer emails, ticket bodies, reply text and every tool argument. Nothing else in
+    this codebase ever deletes from that table, so without this the live volume
+    accumulates other people's support tickets for the life of the deployment — a
+    data-protection posture nobody chose, and a disk-exhaustion path on a 512MB machine
+    (WR-05). Redacting at write time is not the alternative: it would leave phase 6
+    nothing to drill into, which is the whole reason the table exists.
+
+    Deliberately scoped to run_events. The `runs` summary rows carry no message content,
+    /metrics is built from them, and SEC-03's daily ceiling sums them — deleting those
+    would erase spend the ceiling can never see again.
+
+    Synchronous, like every other statement in this module: the one caller offloads it
+    with asyncio.to_thread, because Database holds its lock for the whole transaction.
+    """
+    with conn.transaction():
+        # SQLite's own clock arithmetic on the same 'now' the DEFAULT uses, so the
+        # comparison cannot drift with the process's timezone or with Python's clock.
+        deleted = conn.execute(
+            "DELETE FROM run_events WHERE created_at < datetime('now', ?)",
+            (f"-{int(retention_days)} days",),
+        ).rowcount
+    return max(deleted, 0)
+
+
 def init_db(conn: Database) -> None:
     conn.executescript(SCHEMA)
     # `runs` already exists on the live Fly volume, and CREATE TABLE IF NOT EXISTS does

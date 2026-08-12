@@ -23,6 +23,7 @@ from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 from helpers import (
     FakeClient,
@@ -34,7 +35,7 @@ from helpers import (
 from relay import main
 from relay.agent import bind_to_ticket
 from relay.config import settings
-from relay.db import connect, init_db
+from relay.db import connect, init_db, purge_expired_run_events
 from relay.events import (
     _CLOSE_SENTINEL,
     BrokerUnavailable,
@@ -128,6 +129,90 @@ def test_record_run_without_run_uid_still_works(conn):
         outcome="resolved",
     )
     assert conn.execute("SELECT run_uid FROM runs").fetchone()["run_uid"] is None
+
+
+def _insert_event_row(conn, *, run_uid: str, age_days: int, payload: str) -> None:
+    """One run_events row backdated by SQLite's own clock, like a run from `age_days` ago."""
+    conn.execute(
+        "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload, created_at)"
+        " VALUES (?, ?, ?, ?, ?, datetime('now', ?))",
+        (run_uid, 1, 1, "tool_use", payload, f"-{age_days} days"),
+    )
+
+
+def test_retention_sweep_deletes_old_run_events_and_keeps_recent_ones(conn):
+    """WR-05: raw payloads do not live on the volume forever.
+
+    `payload` is stored raw by design (D-01) — customer email, ticket body, reply text,
+    every tool argument — and nothing else in the codebase deletes from this table, so
+    a public demo anyone can drive accumulated personal data for the life of the Fly
+    volume.
+
+    MUTATION that must turn this red: widen the window in purge_expired_run_events to
+    `datetime('now', '-99999 days')` (or drop the DELETE) — the 60-day-old payload
+    survives and the first assertion names the sentinel that is still on disk.
+    """
+    _insert_event_row(conn, run_uid="old", age_days=60, payload='{"email": "STALE_PII"}')
+    _insert_event_row(conn, run_uid="edge", age_days=31, payload='{"email": "EDGE_PII"}')
+    _insert_event_row(conn, run_uid="fresh", age_days=2, payload='{"email": "LIVE_PII"}')
+    # The summary table must survive the sweep untouched: it carries no message content,
+    # /metrics is built from it, and SEC-03's daily ceiling sums it.
+    record_run(conn, ticket_id=1, model="m", duration_ms=1, steps=1, input_tokens=1,
+               output_tokens=1, cost_usd=0.01, outcome="send_reply", run_uid="old")
+    conn.commit()
+
+    deleted = purge_expired_run_events(conn, retention_days=30)
+
+    survivors = conn.execute("SELECT run_uid, payload FROM run_events").fetchall()
+    kept = {r["run_uid"] for r in survivors}
+    raw = "".join(r["payload"] for r in survivors)
+    assert "STALE_PII" not in raw, "a 60-day-old raw payload survived the retention sweep"
+    assert "EDGE_PII" not in raw, "a payload one day past the window survived"
+    assert "LIVE_PII" in raw, "the sweep deleted a run inside its own retention window"
+    assert kept == {"fresh"}
+    assert deleted == 2, f"the sweep reported the wrong count: {deleted}"
+    assert conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1, (
+        "the sweep deleted the runs summary row — that is spend the daily ceiling can"
+        " never see again"
+    )
+
+
+def test_retention_sweep_runs_at_startup(tmp_path, monkeypatch):
+    """WR-05: the sweep is wired into lifespan, not merely available to be called.
+
+    A retention function nobody calls is not a retention policy. Driven through the real
+    TestClient lifespan against a database seeded before boot.
+
+    MUTATION that must turn this red: delete the `purge_expired_run_events` call from
+    lifespan — the stale payload is still on disk after startup.
+    """
+    db_path = tmp_path / "retention.db"
+    seed = connect(db_path)
+    try:
+        init_db(seed)
+        _insert_event_row(seed, run_uid="old", age_days=60, payload='{"email": "STALE_PII"}')
+        _insert_event_row(seed, run_uid="fresh", age_days=1, payload='{"email": "LIVE_PII"}')
+        seed.commit()
+    finally:
+        seed.close()
+
+    monkeypatch.setattr(settings, "db_path", db_path)
+    monkeypatch.setattr(settings, "api_key", "test-owner-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-not-used")
+    with TestClient(app) as booted:
+        assert booted.get("/health").status_code == 200
+
+    after = connect(db_path)
+    try:
+        rows = after.execute("SELECT run_uid, payload FROM run_events").fetchall()
+    finally:
+        after.close()
+
+    assert {r["run_uid"] for r in rows} == {"fresh"}, (
+        "startup did not sweep the expired run_events rows — raw payloads accumulate"
+        " on the volume for the life of the deployment"
+    )
+    assert "STALE_PII" not in "".join(r["payload"] for r in rows)
 
 
 class _HostileQueue:

@@ -14,7 +14,7 @@ from . import __version__
 from .agent import run_ticket
 from .auth import Tier, api_key_header, require_tier
 from .config import settings
-from .db import connect, init_db
+from .db import connect, init_db, purge_expired_run_events
 from .events import (
     _CLOSE_SENTINEL,
     BrokerUnavailable,
@@ -40,6 +40,22 @@ async def lifespan(app: FastAPI):
     setup_tracing()
     conn = connect(settings.db_path)
     init_db(conn)
+    # The retention sweep (WR-05). run_events.payload is raw by design (D-01), so this
+    # is the only thing standing between a public demo anyone can drive and an unbounded
+    # store of other people's customer emails, ticket bodies and reply text on the Fly
+    # volume. At startup rather than on a timer: this process scales to zero by design,
+    # so a background task is a task that mostly does not exist, while a boot is the one
+    # moment the machine is reliably awake and nothing is streaming yet.
+    #
+    # Offloaded like every other DB touch — it holds Database's lock for a DELETE over a
+    # table that grows by ~10 rows per run, and a slow disk here would stall the loop
+    # before it ever answers /health.
+    purged = await asyncio.to_thread(
+        purge_expired_run_events, conn, retention_days=settings.events_retention_days
+    )
+    logger.info("run_events.retention_swept", extra={"ctx": {
+        "deleted": purged, "retention_days": settings.events_retention_days,
+    }})
     app.state.conn = conn
     app.state.registry = build_registry(conn, settings.kb_dir)
     app.state.client = AsyncAnthropic(api_key=settings.anthropic_api_key)
