@@ -2158,3 +2158,139 @@ def test_the_drill_panel_renders_values_as_text_never_html(client):
         assert sink not in drill, f"{sink} reached the drill panel — T-06-23"
     assert "textContent" in drill, "the panel writes no value as text at all"
     assert "el(" in drill, "the panel does not build its nodes through the el() helper"
+
+
+_STEP_TYPES = ("usage", "text", "tool_use", "tool_result",
+               "guardrail", "notice", "resolution", "error")
+
+
+def test_the_drill_panel_renders_every_step_type(client):
+    """DASH-03: the trace renders all eight types the server can send, field by field.
+
+    `project_run_detail` publishes a named field list per type and drops anything else.
+    A renderer that dispatches on six of them leaves two step types as a bare row with
+    no detail — and the panel still looks full, so nothing about the page says it lost
+    something.
+
+    MUTATION that must turn this red: drop the `guardrail` branch. The prompt-injection
+    denial — a ticket body naming another ticket's id, refused by the ticket-binding
+    guard — is the demo's best moment, and it would silently stop rendering while every
+    other test on this page stayed green.
+
+    WEAK BY CONSTRUCTION: grep, and specifically a grep for the DISPATCH form
+    (`s.type === "x"`) plus each type's own field reads, so a name surviving only in a
+    comment cannot make it pass — `_code_only` drops the comments first.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _DRILL))
+
+    for step_type in _STEP_TYPES:
+        assert f's.type === "{step_type}"' in code, f"no branch renders a {step_type} step"
+
+    # tool_use: the name and the argument KEYS (never the values — that is what the
+    # server sent, and D-01 permits exactly this much).
+    for field in ("s.tool", "s.arg_keys", "s.unknown_arg_count"):
+        assert field in code, f"the tool call never shows {field}"
+    # tool_result: outcome, the guard that refused it, and each tool's own result shape.
+    for field in ("s.is_error", "s.denied_by", "s.results",
+                  "s.reply_id", "s.escalation_id", "s.category"):
+        assert field in code, f"the tool result never shows {field}"
+    # guardrail: which guard, what it did, and the ticket-id pair that is the payoff.
+    for field in ("s.guard", "s.action", "s.expected_ticket_id",
+                  "s.supplied_ticket_id", "s.missing_count"):
+        assert field in code, f"the guardrail step never shows {field}"
+    # the rest, each named against its own published fields
+    for field in ("s.reason", "s.error_type", "s.kind", "s.cause", "s.retrieval_mode",
+                  "s.result_count", "s.via", "s.cost_usd", "s.char_count",
+                  "s.input_tokens", "s.output_tokens"):
+        assert field in code, f"the trace never shows {field}"
+    assert "None" not in html
+
+
+def test_the_drill_panel_distinguishes_cited_from_retrieved(client):
+    """The grounding story: what the reply cited, versus what it merely saw.
+
+    The comparison itself is the SERVER's — `project_run_detail` stamps `cited` on each
+    search_docs result using `normalise_citation`, the citation guard's own
+    normalisation, so the view and the control cannot drift (06-03). This page renders
+    that answer and must never recompute it: a highlight that disagrees with the guard
+    is worse than no highlight.
+
+    MUTATION that must turn this red: render every chunk identically (drop the
+    `cited ?` ternary and use one class and one label) — the panel still looks full of
+    grounded retrieval while the only thing that made it legible is gone.
+
+    WEAK BY CONSTRUCTION: grep. It sees two classes, two labels and the flag being
+    read; it cannot see the highlight on screen. That is 06-07's human checkpoint.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _DRILL))
+
+    assert "r.cited" in code, "the panel never reads the server's cited flag"
+    for field in ("r.doc", "r.id", "r.score"):
+        assert field in code, f"a retrieved chunk never shows {field}"
+    # Two distinct classes AND two distinct labels — a class alone is invisible if the
+    # stylesheet never distinguishes them, and a label alone is easy to miss.
+    assert '"chunk cited"' in code and '"chunk uncited"' in code
+    assert "cited in the reply" in code and "retrieved, not cited" in code
+    assert ".chunk.cited" in html and ".chunk.uncited" in html, (
+        "the two chunk states are not styled differently — the class is decorative"
+    )
+    # ...and the comparison is not re-derived here: the page never reaches into the
+    # reply's citation list, which is what the server compared against.
+    assert ".citations" not in code
+    assert "normalise" not in code
+
+
+def test_the_drill_panel_renders_timings(client):
+    """A missing time renders as a dash, never as 0.
+
+    `elapsed_ms` is the offset from the run's start and `duration_ms` is a tool call's
+    own span; both are null for rows written before the elapsed_ms migration (and
+    duration_ms is null for a tool_use with no paired result). Rendering null as 0 makes
+    a legacy step claim it took no time — a fabricated number on the one page whose job
+    is credibility. Rendering it as the word Python prints for an absent value is the
+    bug tests/test_auth.py's "None" check exists for.
+
+    MUTATION that must turn this red: collapse the guard to `String(v || 0)` in `dash`
+    and `ms` — every null timing becomes a confident 0.
+
+    WEAK BY CONSTRUCTION: grep for the guard's presence, not for its behaviour.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _DRILL))
+
+    assert "s.elapsed_ms" in code, "steps are not timed at all"
+    assert "s.duration_ms" in code, "tool calls carry no duration"
+    # The one guard both helpers use, asserted as written — a dash, from an explicit
+    # null/undefined test rather than from falsiness (0 is a real timing).
+    assert code.count('(v === null || v === undefined) ? "—"') >= 2
+    assert "None" not in html
+
+
+def test_the_drill_panel_renders_demo_fidelity_when_present(client):
+    """The visitor's own run shows its raw inputs and outputs — and only then.
+
+    The server adds `input`, `result`, `text` and `missing_citations` on the demo branch
+    ONLY (D-02, decided from tickets.origin). Every one of them is optional, so the
+    renderer must ask before it reads: a redacted run has to render with no empty holes
+    where those fields would have been.
+
+    MUTATION that must turn this red: render the raw region unconditionally (drop the
+    `if (!raw.length) return;` guard) — every public run grows an empty "raw" section
+    that promises detail it does not have.
+
+    WEAK BY CONSTRUCTION: grep. That the region is genuinely collapsed is a browser
+    fact; this sees a <details>/<summary> pair being built.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _DRILL))
+
+    for field in ("s.input", "s.result", "s.text", "s.missing_citations"):
+        assert field in code, f"a demo run never shows {field}"
+    # Secondary and collapsed, not inline with the trace.
+    assert '"details"' in code and '"summary"' in code
+    # Optional, every one of them: presence is tested before anything is built...
+    assert "!== undefined" in code
+    # ...and nothing is appended at all when the server sent none of them.
+    assert "if (!raw.length) return;" in code
