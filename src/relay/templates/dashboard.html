@@ -32,6 +32,20 @@ h3 { font-size: .8rem; font-weight: normal; color: #666; margin: 1rem 0 .2rem; }
                 margin: 0 0 .4rem; }
 #feed-list b { display: block; margin-bottom: .2rem; }
 #feed-list .step { color: #444; }
+button { font: inherit; cursor: pointer; }
+.drill-open { background: none; border: 0; padding: 0; color: #036; text-decoration: underline; }
+dialog#drill { max-width: 780px; width: 90%; border: 1px solid #ccc; border-radius: 10px;
+               padding: 1rem 1.2rem; font-size: .85rem; color: #222; }
+dialog#drill::backdrop { background: rgba(0, 0, 0, .35); }
+.drill-head { display: flex; justify-content: space-between; align-items: baseline; }
+.drill-head h2 { margin: 0 0 .4rem; }
+.drill-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+               gap: .4rem; margin: .6rem 0 .8rem; }
+.drill-facts b { display: block; } .drill-facts span { color: #666; font-size: .75rem; }
+.badge { background: #f4f4f4; border-left: 3px solid #444; padding: .4rem .6rem;
+         margin: 0 0 .6rem; }
+.drill-ticket p { white-space: pre-wrap; background: #fafafa; padding: .4rem .6rem;
+                  border-radius: 6px; }
 </style></head><body>
 <header>
 <h1>Relay — agent runs</h1>
@@ -70,7 +84,12 @@ Try it yourself — this key is published on purpose:
 <th>tokens in/out</th><th>cost</th><th>ms</th><th>at</th></tr></thead><tbody></tbody></table>
 </section>
 
-<!-- dialog#drill (the run drill-down) is added by its own plan (06-06). -->
+<dialog id="drill">
+<div class="drill-head"><h2 id="drill-title">Run</h2>
+<button id="drill-close" type="button">close</button></div>
+<div id="drill-envelope"></div>
+<div id="drill-steps"></div>
+</dialog>
 
 <script>
 // ONE RENDERING RULE, WHOLE FILE: every value that comes from the server is written
@@ -157,6 +176,23 @@ function renderDistribution(distribution) {
   });
 }
 
+// The row's first cell: the control that opens that run's drill-down (DASH-03).
+// /metrics publishes run_uid per row (06-02) and it is the only handle GET /runs/{uid}
+// takes. A row written before phase 5 carries a null uid and gets PLAIN TEXT instead of
+// a control — a button that fetches nothing would render "no such run" and read as a
+// broken page rather than as history that predates step recording.
+function runCell(r) {
+  const cell = el("td", {});
+  if (!r.run_uid) {
+    cell.append(el("span", {}, String(r.id)));
+    return cell;
+  }
+  const open = el("button", { class: "drill-open", type: "button" }, String(r.id));
+  open.addEventListener("click", () => openDrill(r.run_uid));
+  cell.append(open);
+  return cell;
+}
+
 function renderRuns(runs) {
   const body = document.querySelector("#runs tbody");
   clear(body);
@@ -168,11 +204,10 @@ function renderRuns(runs) {
   }
   runs.forEach(r => {
     const row = el("tr", {});
-    // The uid is stamped here so the drill-down plan (06-06) has a handle to open
-    // from. Nothing on this page reads it yet.
     if (r.run_uid) row.dataset.uid = r.run_uid;
+    row.append(runCell(r));
     [
-      String(r.id), "#" + r.ticket_id, r.outcome, String(r.steps),
+      "#" + r.ticket_id, r.outcome, String(r.steps),
       r.input_tokens + "/" + r.output_tokens, "$" + r.cost_usd.toFixed(4),
       String(r.duration_ms), r.created_at,
     ].forEach(value => row.append(el("td", {}, value)));
@@ -335,6 +370,148 @@ function renderCharts(m) {
   renderGauge(m.budget);
 }
 // --- charts (SVG) — end ---
+
+// --- drill-down (/runs/{uid}) — begin ---
+// DASH-03 / D-05: one run's whole trace, rendered into a native <dialog> on this page
+// from the public JSON at GET /runs/{uid}. No route split, no second page, no library —
+// the panel is a client-rendered view of server-redacted JSON, and the redaction is the
+// server's (06-03's allowlist, 06-04's route).
+//
+// THE RENDERING RULE THIS BLOCK INHERITS — stated here on purpose rather than absorbed
+// from the block above it: every value below arrives from a public JSON route and is
+// written with textContent through el(). This is the WIDEST surface model-influenced
+// strings reach on the page. The tool name is clamped to the registry server-side and
+// the argument keys are intersected with each tool's declared schema, but doc ids,
+// `denied_by`, guard names, error reasons and — for a run the visitor submitted — their
+// own words all land here, and this page treats every one of them as untrusted data.
+//
+// It also never asks the server for more than it offered. Which runs are shown in
+// detail is decided server-side from tickets.origin; there is no parameter, header or
+// toggle on this page that could ask otherwise, and adding one would teach the next
+// author that asking works.
+const drillEl = document.getElementById("drill");
+const drillTitle = document.getElementById("drill-title");
+const drillFacts = document.getElementById("drill-envelope");
+const drillSteps = document.getElementById("drill-steps");
+document.getElementById("drill-close").addEventListener("click", () => drillEl.close());
+
+// A missing number renders as a dash. Never 0, and never the word Python prints for an
+// absent value: a row written before the elapsed_ms migration did not take zero
+// milliseconds, and saying it did would be an invention a visitor cannot check.
+function dash(v) { return (v === null || v === undefined) ? "—" : String(v); }
+function ms(v) { return (v === null || v === undefined) ? "—" : String(v) + " ms"; }
+
+function drillNotice(text) {
+  clear(drillFacts);
+  clear(drillSteps);
+  drillFacts.append(el("p", { class: "empty" }, text));
+}
+
+async function openDrill(uid) {
+  if (!uid) return;
+  clear(drillFacts);
+  clear(drillSteps);
+  drillTitle.textContent = "Run " + String(uid).slice(0, 8);
+  drillFacts.append(el("p", { class: "empty" }, "loading the trace…"));
+  if (!drillEl.open) drillEl.showModal();
+  let resp;
+  try {
+    resp = await fetch("/runs/" + encodeURIComponent(uid));
+  } catch (err) {
+    drillNotice("the trace could not be fetched — the connection failed. Try again.");
+    return;
+  }
+  if (!resp.ok) {
+    // The route emits exactly ONE 404 and it means the uid is unknown. That is a
+    // different sentence from "swept", which is a 200 about a run that really happened.
+    drillNotice(resp.status === 404
+      ? "no such run — this service never issued that id"
+      : "the trace is unavailable right now (HTTP " + resp.status + ")");
+    return;
+  }
+  renderDrill(await resp.json());
+}
+
+function renderDrill(d) {
+  clear(drillFacts);
+  clear(drillSteps);
+  drillTitle.textContent = "Ticket #" + d.ticket_id + " · run " +
+                           String(d.run_uid).slice(0, 8);
+  if (d.demo) {
+    drillFacts.append(el("p", { class: "badge" },
+      "You submitted this run, so it is shown in detail — including the text you wrote."));
+  }
+  // `run` is null while a run is in flight (its summary row is written in the stream's
+  // finally), so every fact below asks before it reads.
+  const run = d.run;
+  const facts = [
+    ["outcome", run ? run.outcome : "still working"],
+    ["model", run ? run.model : "—"],
+    ["cost", run ? "$" + run.cost_usd : "—"],
+    ["duration", run ? ms(run.duration_ms) : "—"],
+    ["steps", run ? dash(run.steps) : String(d.steps.length)],
+    ["tokens in/out", run ? run.input_tokens + "/" + run.output_tokens : "—"],
+    ["started", run ? run.created_at : "—"],
+  ];
+  const grid = el("div", { class: "drill-facts" });
+  facts.forEach(([label, value]) => {
+    const cell = el("div", {});
+    cell.append(el("b", {}, value), el("span", {}, label));
+    grid.append(cell);
+  });
+  drillFacts.append(grid);
+  // Sent only for a run the visitor submitted themselves (D-02) — which is exactly why
+  // it can be shown: they wrote it.
+  if (d.ticket) {
+    const box = el("div", { class: "drill-ticket" });
+    box.append(el("h3", {}, "The ticket you submitted"));
+    box.append(el("b", {}, d.ticket.subject));
+    box.append(el("p", {}, d.ticket.body));
+    drillFacts.append(box);
+  }
+  renderDrillBody(d);
+}
+
+// The four states 06-04's absence matrix answers with a 200. Each one says what it
+// knows and what it does not; not one of them is an empty box, because a panel that
+// renders nothing reads as a broken page rather than as retention or a run in flight.
+function renderDrillBody(d) {
+  if (d.status === "in_flight") {
+    drillSteps.append(el("p", { class: "empty" },
+      "This run is still working. The steps below are the ones recorded so far, and the"
+      + " totals appear when it ends."));
+  } else if (d.status === "swept") {
+    // The SERVER's note, which names the retention window. A window length written
+    // here would quietly contradict the setting the sweep actually uses.
+    drillSteps.append(el("p", { class: "empty" }, d.note ||
+      "The step detail for this run has been swept — it is kept for a limited window."));
+  } else if (d.status === "unrecorded") {
+    drillSteps.append(el("p", { class: "empty" },
+      "This run has no stored steps: it ran before step recording existed, or its"
+      + " record was never written. The totals above are what survived."));
+  } else if (d.status === "complete" && !d.steps.length) {
+    drillSteps.append(el("p", { class: "empty" }, "this run recorded no steps"));
+  }
+  renderSteps(d.steps);
+}
+
+// The ordered trace. `seq` carries the causal order and `elapsed_ms` the offset from
+// the run's start; a gap in seq is expected (the server drops an unreadable row rather
+// than failing the whole run's history), so nothing here indexes by it.
+function renderSteps(steps) {
+  const list = el("ol", { class: "steps" });
+  steps.forEach(s => {
+    const li = el("li", { class: "step" });
+    const head = el("div", { class: "step-head" });
+    head.append(el("span", { class: "seq" }, "#" + dash(s.seq)));
+    head.append(el("span", { class: "kind" }, s.type));
+    head.append(el("span", { class: "at" }, ms(s.elapsed_ms)));
+    li.append(head);
+    list.append(li);
+  });
+  drillSteps.append(list);
+}
+// --- drill-down (/runs/{uid}) — end ---
 
 // --- live feed (/events) — begin ---
 // The aggregate numbers above still poll; this ADDS the live half DASH-01 names.
