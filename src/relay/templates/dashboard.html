@@ -787,23 +787,190 @@ function setupTryIt() {
   trySend.addEventListener("click", submitTryIt);
 }
 
+// The two calls scripts/demo.sh makes, in the same order and against the same
+// perimeter: create the ticket, then run it. What is sent is what the FIELDS hold, so
+// an edited example is what the agent actually sees.
 async function submitTryIt() {
   trySend.disabled = true;
   clear(tryStream);
   clear(tryActions);
   tryState.textContent = "creating the ticket…";
-  const created = await fetch("/tickets", {
-    method: "POST",
-    headers: { "X-API-Key": DEMO_KEY, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      customer_email: tryEmail,
-      subject: trySubject.value,
-      body: tryBody.value,
-    }),
-  });
+  let created;
+  try {
+    created = await fetch("/tickets", {
+      method: "POST",
+      headers: { "X-API-Key": DEMO_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        customer_email: tryEmail,
+        subject: trySubject.value,
+        body: tryBody.value,
+      }),
+    });
+  } catch (err) {
+    tryFailed("the ticket could not be sent — the connection failed. Try again.");
+    return;
+  }
+  // /tickets has its own allowance (demo_create_limit), so a refusal can land here and
+  // not only on the run itself.
+  if (!created.ok) { await refuse(created); return; }
   const ticket = await created.json();
-  tryState.textContent = "ticket #" + ticket.id + " created";
+  tryState.textContent = "ticket #" + ticket.id + " — working…";
+  await streamRun(ticket.id);
   trySend.disabled = false;
+}
+
+// The run, streamed. `fetch` and not EventSource, and the reason is a hard limit rather
+// than a preference: EventSource takes only (url, {withCredentials}) — it cannot POST
+// and it cannot set a header, so it can neither start a run nor present the key. The
+// ambient feed below still uses it, because that IS a keyless GET.
+async function streamRun(ticketId) {
+  let res;
+  try {
+    res = await fetch("/tickets/" + ticketId + "/process", {
+      method: "POST",
+      headers: { "X-API-Key": DEMO_KEY },
+    });
+  } catch (err) {
+    tryFailed("the run could not be started — the connection failed. Try again.");
+    return;
+  }
+  if (!res.ok) { await refuse(res); return; }
+  // The only way this page learns which run is its own. Same-origin, so the header
+  // needs no CORS allowlist; minted server-side and returned to THIS submitter, so the
+  // badge below cannot be claimed by anyone else (T-06-30).
+  const uid = res.headers.get("X-Relay-Run-Uid");
+  if (uid) offerTheTrace(uid);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut;
+    // Frames are "\n\n"-delimited and arrive split across chunk boundaries, so the tail
+    // stays in the buffer until its terminator turns up. A regex over the whole body
+    // would only produce anything once the stream ended — which is the opposite of the
+    // thing being demonstrated.
+    while ((cut = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      let name = "message", data = "";
+      for (const part of frame.split("\n")) {
+        if (part.startsWith("event: ")) name = part.slice(7);
+        else if (part.startsWith("data: ")) data += part.slice(6);
+      }
+      if (data) onTryFrame(name, JSON.parse(data), uid);
+    }
+  }
+  tryState.textContent = uid ? "run finished" : "run finished (no run id returned)";
+}
+
+// This stream is FULL FIDELITY — it belongs to the caller who created the ticket — so
+// everything here is model-influenced text and every value is written with textContent.
+function onTryFrame(name, data, uid) {
+  if (uid) badgeOwnRun(uid);
+  if (name === "done") return;
+  const text = describeOwn(name, data);
+  if (text === null) return;
+  tryStream.append(el("div", { class: "step" }, text));
+  tryStream.scrollTop = tryStream.scrollHeight;
+}
+
+function describeOwn(name, d) {
+  if (name === "tool_use") return "-> " + d.tool;
+  if (name === "tool_result") return (d.is_error ? "x " : "<- ") + d.tool;
+  if (name === "guardrail") return "guardrail " + d.guard + " -> " + d.action +
+                                   " on " + d.tool;
+  if (name === "notice") return "notice · " + d.kind + " · " + d.tool;
+  if (name === "text") return "thinking: " + d.text;
+  if (name === "usage") return "step " + d.steps + " · $" + d.cost_usd;
+  if (name === "resolution") return "resolved via " + d.via + " · $" + d.cost_usd;
+  // An in-stream refusal: a drain landed mid-request, or a step could not be recorded.
+  // The server writes the copy for both, and it is a state, not a stack trace.
+  if (name === "error") {
+    tryStream.append(el("p", { class: "refusal" },
+                        d.note || "the run stopped: " + d.reason));
+    return null;
+  }
+  return name;
+}
+
+// The visitor's own run, badged where the PUBLIC feed shows it — and left in that feed
+// rather than hidden from it. The same run is on this page twice at once: in full above
+// and redacted below. Seeing both is the security story rendered as an interface, and
+// suppressing one of them would throw that away to avoid a duplicate.
+function badgeOwnRun(uid) {
+  const node = runNodes.get(uid);
+  if (!node || node.dataset.mine === "yes") return;
+  node.dataset.mine = "yes";
+  node.className = "mine";
+  node.append(el("div", { class: "mine-tag" },
+                 "your run — redacted here, in full above"));
+}
+
+// Full fidelity when it opens, because the ticket was CREATED with the demo key (D-02).
+// The page does not ask for that and could not: the decision is the ticket's origin,
+// read server-side.
+function offerTheTrace(uid) {
+  clear(tryActions);
+  const open = el("button", { class: "drill-open", type: "button" },
+                  "see the full trace");
+  open.addEventListener("click", () => openDrill(uid));
+  tryActions.append(open);
+}
+
+function tryFailed(text) {
+  clear(tryStream);
+  tryState.textContent = "";
+  tryStream.append(el("p", { class: "refusal" }, text));
+  trySend.disabled = false;
+}
+
+// D-08: a refusal is a designed STATE, not an error. The rate limiter and the budget
+// ceiling both author their own copy, and the budget one computes its own reset instant
+// — this reads both back out and renders them, so what a visitor is told is exactly
+// what the control decided. Rate-limit and budget details are objects; an auth refusal
+// on an unconfigured deployment is a plain string, and both shapes land here.
+async function refuse(res) {
+  let detail = null;
+  try {
+    const body = await res.json();
+    detail = (body && body.detail !== undefined) ? body.detail : body;
+  } catch (err) {
+    detail = null;
+  }
+  renderRefusal(res.status, detail);
+  trySend.disabled = false;
+}
+
+function renderRefusal(status, detail) {
+  clear(tryStream);
+  clear(tryActions);
+  tryState.textContent = "";
+  const box = el("div", { class: "refusal" });
+  box.append(el("b", {}, status === 503
+    ? "the demo has spent its budget for today"
+    : status === 429
+      ? "the demo's rate limit stopped this run"
+      : "this run was refused"));
+  const note = (typeof detail === "string") ? detail : (detail && detail.note);
+  box.append(el("p", {}, note ||
+                 "the service refused this request (HTTP " + status + ")"));
+  // The SERVER's instant, printed as it sent it. Recomputing midnight here would put a
+  // second, disagreeing answer on the page — in the visitor's local timezone, against a
+  // ceiling that resets at 00:00 UTC.
+  if (detail && detail.resets_at) {
+    box.append(el("p", { class: "resets" }, "resets at " + detail.resets_at));
+  }
+  if (detail && detail.retry_after_seconds) {
+    box.append(el("p", { class: "resets" },
+                   "try again in " + detail.retry_after_seconds + "s"));
+  }
+  box.append(el("p", { class: "resets" },
+                 "This is the cost control working: the cap is what keeps the demo"
+                 + " open to everyone, and it is the same one the metrics above show."));
+  tryStream.append(box);
 }
 
 setupTryIt();
