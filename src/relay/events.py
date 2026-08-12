@@ -11,11 +11,21 @@ that watches it, and each one fails in a way the others cannot catch:
   adds later, and the fields flowing past here include customer emails, ticket
   bodies and reply text (D-07). `attribute_to_run()` stamps the run's identity onto
   a frame project() has already built — it is not a second path to one.
-- `snapshot_frame()` is the only other public serialiser on the whole surface: the
-  connect frame (D-14), whose input is registry state rather than a run event. It
-  lives HERE, beside project(), because "the redaction boundary" has to be one file a
-  reviewer can open (WR-04) — it used to sit in main.py while this docstring claimed
-  project() was the only path, which is the kind of gap an audit finds by luck.
+- `snapshot_frame()` is the second public serialiser: the connect frame (D-14), whose
+  input is registry state rather than a run event. It lives HERE, beside project(),
+  because "the redaction boundary" has to be one file a reviewer can open (WR-04) — it
+  used to sit in main.py while this docstring claimed project() was the only path,
+  which is the kind of gap an audit finds by luck.
+- `project_run_detail()` is the third and last: phase 6's drill-down redactor (D-01),
+  whose input is stored `run_events` ROWS rather than a live event. It is here for the
+  same WR-04 reason, and it reuses `_project_tool_result` so the back catalogue can
+  never disclose more of a tool result than the live feed already did. Counting it
+  makes three — this docstring said two until phase 6 added it, and a docstring that
+  undercounts the public serialisers is the exact failure WR-04 was raised for.
+  `test_events_output_comes_only_from_two_serialisers` still holds and still says two:
+  it pins the /events GENERATOR, which uses project() and snapshot_frame() and must
+  never grow a third path. The drill-down is a different route, so it is outside that
+  test's subject and inside its own (tests/test_dashboard.py).
 - `RunRecorder` writes one `run_events` row per step. For a write-tier tool the row
   goes in the tool's OWN transaction as a savepoint, so the reply and the record of
   the reply commit or roll back together (D-04).
@@ -34,6 +44,7 @@ from typing import Any
 from .config import settings
 from .db import Database
 from .models import AgentEvent
+from .retrieval import normalise_citation
 from .runs import ActiveRun
 
 logger = logging.getLogger("relay.events")
@@ -311,6 +322,230 @@ def project(event: AgentEvent) -> dict | None:
     return None
 
 
+def _as_int(value: Any) -> int | None:
+    """An int, or nothing. Coerced rather than forwarded, the way `result_count` is.
+
+    `bool` is excluded deliberately even though it is an int subclass: `True` is not a
+    ticket id, and a frame reading `supplied_ticket_id: true` is worse than one reading
+    null. Everything else — a model-authored string, a dict, a list — becomes None
+    rather than being published in whatever shape it arrived in.
+    """
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
+
+
+def project_run_detail(
+    rows: list, *, full_fidelity: bool, known_tools: dict[str, frozenset[str]]
+) -> list[dict]:
+    """Redact one run's persisted events into a public drill-down (D-01, DASH-03).
+
+    Takes the WHOLE run rather than one event, because two of the things DASH-03 asks
+    for are run-level facts and not per-event ones: cited-vs-not is a comparison
+    between the accepted send_reply's citations and every search_docs result the run
+    saw, and a tool's duration is the gap between its tool_use row and its tool_result
+    row. A `map(project_one, rows)` shape cannot compute either.
+
+    `full_fidelity` is D-02's exception, and it is decided by the CALLER from
+    `tickets.origin` — never from anything the client sent. It is keyword-only with NO
+    default so a caller has to state which side it is on. It selects a SECOND
+    allowlist, not a raw spread: even the demo path names `input`, `result`, `text` and
+    `missing_citations` explicitly, so no path in this codebase publishes a field
+    nobody wrote down, and default-deny survives the exception. `customer_email` is on
+    neither side (Q3) — it is the one field a visitor could use to publish a third
+    party's identifier — and neither is the ticket text, which is the route's to add.
+
+    `known_tools` maps each REGISTERED tool name to the frozenset of its declared
+    `input_schema.properties` keys; the caller builds it from `app.state.registry`.
+    Both the tool name and its argument keys are strings the MODEL chose (INFO-1), and
+    both reach a browser: the name is clamped to this map and an unregistered one
+    renders the literal "unknown", while argument keys are intersected with the
+    declared schema and whatever that excludes becomes a count — a number cannot carry
+    a payload.
+
+    The tool_result branch calls `_project_tool_result` itself rather than restating
+    it. That is the point: the drill-down is a bigger disclosure surface than the live
+    feed and, unlike the feed, it is a BACK CATALOGUE — so "the drill-down can never
+    show more of a tool result than /events already does" has to be a structural
+    property, enforced by shared code, and not a promise a reviewer keeps by comparing
+    two lists. It also means the error branch's dropping of the message text is
+    inherited, not re-decided: there is no `error` or `message` key on the public side.
+
+    Fail-closed on both axes. An unrecognised `type` is dropped, exactly as project()
+    drops one, so a new yield site in agent.py is absent from the drill-down until
+    someone adds it here on purpose. A payload that will not parse — or parses to
+    something that is not a dict — is a DROPPED STEP and never a 500: `load_index`'s
+    degrade-and-log posture, because one bad row must not make a whole run's history
+    unreadable. An empty `rows` (a run whose events the 30-day retention swept, which
+    deliberately spares the `runs` row) projects to `[]`; rendering that state as
+    "swept" is the route's job, and not crashing is this function's.
+
+    `created_at` is never published: it is `datetime('now')` at second resolution, so
+    as a per-step timing it is actively misleading. `seq` carries the causal order and
+    `elapsed_ms` the timing, both stamped by RunRecorder for exactly this.
+    """
+    # Pass 1 — parse, dropping anything unreadable. The log names the row, never a
+    # value from it: this function's whole job is that payload values do not escape.
+    parsed: list[tuple[Any, dict]] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"])
+        except (ValueError, TypeError):
+            payload = None
+        if not isinstance(payload, dict):
+            logger.warning("run_detail.malformed_payload", extra={"ctx": {
+                "seq": row["seq"], "type": row["type"],
+            }})
+            continue
+        parsed.append((row, payload))
+
+    # Pass 2 — the run-level facts. Each tool_result pairs with the NEAREST PRECEDING
+    # UNPAIRED tool_use of the same tool name, so two interleaved calls to different
+    # tools cannot swap durations, and a retried send_reply pairs with its own attempt.
+    pending: dict[Any, list[int]] = {}
+    paired_use: dict[int, int] = {}
+    for i, (row, payload) in enumerate(parsed):
+        if row["type"] == "tool_use":
+            pending.setdefault(payload.get("tool"), []).append(i)
+        elif row["type"] == "tool_result":
+            stack = pending.get(payload.get("tool"))
+            if stack:
+                paired_use[i] = stack.pop()
+
+    # The cited set comes from the ACCEPTED send_reply's tool_use — the citations are
+    # nowhere else, `replies` does not persist them (tools.py). A DENIED attempt's
+    # citations are not "cited": the guardrail row already tells that story, and
+    # counting them would make the drill-down claim grounding the guard refused. No
+    # accepted send_reply at all (an escalation, an error, a dry run) leaves this empty,
+    # which correctly renders every chunk as retrieved-but-not-cited.
+    cited: set[str] = set()
+    for i, (row, payload) in enumerate(parsed):
+        if (
+            row["type"] != "tool_result"
+            or payload.get("tool") != "send_reply"
+            or payload.get("is_error")
+            or i not in paired_use
+        ):
+            continue
+        raw_input = parsed[paired_use[i]][1].get("input")
+        citations = raw_input.get("citations") if isinstance(raw_input, dict) else None
+        if isinstance(citations, list):
+            # normalise_citation, not a local strip().lower(): this is the VIEW of the
+            # citation guard, and a view that contradicts its control is worse than none.
+            cited.update(normalise_citation(c) for c in citations if isinstance(c, str))
+
+    duration_for: dict[int, int | None] = {}
+    for i, use in paired_use.items():
+        end, start = parsed[i][0]["elapsed_ms"], parsed[use][0]["elapsed_ms"]
+        duration_for[i] = (
+            end - start if isinstance(end, int) and isinstance(start, int) else None
+        )
+
+    # Pass 3 — one step per surviving row, field by field.
+    steps: list[dict] = []
+    for i, (row, payload) in enumerate(parsed):
+        t = row["type"]
+        step: dict[str, Any] = {"seq": row["seq"], "type": t, "elapsed_ms": row["elapsed_ms"]}
+        if t == "usage":
+            step["steps"] = payload.get("steps")
+            step["input_tokens"] = payload.get("input_tokens")
+            step["output_tokens"] = payload.get("output_tokens")
+            step["cost_usd"] = payload.get("cost_usd")
+        elif t == "resolution":
+            step["via"] = payload.get("via")
+            step["cost_usd"] = payload.get("cost_usd")
+            step["steps"] = payload.get("steps")
+        elif t == "error":
+            # `error_type`, not `type`: the API error's own type would collide with the
+            # step's, for the same reason project() renames it.
+            step["reason"] = payload.get("reason")
+            step["status"] = payload.get("status")
+            step["error_type"] = payload.get("type")
+        elif t == "text":
+            # A length tells a visitor "the model reasoned for 400 characters" and
+            # discloses nothing quotable; the prose restates the customer's own ticket.
+            # len() only of a str — never of a dict that happened to land here.
+            raw_text = payload.get("text")
+            step["char_count"] = len(raw_text) if isinstance(raw_text, str) else None
+            if full_fidelity:
+                step["text"] = raw_text
+        elif t == "tool_use":
+            raw_tool = payload.get("tool")
+            raw_input = payload.get("input")
+            raw_input = raw_input if isinstance(raw_input, dict) else {}
+            declared = known_tools.get(raw_tool, frozenset())
+            arg_keys = sorted(k for k in raw_input if k in declared)
+            step["tool"] = raw_tool if raw_tool in known_tools else "unknown"
+            step["arg_keys"] = arg_keys
+            step["unknown_arg_count"] = len(raw_input) - len(arg_keys)
+            if full_fidelity:
+                step["input"] = raw_input
+        elif t == "tool_result":
+            detail = _project_tool_result(payload)
+            # Its own "type" is the same string as the row's; dropped so the envelope
+            # above stays the single source of it.
+            detail.pop("type", None)
+            # An update of ALREADY-REDACTED output, not a spread of the payload — the
+            # reuse this branch exists for.
+            step.update(detail)
+            step["duration_ms"] = duration_for.get(i)
+            projected_results = detail.get("results")
+            if isinstance(projected_results, list):
+                # Filtered exactly as _project_tool_result filters, so index i of the
+                # projected list is index i of the raw one and no result can be
+                # labelled with another's grounding.
+                result = payload.get("result")
+                raw_results = result.get("results") if isinstance(result, dict) else None
+                raw_results = [
+                    r for r in raw_results if isinstance(r, dict)
+                ] if isinstance(raw_results, list) else []
+                for projected, raw in zip(projected_results, raw_results, strict=False):
+                    anchors = raw.get("anchors")
+                    # Every id this hit licenses — its doc, its located id and each of
+                    # its anchors — exactly the set agent.py adds to the run's
+                    # accept-set. Narrowing it to `id` would mark a correct anchor
+                    # citation as ungrounded.
+                    licensed = [raw.get("doc"), raw.get("id")]
+                    licensed.extend(anchors if isinstance(anchors, list) else ())
+                    projected["cited"] = any(
+                        isinstance(lic, str) and normalise_citation(lic) in cited
+                        for lic in licensed
+                    )
+            if full_fidelity:
+                step["result"] = payload.get("result")
+        elif t == "guardrail":
+            # The prompt-injection story IS "a ticket body named ticket 999 and the
+            # guard denied it", so the two ids are the payoff — and they are ints by
+            # the time the event is built (agent.py reads them off validated input),
+            # which is why coercing rather than forwarding costs nothing here.
+            missing = payload.get("missing_citations")
+            step["guard"] = payload.get("guard")
+            step["tool"] = payload.get("tool")
+            step["action"] = payload.get("action")
+            step["expected_ticket_id"] = _as_int(payload.get("expected_ticket_id"))
+            step["supplied_ticket_id"] = _as_int(payload.get("supplied_ticket_id"))
+            step["missing_count"] = len(missing) if isinstance(missing, list) else 0
+            if full_fidelity:
+                # Model-authored text, so it is named here and nowhere near the public
+                # branch. `retrieved_ids` is on NEITHER: it is not in the allowlist.
+                step["missing_citations"] = missing
+        elif t == "notice":
+            # `result_count`, not `results`, and coerced — project()'s WR-02 coercion
+            # copied rather than merely its field name, because the same future edit
+            # ("show WHICH results we fell back to") turns this into the hit list, and
+            # a forward would then publish each hit's retrieved prose.
+            count = payload.get("results")
+            step["kind"] = payload.get("kind")
+            step["tool"] = payload.get("tool")
+            step["retrieval_mode"] = payload.get("retrieval_mode")
+            step["cause"] = payload.get("cause")
+            step["result_count"] = count if isinstance(count, int) else None
+        else:
+            continue  # unrecognised type — dropped, on BOTH branches
+        steps.append(step)
+    return steps
+
+
 def attribute_to_run(frame: dict, *, run_uid: str, ticket_id: int) -> dict:
     """Stamp an already-projected frame with the run it belongs to (CR-03).
 
@@ -329,28 +564,36 @@ def attribute_to_run(frame: dict, *, run_uid: str, ticket_id: int) -> dict:
     `ticket_id` is not a new disclosure: /events' own connect snapshot and /metrics'
     last_runs both already carry it.
 
-    `run_uid` IS a disclosure this function makes and /metrics deliberately does not.
-    That is the current, deliberate position, and it is stated here because this
-    docstring used to claim /metrics published the uid too — true when this function
-    landed, false three commits later when `telemetry._PUBLIC_RUN_COLUMNS` replaced
-    `SELECT *` and dropped it, on the reasoning that the uid is the key into
-    `run_events`, a table filled with unredacted customer data. Two tests now pin the
-    two halves: `test_metrics_does_not_publish_run_uid` and
-    `test_concurrent_runs_are_attributable_in_the_feed`.
+    `run_uid` is published on BOTH surfaces now: here, and on /metrics' last_runs.
 
-    The two are coherent, on one condition, and it is the condition phase 6 inherits:
+    Phase 5 left it here only. `telemetry._PUBLIC_RUN_COLUMNS` had dropped it from
+    /metrics on the reasoning that the uid is the key into `run_events` — a table full
+    of unredacted customer data — and this docstring set the condition phase 6 would
+    have to satisfy before it could come back: the uid must stay a CORRELATION token
+    and never become a bearer credential, so a drill-down keyed on it must be
+    authenticated or itself redacted, and knowing a uid must grant nothing.
 
-    - Here the uid is a CORRELATION token. Concurrent runs interleave, so without it a
-      cost figure has no ticket and a resolution has no run — and the listener already
-      holds every frame the uid identifies. It buys nothing it did not just receive.
-    - On /metrics the uid would be a HANDLE to the back catalogue: last_runs is history,
-      so stamping it there hands an anonymous caller keys to runs it never watched.
+    Phase 6 satisfied that condition rather than widening it, so the withholding was
+    dropped (it was never protection — the uid is already broadcast to every anonymous
+    listener for every run they watch; withholding it on /metrics only made the back
+    catalogue unnavigable for honest callers):
 
-    The condition: `run_uid` must stay a correlation token and never become a bearer
-    credential. It is already broadcast to every anonymous listener for the runs they
-    watch, so a phase 6 drill-down keyed on it has to be authenticated (or itself
-    redacted) — knowing a uid must grant nothing. If that is ever not true, this is the
-    line to delete, not the reasoning to widen.
+    - `project_run_detail` above is the drill-down the uid opens, and it is redacted
+      server-side by the same field-by-field allowlist this file exists for (D-01,
+      D-03). What a uid buys is a step trace with the emails, ticket bodies, reply text
+      and retrieved prose already removed.
+    - The one full-fidelity path is gated on `tickets.origin`, read from the database
+      by the route. It is not a query param, a header or a cookie, and
+      `full_fidelity` is keyword-only with no default so no caller drifts into it.
+
+    So the uid is a correlation token on both surfaces: it names a run, and naming a
+    run grants exactly what any anonymous visitor could already watch happen live.
+    `test_concurrent_runs_are_attributable_in_the_feed` pins the correlation half; the
+    drill-down's own leak tests pin the half that makes publishing it safe.
+
+    If a future change makes a uid grant anything a caller did not already have — an
+    unredacted field, a write, a rate-limit exemption — that is the moment it becomes a
+    bearer credential, and this is the line to delete, not the reasoning to widen.
 
     The identity is written LAST so no event field can ever overwrite it — a frame that
     lies about which run it came from is worse than no frame.

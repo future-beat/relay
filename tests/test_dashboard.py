@@ -7,6 +7,7 @@ gate share — are Phase 6's, and belong where a reader looking for Phase 6 will
 """
 
 import asyncio
+import inspect
 import json
 import re
 from datetime import datetime
@@ -19,6 +20,7 @@ from relay import db as db_module
 from relay.agent import _execute_guarded
 from relay.config import settings
 from relay.db import connect, init_db
+from relay.events import project_run_detail
 from relay.guardrails import ToolPolicy
 from relay.main import app
 from relay.ratelimit import (
@@ -338,3 +340,454 @@ def test_normalise_citation_is_the_guards_normalisation(conn, registry):
     )
     assert denied_is_error is True
     assert json.loads(denied)["denied_by"] == "citation"
+
+
+# Sentinels for the drill-down. Distinct per field so a failure names WHICH secret got
+# out and through which step, and implausible-by-accident so absence means something.
+DETAIL_EMAIL = "drilldown-leak-3e91@example.com"      # lookup_customer input + result
+DETAIL_QUERY = "sk-ant-DRILLDOWN-FAKE-KEY-77af"       # search_docs input.query
+DETAIL_PROSE = "DRILLDOWN-KB-PROSE-4c8e"              # search_docs result text + heading
+DETAIL_REASON = "DRILLDOWN-TICKET-BODY-9b12"          # create_escalation input.reason
+DETAIL_REPLY = "DRILLDOWN-REPLY-TEXT-1d55"            # send_reply input.body
+DETAIL_CITE = "DRILLDOWN-FABRICATED-CITE-6a20"        # guardrail missing_citations
+DETAIL_ERROR = "DRILLDOWN-ERROR-MESSAGE-8f74"         # tool_result error string
+
+DETAIL_SENTINELS = (
+    ("customer email", DETAIL_EMAIL),
+    ("search query", DETAIL_QUERY),
+    ("retrieved prose", DETAIL_PROSE),
+    ("escalation reason", DETAIL_REASON),
+    ("reply body", DETAIL_REPLY),
+    ("missing citation", DETAIL_CITE),
+    ("tool error message", DETAIL_ERROR),
+)
+
+DETAIL_UID = "drilldown-uid"
+
+
+def _known_tools(registry) -> dict[str, frozenset[str]]:
+    """Each registered tool's DECLARED argument keys, straight off its Claude schema.
+
+    Built from the real registry rather than a literal so a schema change moves the
+    clamp with it — a hardcoded set would keep passing while the projector started
+    excluding a key the tool genuinely declares.
+    """
+    return {
+        name: frozenset(spec.schema["input_schema"]["properties"])
+        for name, spec in registry.items()
+    }
+
+
+def _store(conn, events, *, run_uid: str = DETAIL_UID, ticket_id: int = 77) -> list:
+    """Write raw run_events rows and read them back as real sqlite3.Rows.
+
+    `events` is a list of (type, payload, elapsed_ms); a payload that is already a str
+    is written through untouched, which is how the malformed-JSON case is built.
+    """
+    for seq, (type_, payload, elapsed_ms) in enumerate(events, start=1):
+        conn.execute(
+            "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload, elapsed_ms)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                run_uid,
+                ticket_id,
+                seq,
+                type_,
+                payload if isinstance(payload, str) else json.dumps(payload, default=str),
+                elapsed_ms,
+            ),
+        )
+    conn.commit()
+    return conn.execute(
+        "SELECT seq, type, payload, elapsed_ms, created_at FROM run_events"
+        " WHERE run_uid = ? ORDER BY seq",
+        (run_uid,),
+    ).fetchall()
+
+
+def _leaky_run_events() -> list:
+    """One run carrying every sentinel, in the raw shapes RunRecorder actually writes."""
+    return [
+        ("usage", {"steps": 1, "input_tokens": 900, "output_tokens": 120,
+                   "cost_usd": 0.004, "max_cost_usd": 0.5}, 10),
+        ("text", {"text": f"The customer wrote: {DETAIL_REASON}"}, 20),
+        ("tool_use", {"tool": "lookup_customer", "input": {"email": DETAIL_EMAIL}}, 30),
+        ("tool_result", {"tool": "lookup_customer", "is_error": False, "result": {
+            "found": True,
+            "customer": {"email": DETAIL_EMAIL, "name": "Leak", "plan": "enterprise"},
+            "recent_tickets": [{"id": 1, "subject": DETAIL_REASON, "status": "open"}],
+        }}, 55),
+        ("tool_use", {"tool": "search_docs", "input": {"query": DETAIL_QUERY}}, 60),
+        ("tool_result", {"tool": "search_docs", "is_error": False, "result": {
+            "results": [{
+                "doc": "billing.md", "heading": f"Refunds {DETAIL_PROSE}",
+                "id": "billing.md#refunds",
+                "anchors": ["billing.md", "billing.md#refunds"],
+                "text": f"Refunds take 14 days. {DETAIL_PROSE}", "score": 0.82,
+            }],
+            "retrieval_mode": "hybrid", "degraded": False,
+        }}, 140),
+        ("notice", {"kind": "retrieval_degraded", "tool": "search_docs",
+                    "retrieval_mode": "keyword", "cause": "no_index", "results": 1}, 145),
+        ("guardrail", {"guard": "citation", "tool": "send_reply",
+                       "missing_citations": [DETAIL_CITE],
+                       "retrieved_ids": ["billing.md#refunds"], "action": "denied"}, 150),
+        ("tool_result", {"tool": "send_reply", "is_error": True, "result": {
+            "error": f"citation(s) ['{DETAIL_CITE}'] were not retrieved. {DETAIL_ERROR}",
+            "denied_by": "citation", "missing_citations": [DETAIL_CITE],
+        }}, 155),
+        ("guardrail", {"guard": "ticket_binding", "tool": "send_reply",
+                       "expected_ticket_id": 77, "supplied_ticket_id": 999,
+                       "action": "denied"}, 160),
+        ("tool_use", {"tool": "create_escalation", "input": {
+            "ticket_id": 77, "reason": DETAIL_REASON, "priority": "high"}}, 170),
+        ("tool_use", {"tool": "send_reply", "input": {
+            "ticket_id": 77, "body": DETAIL_REPLY,
+            "citations": ["  BILLING.md#Refunds "]}}, 180),
+        ("tool_result", {"tool": "send_reply", "is_error": False,
+                         "result": {"reply_id": 5, "status": "resolved"}}, 240),
+        ("resolution", {"via": "send_reply", "cost_usd": 0.012, "steps": 4,
+                        "input_tokens": 900, "output_tokens": 120}, 250),
+        ("error", {"reason": "api_error", "status": 529, "type": "overloaded_error"}, 260),
+    ]
+
+
+def test_project_run_detail_publishes_only_named_fields(conn, registry):
+    """No sentinel survives the public branch — asserted per step and per secret.
+
+    The rows are hand-written in the exact shapes RunRecorder persists, with a distinct
+    secret in every sensitive position the payload map enumerates: lookup_customer's
+    input.email AND its result.customer.email, search_docs' input.query and its result
+    text/heading, create_escalation's reason, send_reply's body, a guardrail's
+    missing_citations, and a denied tool_result's `error` string (Pitfall 7 — the
+    drill-down must not "improve" on _project_tool_result's dropping of that message).
+
+    The anti-vacuity half matters as much as the absence half: a projector that
+    published nothing at all would leak nothing at all. So the step list must be
+    non-empty and must actually contain the tool_use, tool_result and guardrail steps
+    the secrets rode in on, and each raw payload must still hold its sentinel (D-01:
+    run_events stays full-fidelity; redaction happens on the way out, or phase 6 has
+    nothing to drill into).
+
+    MUTATION that must turn this red for ALL sentinels: forward the raw payload on the
+    public branch — `step = dict(json.loads(row["payload"])); step["seq"] = row["seq"]`.
+
+    SECOND, INDEPENDENT MUTATION: give `full_fidelity` a default of True, so a caller
+    that forgets to decide gets full disclosure (T-06-11). Caught by the SIGNATURE
+    assertion below and not by the behaviour above — every call in this file passes the
+    flag explicitly, so no amount of leak-checking can see a default. Stated plainly:
+    that assertion is a regression guard on the signature, not proof about output.
+    """
+    # T-06-11: keyword-only, no default. A positional bool is the kind of argument a
+    # future route passes by accident; a default is the kind of decision a future
+    # caller never makes at all.
+    param = inspect.signature(project_run_detail).parameters["full_fidelity"]
+    assert param.default is inspect.Parameter.empty, "full_fidelity acquired a default"
+    assert param.kind is inspect.Parameter.KEYWORD_ONLY
+
+    rows = _store(conn, _leaky_run_events())
+
+    steps = project_run_detail(
+        rows, full_fidelity=False, known_tools=_known_tools(registry)
+    )
+
+    # Anti-vacuity: the secrets were genuinely carried, and the projector genuinely
+    # produced the steps they rode in on.
+    raw = "".join(r["payload"] for r in rows)
+    for name, sentinel in DETAIL_SENTINELS:
+        assert sentinel in raw, f"the {name} sentinel never reached run_events"
+    assert steps, "the projector returned nothing — the absence assertions would be vacuous"
+    by_type = {s["type"] for s in steps}
+    assert {"tool_use", "tool_result", "guardrail", "text", "notice"} <= by_type, by_type
+    assert {s.get("tool") for s in steps if s["type"] == "tool_use"} == {
+        "lookup_customer", "search_docs", "create_escalation", "send_reply"
+    }
+
+    # Collected rather than asserted in place: under the mutations above the useful
+    # answer is EVERY step/secret pair that opened, not just the first.
+    leaks = [
+        (name, step["seq"], step["type"])
+        for step in steps
+        for name, sentinel in DETAIL_SENTINELS
+        if sentinel in json.dumps(step, default=str)
+    ]
+    assert leaks == [], f"the public drill-down leaked: {leaks}"
+
+    # Pitfall 7 stated directly: no error/message key exists on the public branch at all.
+    assert not any({"error", "message"} & set(step) for step in steps), steps
+
+
+def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
+    """D-02's inverse: full fidelity really is fuller, and still only where named.
+
+    Without this half, `project_run_detail` could regress to redacted-for-everyone and
+    every leak assertion in this module would stay green — the Try-it payoff would just
+    silently stop working. So the demo branch must return the raw `input`, `result`,
+    `text` and `missing_citations`, and NOTHING outside that named list: the exact key
+    set of a tool_use step is asserted in BOTH branches, so a demo branch built as a
+    raw spread fails here rather than being caught only by review.
+    """
+    rows = _store(conn, _leaky_run_events())
+    known = _known_tools(registry)
+
+    public = project_run_detail(rows, full_fidelity=False, known_tools=known)
+    demo = project_run_detail(rows, full_fidelity=True, known_tools=known)
+
+    demo_json = json.dumps(demo, default=str)
+    for name, sentinel in (
+        ("customer email", DETAIL_EMAIL),        # tool_use.input + tool_result.result
+        ("search query", DETAIL_QUERY),
+        ("retrieved prose", DETAIL_PROSE),
+        ("escalation reason", DETAIL_REASON),
+        ("reply body", DETAIL_REPLY),
+        ("missing citation", DETAIL_CITE),
+    ):
+        assert sentinel in demo_json, f"the demo branch dropped the {name} — D-02 regressed"
+
+    def _tool_use(steps, tool):
+        return next(s for s in steps if s["type"] == "tool_use" and s.get("tool") == tool)
+
+    assert set(_tool_use(public, "send_reply")) == {
+        "seq", "type", "elapsed_ms", "tool", "arg_keys", "unknown_arg_count"
+    }
+    assert set(_tool_use(demo, "send_reply")) == {
+        "seq", "type", "elapsed_ms", "tool", "arg_keys", "unknown_arg_count", "input"
+    }
+
+    def _guardrail(steps, guard):
+        return next(s for s in steps if s["type"] == "guardrail" and s["guard"] == guard)
+
+    assert set(_guardrail(public, "citation")) == {
+        "seq", "type", "elapsed_ms", "guard", "tool", "action",
+        "expected_ticket_id", "supplied_ticket_id", "missing_count",
+    }
+    assert set(_guardrail(demo, "citation")) - set(_guardrail(public, "citation")) == {
+        "missing_citations"
+    }
+    # `retrieved_ids` is on neither branch: it is not in the allowlist table, and a
+    # field nobody wrote down is not published even when it looks harmless.
+    assert "retrieved_ids" not in _guardrail(demo, "citation")
+
+    text_public = next(s for s in public if s["type"] == "text")
+    text_demo = next(s for s in demo if s["type"] == "text")
+    assert set(text_public) == {"seq", "type", "elapsed_ms", "char_count"}
+    assert set(text_demo) - set(text_public) == {"text"}
+    assert text_public["char_count"] == len(f"The customer wrote: {DETAIL_REASON}")
+
+
+def test_project_run_detail_drops_unknown_and_malformed(conn, registry):
+    """Fail-closed on both axes: an unknown type and an unparseable payload are DROPPED.
+
+    Same default as project(): a new yield site in agent.py is absent from the
+    drill-down until someone adds it here on purpose. And a malformed payload is a
+    dropped step, never a 500 — load_index's degrade-and-log posture, because one bad
+    row must not make a whole run's history unreadable.
+
+    MUTATION that must turn this red: replace the `return None` fallthrough with
+    `return dict(payload)` — the debug_dump row's secret then appears in the output.
+    SECOND MUTATION: let json.loads raise instead of catching — the malformed row
+    raises out of the projector and this test errors rather than asserting.
+    """
+    rows = _store(conn, [
+        ("usage", {"steps": 1, "input_tokens": 1, "output_tokens": 1, "cost_usd": 0.1}, 5),
+        ("debug_dump", {"secret": DETAIL_EMAIL}, 6),
+        ("tool_use", "{not json at all", 7),
+        ("tool_use", "[1, 2, 3]", 8),  # valid JSON, wrong shape — a payload is a dict
+        ("resolution", {"via": "send_reply", "cost_usd": 0.1, "steps": 1}, 9),
+    ])
+
+    steps = project_run_detail(
+        rows, full_fidelity=False, known_tools=_known_tools(registry)
+    )
+
+    assert [s["type"] for s in steps] == ["usage", "resolution"]
+    assert [s["seq"] for s in steps] == [1, 5]
+    assert DETAIL_EMAIL not in json.dumps(steps, default=str)
+
+    # And the demo branch drops them too: full fidelity widens named fields, it does
+    # not turn off the type allowlist.
+    demo = project_run_detail(rows, full_fidelity=True, known_tools=_known_tools(registry))
+    assert [s["type"] for s in demo] == ["usage", "resolution"]
+
+
+def test_project_run_detail_survives_a_swept_run(conn, registry):
+    """A run whose events the 30-day retention deleted projects to [], not a crash.
+
+    purge_expired_run_events spares the `runs` row on purpose (db.py), so this state is
+    reachable in production for every run older than the retention window. The route
+    renders it as `status: "swept"`; the projector's job is simply not to be the reason
+    that page 500s.
+    """
+    assert project_run_detail([], full_fidelity=False, known_tools=_known_tools(registry)) == []
+    assert project_run_detail([], full_fidelity=True, known_tools=_known_tools(registry)) == []
+
+
+def test_tool_use_arg_keys_are_clamped(conn, registry):
+    """INFO-1 for this surface: neither the tool NAME nor an argument KEY is model-free.
+
+    Both are strings the model chose and both reach a browser. The name is clamped to
+    the registry and an unregistered one renders the literal "unknown"; argument keys
+    are intersected with the tool's own declared input_schema.properties, and whatever
+    that excludes becomes a COUNT — a number, which cannot carry a payload.
+
+    MUTATION that must turn this red: `arg_keys = sorted(raw_input)` — the injected key
+    name appears verbatim in the output and unknown_arg_count reads 0.
+    """
+    rows = _store(conn, [
+        ("tool_use", {"tool": "send_reply", "input": {
+            "ticket_id": 77,
+            "body": "z" * 40,
+            # A model-chosen key the tool never declared, carrying a payload.
+            f"<img src=x onerror={DETAIL_EMAIL}>": "x",
+            # Real to the EXECUTOR but absent from the schema the model was shown, so
+            # the clamp follows the declared properties and not the Python signature.
+            "max_results": 3,
+        }}, 10),
+        ("tool_use", {"tool": "delete_everything", "input": {"target": "prod"}}, 20),
+    ])
+
+    steps = project_run_detail(
+        rows, full_fidelity=False, known_tools=_known_tools(registry)
+    )
+
+    declared, unknown = steps
+    assert declared["tool"] == "send_reply"
+    assert declared["arg_keys"] == ["body", "ticket_id"]  # sorted, declared only
+    assert declared["unknown_arg_count"] == 2
+    assert DETAIL_EMAIL not in json.dumps(steps, default=str)
+
+    # An unregistered tool is named "unknown", not echoed — and since it declares
+    # nothing, all of its arguments are unknown.
+    assert unknown["tool"] == "unknown"
+    assert unknown["arg_keys"] == []
+    assert unknown["unknown_arg_count"] == 1
+    assert "delete_everything" not in json.dumps(steps, default=str)
+
+
+def test_steps_carry_seq_and_elapsed_and_tool_durations(conn, registry):
+    """The envelope: seq, elapsed_ms, a real per-tool duration — and never created_at.
+
+    `duration_ms` is elapsed_ms(tool_result) - elapsed_ms(the paired tool_use), which is
+    exactly what RunRecorder's stamping was built to make subtractable. Pairing is by
+    tool name to the nearest preceding unpaired tool_use, so two interleaved calls to
+    different tools do not swap durations.
+
+    MUTATION that must turn this red: pair each tool_result with the immediately
+    preceding tool_use row regardless of name — the LIFO run below then reads
+    lookup_customer 105 and search_docs 155 instead of 200 and 155.
+    SECOND MUTATION, and the reason the FIFO run exists: pair name-blind but still pop
+    (a single global stack). That survives the LIFO ordering, where popping happens to
+    restore the right answer, and it is the FIFO ordering that kills it —
+    lookup_customer reads 40 and search_docs 90 instead of 50 and 80. One ordering was
+    not enough; I ran the first version of this test against that mutation and it
+    passed.
+    THIRD MUTATION: publish `created_at` in the envelope — the last assertion names it.
+    """
+    # LIFO: the two calls nest, so the nearest preceding tool_use is the right one.
+    lifo = _store(conn, [
+        ("tool_use", {"tool": "lookup_customer", "input": {"email": "a@b.co"}}, 10),
+        ("tool_use", {"tool": "search_docs", "input": {"query": "refunds"}}, 105),
+        # Resolves against the search_docs row at 105, not the lookup row at 10.
+        ("tool_result", {"tool": "search_docs", "is_error": False,
+                         "result": {"results": []}}, 110),
+        ("tool_result", {"tool": "lookup_customer", "is_error": False,
+                         "result": {"found": False}}, 210),
+    ], run_uid="durations-lifo")
+    # FIFO: the two calls overlap and complete in the order they started, so a global
+    # stack pairs each result with the OTHER tool's use.
+    fifo = _store(conn, [
+        ("tool_use", {"tool": "lookup_customer", "input": {"email": "a@b.co"}}, 10),
+        ("tool_use", {"tool": "search_docs", "input": {"query": "refunds"}}, 20),
+        ("tool_result", {"tool": "lookup_customer", "is_error": False,
+                         "result": {"found": False}}, 60),
+        ("tool_result", {"tool": "search_docs", "is_error": False,
+                         "result": {"results": []}}, 100),
+    ], run_uid="durations-fifo")
+    known = _known_tools(registry)
+
+    steps = project_run_detail(lifo, full_fidelity=False, known_tools=known)
+
+    assert [s["seq"] for s in steps] == [1, 2, 3, 4]
+    assert [s["elapsed_ms"] for s in steps] == [10, 105, 110, 210]
+    durations = {s["tool"]: s["duration_ms"] for s in steps if s["type"] == "tool_result"}
+    assert durations == {"search_docs": 5, "lookup_customer": 200}
+
+    overlapped = project_run_detail(fifo, full_fidelity=False, known_tools=known)
+    assert {
+        s["tool"]: s["duration_ms"] for s in overlapped if s["type"] == "tool_result"
+    } == {"lookup_customer": 50, "search_docs": 80}
+
+    # A tool_result with no tool_use to pair against — the first row of a run whose
+    # earlier rows the retention swept — carries None rather than raising.
+    orphan = _store(conn, [
+        ("tool_result", {"tool": "send_reply", "is_error": False,
+                         "result": {"reply_id": 1, "status": "resolved"}}, 90),
+    ], run_uid="durations-orphan")
+    assert project_run_detail(
+        orphan, full_fidelity=False, known_tools=known
+    )[0]["duration_ms"] is None
+
+    # Second resolution, so it is misleading as a timing and it is not published.
+    assert "created_at" not in json.dumps(steps, default=str)
+    assert all("created_at" not in step for step in steps)
+
+
+def test_cited_is_computed_against_the_accepted_reply(conn, registry):
+    """A chunk is cited iff an id it LICENSES is in the accepted send_reply's citations.
+
+    Each search_docs hit licenses its `doc`, its `id` and every one of its `anchors` —
+    the same set agent.py adds to the run's accept-set — and a denied attempt's
+    citations are not "cited": the guardrail row already tells that story.
+
+    MUTATION that must turn this red: drop normalise_citation from the CITED side
+    (`cited.update(c for c in citations ...)`) — the accepted reply's differently-cased
+    citation matches nothing and the grounded chunk renders as not-cited.
+    SECOND, INDEPENDENT MUTATION: drop it from the LICENSED side. That is what the
+    third hit below exists for: `run_events` is a back catalogue, so a row written by
+    an older build can hold an id this build would have lowercased, and only a hit
+    whose own licensed ids are NOT already normalised can tell the two sides apart. I
+    ran this test without that hit and the licensed-side mutation passed.
+    THIRD MUTATION: count the DENIED attempt's citations too — api.md then renders as
+    cited, an audit view claiming grounding the guard refused.
+    """
+    hit = {
+        "doc": "billing.md", "heading": "Refunds", "id": "billing.md#refunds",
+        "anchors": ["billing.md", "billing.md#refunds"], "text": "prose", "score": 0.9,
+    }
+    other = {
+        "doc": "api.md", "heading": "Rate limits", "id": "api.md#rate-limits",
+        "anchors": ["api.md", "api.md#rate-limits"], "text": "prose", "score": 0.4,
+    }
+    # A historical row whose licensed ids were never normalised on the way in.
+    legacy = {
+        "doc": "SSO.md", "heading": "SSO (Enterprise)", "id": "SSO.md#SSO-Enterprise",
+        "anchors": ["SSO.md", "SSO.md#SSO-Enterprise"], "text": "prose", "score": 0.7,
+    }
+    rows = _store(conn, [
+        ("tool_result", {"tool": "search_docs", "is_error": False,
+                         "result": {"results": [hit, other, legacy]}}, 10),
+        # A DENIED attempt citing api.md — its citations must not count.
+        ("tool_use", {"tool": "send_reply", "input": {
+            "ticket_id": 77, "body": "z" * 40, "citations": ["api.md#rate-limits"]}}, 20),
+        ("tool_result", {"tool": "send_reply", "is_error": True,
+                         "result": {"error": "nope", "denied_by": "citation"}}, 25),
+        # The ACCEPTED attempt. It cites billing.md in a case the guard normalises
+        # away, and the legacy doc in the case THIS build would have minted — so one
+        # citation exercises the cited side of the comparison and the other the
+        # licensed side.
+        ("tool_use", {"tool": "send_reply", "input": {"ticket_id": 77, "body": "z" * 40,
+            "citations": [" BILLING.md#Refunds ", "sso.md#sso-enterprise"]}}, 30),
+        ("tool_result", {"tool": "send_reply", "is_error": False,
+                         "result": {"reply_id": 1, "status": "resolved"}}, 40),
+    ])
+
+    steps = project_run_detail(
+        rows, full_fidelity=False, known_tools=_known_tools(registry)
+    )
+
+    search = next(s for s in steps if s["type"] == "tool_result" and s["tool"] == "search_docs")
+    assert [(r["id"], r["cited"]) for r in search["results"]] == [
+        ("billing.md#refunds", True),          # cited side needed normalising
+        ("api.md#rate-limits", False),         # cited only by the DENIED attempt
+        ("SSO.md#SSO-Enterprise", True),       # licensed side needed normalising
+    ]
