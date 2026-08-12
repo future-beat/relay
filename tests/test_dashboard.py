@@ -1876,3 +1876,92 @@ def test_dashboard_substitutes_the_key_per_request(client, monkeypatch):
 
     # ...and the file on disk was never rewritten to do it.
     assert "__RELAY_DEMO_KEY__" in _packaged_template().read_text(encoding="utf-8")
+
+
+# --- Wave 4: the page shell (DASH-02) ------------------------------------------------
+
+_MARKUP_SINKS = ("inner" + "HTML", "outer" + "HTML", "insertAdjacent" + "HTML",
+                 "document." + "write", "eval" + "(")
+
+
+def _block(html: str, name: str) -> str:
+    """One marker-delimited block of the page, isolated from everything around it.
+
+    The marker assertion comes first for the reason tests/test_run_events.py:2068
+    gives: with the markers gone, `split` would hand back the whole page (or blow up),
+    and every assertion below would be vacuous or accidentally green off a comment
+    somewhere else in the file.
+    """
+    begin, end = f"// --- {name} — begin ---", f"// --- {name} — end ---"
+    assert begin in html and end in html, (
+        f"the {name!r} block markers are gone — every assertion below would be vacuous"
+    )
+    return html.split(begin, 1)[1].split(end, 1)[0]
+
+
+def test_dashboard_never_renders_through_a_markup_sink(client):
+    """T-06-19: one rendering rule, the WHOLE page — not just the feed block.
+
+    Phase 5 scoped this rule to the live-feed block, because the tool name was the only
+    model-chosen string on the page. The drill-down (06-06) and Try-it (06-07) render
+    tool names, argument keys and the visitor's own text, and a block-scoped rule does
+    not cover a block nobody has written yet — so the assertion is over the served
+    document.
+
+    MUTATION that must turn this red: render one card as markup
+    (`host.innerHTML = "<div class=card>..."`) inside the metrics-poll block.
+
+    WEAK BY CONSTRUCTION: there is no DOM in this suite. This greps the served HTML;
+    it is a regression guard on what shipped, not evidence a browser renders anything
+    safely. The real check is 06-07's human checkpoint.
+    """
+    html = client.get("/dashboard").text
+    for sink in _MARKUP_SINKS:
+        assert sink not in html, f"{sink} reached the dashboard — T-06-19"
+    assert "textContent" in html, "nothing on the page writes a value as text at all"
+    assert "createElement" in html
+
+
+def test_dashboard_renders_the_summary_from_metrics(client):
+    """DASH-02: the cards and the outcome bars are fed by /metrics' SQL-computed values.
+
+    Asserted against the metrics-poll BLOCK, not the page at large: every bucket name
+    also appears in telemetry's SQL and could be mentioned in a comment elsewhere, and
+    an assertion that a name appears *somewhere* on a 250-line page proves nothing
+    about what the poll reads.
+
+    MUTATION that must turn this red: drop a bucket from OUTCOME_BUCKETS (the chart
+    silently stops having a bar for it), or read the counts from `m.outcomes` — the raw
+    outcome strings, which are NOT zero-filled and are not the seven display buckets.
+
+    WEAK BY CONSTRUCTION: grep-level, as above.
+    """
+    html = client.get("/dashboard").text
+    block = _block(html, "metrics poll (/metrics)")
+
+    assert 'fetch("/metrics")' in block
+    assert "outcome_distribution" in block
+    buckets = block.split("const OUTCOME_BUCKETS = [", 1)[1].split("]", 1)[0]
+    for bucket in ("resolved", "escalated", "dry_run", "incomplete",
+                   "budget_exceeded", "step_limit", "error"):
+        assert f'"{bucket}"' in buckets, f"the page never displays the {bucket} bucket"
+    # Each card's source key, named against the block that builds the cards.
+    for key in ("m.runs", "m.latency_ms", "m.cost_usd", "m.tokens", "m.last_runs"):
+        assert key in block, f"the summary never reads {key}"
+
+
+def test_dashboard_renders_without_a_demo_key(client, monkeypatch):
+    """Pitfall 14: the public landing surface must survive an unconfigured deployment.
+
+    The "None" assertion is tests/test_auth.py's, restated here deliberately: this plan
+    rewrote the whole page, and a JS comment, an empty-state label or a `=== None` typo
+    is exactly how that check goes red. Case-sensitive — CSS `display:none` is fine.
+
+    MUTATION that must turn this red: label an empty state "None yet" instead of
+    "no runs yet".
+    """
+    monkeypatch.setattr(settings, "demo_key", None)
+    resp = client.get("/dashboard")
+    assert resp.status_code == 200
+    assert "(not configured)" in resp.text
+    assert "None" not in resp.text
