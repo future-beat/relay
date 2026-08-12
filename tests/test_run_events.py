@@ -87,7 +87,12 @@ def test_run_uid_migration_is_idempotent(tmp_path):
 
 def test_run_events_table_shape(conn):
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(run_events)").fetchall()}
-    assert cols == {"id", "run_uid", "ticket_id", "seq", "type", "payload", "created_at"}
+    # elapsed_ms joined the table in phase 6 (added by migration, not by the DDL — see
+    # db._add_column_if_missing). Kept as an exact-set assertion rather than a subset:
+    # a column appearing here that nobody decided on is exactly what this pins.
+    assert cols == {
+        "id", "run_uid", "ticket_id", "seq", "type", "payload", "created_at", "elapsed_ms",
+    }
 
     conn.execute(
         "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload)"
