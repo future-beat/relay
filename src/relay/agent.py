@@ -37,6 +37,7 @@ from anthropic import AsyncAnthropic
 from opentelemetry import trace
 
 from .config import settings
+from .events import RunRecorder
 from .guardrails import RunBudget, ToolInputError, ToolPolicy, validate_tool_input
 from .models import AgentEvent
 from .prompts import SYSTEM_PROMPT, ticket_prompt
@@ -182,6 +183,7 @@ async def run_ticket(
     ticket: dict[str, Any],
     policy: ToolPolicy | None = None,
     budget: RunBudget | None = None,
+    recorder: RunRecorder | None = None,
     *,
     seed_citation_denial: bool = False,
 ) -> AsyncIterator[AgentEvent]:
@@ -193,6 +195,21 @@ async def run_ticket(
     action becomes observable. Keyword-only and off by default on purpose — the same
     aversion to forgettable per-call controls as `bind_to_ticket` above, in reverse:
     arming it narrows a live run's accept-set, so nothing but the eval harness may.
+
+    `recorder` is an optional collaborator (phase 5, D-04), defaulted the same way as
+    `policy` and `budget`: given one, every event this generator yields is first
+    written to `run_events`; given None, this loop is byte-for-byte what it was, which
+    is what keeps `evals.py` and `mcp_server.py` — both of which call this with neither
+    — unchanged. It is injected HERE rather than at the SSE layer because that is the
+    only place D-04's atomicity is reachable: a write-tier tool's own transaction is
+    opened and committed inside the `to_thread` worker below, so the only way its event
+    row can share that transaction is to write it on that same thread, before the
+    result ever comes back to the loop. By the time an event surfaces to `event_stream`
+    it is already committed — which is also what makes publishing from there
+    post-commit for free (D-06).
+
+    Publishing is deliberately NOT done here. The broker is a `main.py` concern; this
+    loop's job is to make the event durable, and nothing more.
     """
     policy = policy or ToolPolicy()
     budget = budget or RunBudget(
@@ -207,6 +224,25 @@ async def run_ticket(
             ),
         }
     ]
+
+    async def _persisted(event: AgentEvent) -> AgentEvent:
+        """Make one event durable, then hand it back to be yielded.
+
+        Written as `yield await _persisted(AgentEvent(...))` at every yield site so
+        persistence is impossible to reorder after the yield: the caller cannot see an
+        event the database has not already committed, which is the whole of D-06 and
+        the reason `event_stream` can publish on arrival with no ordering logic of its
+        own. With no recorder this is a plain pass-through.
+
+        Offloaded like every other DB touch in this codebase — `record` opens and
+        closes its own transaction synchronously, and Database holds its lock for the
+        length of that transaction, so running it on the loop would stall every other
+        run on the process for the write. Nothing is held across the `yield` that
+        follows: the transaction is already closed when this returns.
+        """
+        if recorder is not None:
+            await asyncio.to_thread(recorder.record, event)
+        return event
 
     resolved_via: str | None = None
     last_stop_reason: str | None = None
@@ -274,33 +310,39 @@ async def run_ticket(
                 }})
             except anthropic.APIConnectionError:
                 logger.error("model.connection_error", extra={"ctx": {"ticket_id": ticket["id"]}})
-                yield AgentEvent(type="error", data={"reason": "api_connection_error"})
+                yield await _persisted(
+                    AgentEvent(type="error", data={"reason": "api_connection_error"})
+                )
                 return
             except anthropic.APIStatusError as exc:
                 logger.error("model.api_error", extra={"ctx": {
                     "ticket_id": ticket["id"], "status": exc.status_code, "type": exc.type,
                 }})
-                yield AgentEvent(
+                yield await _persisted(AgentEvent(
                     type="error",
                     data={"reason": "api_error", "status": exc.status_code, "type": exc.type},
-                )
+                ))
                 return
 
             budget.add(response.usage)
-            yield AgentEvent(type="usage", data=budget.snapshot())
+            yield await _persisted(AgentEvent(type="usage", data=budget.snapshot()))
 
             if response.stop_reason == "refusal":
-                yield AgentEvent(type="error", data={"reason": "model_refusal"})
+                yield await _persisted(
+                    AgentEvent(type="error", data={"reason": "model_refusal"})
+                )
                 return
 
             tool_results: list[dict[str, Any]] = []
             for block in response.content:
                 if block.type == "text" and block.text.strip():
-                    yield AgentEvent(type="text", data={"text": block.text})
-                elif block.type == "tool_use":
-                    yield AgentEvent(
-                        type="tool_use", data={"tool": block.name, "input": block.input}
+                    yield await _persisted(
+                        AgentEvent(type="text", data={"text": block.text})
                     )
+                elif block.type == "tool_use":
+                    yield await _persisted(AgentEvent(
+                        type="tool_use", data={"tool": block.name, "input": block.input}
+                    ))
                     spec = registry.get(block.name)
                     with tracer.start_as_current_span(
                         f"tool.{block.name}", context=run_ctx
@@ -312,9 +354,32 @@ async def run_ticket(
                         # returns from this await at once but the thread runs to completion,
                         # so a disconnect is not "no side effect" — the write is inside a
                         # transaction and either commits or rolls back, never lands halfway.
-                        result, is_error = await asyncio.to_thread(
-                            execute_bound, spec, block.name, block.input, policy
-                        )
+                        #
+                        # Two offloads, one seam. A write-tier tool goes through the
+                        # recorder so its `run_events` row is inserted INSIDE the
+                        # transaction the tool itself opens on this worker thread — the
+                        # reply and the record of the reply commit or roll back together
+                        # (D-04). Splitting them would mean a customer emailed with
+                        # nothing in the feed to show it happened, or the reverse.
+                        # Read tools and everything else have no sibling write to nest
+                        # into and are persisted by _persisted() at their yield.
+                        #
+                        # `tool_result_persisted` comes back False when the call was
+                        # denied by a guardrail: nothing was written, so there is
+                        # nothing to be atomic with, and the row is written below —
+                        # AFTER the guardrail event — so the durable record reads in
+                        # causal order rather than inverted (05-REVIEW CR-02).
+                        if recorder is not None and spec is not None and spec.tier == "write":
+                            result, is_error, tool_result_persisted = await asyncio.to_thread(
+                                recorder.execute_and_record,
+                                execute_bound, spec, block.name, block.input, policy,
+                                event_type="tool_result",
+                            )
+                        else:
+                            result, is_error = await asyncio.to_thread(
+                                execute_bound, spec, block.name, block.input, policy
+                            )
+                            tool_result_persisted = False
                         payload = json.loads(result)
                         binding_violation = (
                             is_error and payload.get("denied_by") == "ticket_binding"
@@ -388,8 +453,11 @@ async def run_ticket(
                             "tool": block.name,
                             "supplied_ticket_id": payload["supplied_ticket_id"],
                         }})
-                        # Cause before effect: the stream shows the denial, then its result.
-                        yield AgentEvent(
+                        # Cause before effect, in the stream AND in `run_events`: a
+                        # denied write tool skips the recorder's in-transaction insert
+                        # (nothing was written to be atomic with), so this row takes the
+                        # lower seq and the tool_result below follows it.
+                        yield await _persisted(AgentEvent(
                             type="guardrail",
                             data={
                                 "guard": "ticket_binding",
@@ -398,7 +466,7 @@ async def run_ticket(
                                 "supplied_ticket_id": payload["supplied_ticket_id"],
                                 "action": "denied",
                             },
-                        )
+                        ))
                     if block.name == "search_docs" and not is_error and payload.get("degraded"):
                         # A notice, not a guardrail: nothing was denied, the run just
                         # got weaker results than it asked for. Never ends the run —
@@ -411,7 +479,7 @@ async def run_ticket(
                             "cause": payload.get("degraded_cause"),
                             "results": len(payload.get("results", [])),
                         }})
-                        yield AgentEvent(
+                        yield await _persisted(AgentEvent(
                             type="notice",
                             data={
                                 "kind": "retrieval_degraded",
@@ -422,14 +490,14 @@ async def run_ticket(
                                 "cause": payload.get("degraded_cause"),
                                 "results": len(payload.get("results", [])),
                             },
-                        )
+                        ))
                     if citation_violation:
                         logger.warning("guardrail.citation_unretrieved", extra={"ctx": {
                             "ticket_id": ticket["id"],
                             "tool": block.name,
                             "missing_citations": payload["missing_citations"],
                         }})
-                        yield AgentEvent(
+                        yield await _persisted(AgentEvent(
                             type="guardrail",
                             data={
                                 "guard": "citation",
@@ -438,7 +506,7 @@ async def run_ticket(
                                 "retrieved_ids": payload["retrieved_ids"],
                                 "action": "denied",
                             },
-                        )
+                        ))
                     tool_results.append(
                         {
                             "type": "tool_result",
@@ -447,7 +515,7 @@ async def run_ticket(
                             "is_error": is_error,
                         }
                     )
-                    yield AgentEvent(
+                    tool_result_event = AgentEvent(
                         type="tool_result",
                         data={
                             "tool": block.name,
@@ -455,6 +523,12 @@ async def run_ticket(
                             "is_error": is_error,
                         },
                     )
+                    # Not _persisted() when the recorder already wrote this row inside
+                    # the tool's own transaction above — recording it again here would
+                    # be a second, non-atomic copy of the same step.
+                    if not tool_result_persisted:
+                        tool_result_event = await _persisted(tool_result_event)
+                    yield tool_result_event
                     if not is_error and block.name in TERMINAL_TOOLS:
                         resolved_via = block.name
 
@@ -469,23 +543,29 @@ async def run_ticket(
                 logger.warning("run.budget_exceeded", extra={"ctx": {
                     "ticket_id": ticket["id"], **budget.snapshot(),
                 }})
-                yield AgentEvent(
+                yield await _persisted(AgentEvent(
                     type="error", data={"reason": "budget_exceeded", **budget.snapshot()}
-                )
+                ))
                 return
 
         if resolved_via:
-            yield AgentEvent(type="resolution", data={"via": resolved_via, **budget.snapshot()})
+            yield await _persisted(
+                AgentEvent(type="resolution", data={"via": resolved_via, **budget.snapshot()})
+            )
         elif last_stop_reason == "end_turn" and not policy.allow_writes:
             # A dry run can never take a terminal action; a clean finish is success.
-            yield AgentEvent(type="resolution", data={"via": None, **budget.snapshot()})
+            yield await _persisted(
+                AgentEvent(type="resolution", data={"via": None, **budget.snapshot()})
+            )
         elif last_stop_reason == "end_turn":
-            yield AgentEvent(type="error", data={"reason": "ended_without_action"})
+            yield await _persisted(
+                AgentEvent(type="error", data={"reason": "ended_without_action"})
+            )
         else:
-            yield AgentEvent(
+            yield await _persisted(AgentEvent(
                 type="error",
                 data={"reason": "step_limit_reached", "max_steps": settings.max_agent_steps},
-            )
+            ))
     finally:
         run_span.set_attributes({
             "relay.outcome": resolved_via or "unresolved",

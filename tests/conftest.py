@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import httpx
@@ -5,7 +6,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from relay.db import connect, init_db
-from relay.main import app
+from relay.main import app, process_ticket
 from relay.ratelimit import reset_limits
 from relay.tools import build_registry
 
@@ -58,6 +59,53 @@ def client(tmp_path, monkeypatch):
     # lives in tests/test_ratelimit.py, which sets its own tier explicitly.
     with TestClient(app, headers={"X-API-Key": "test-owner-key"}) as client:
         yield client
+
+
+@pytest.fixture()
+def capture_frames():
+    """Drive one real run and hand back everything it published to the broker.
+
+    Returns an async callable — the caller runs it under `asyncio.run`, following
+    test_lifecycle.py: the `client` fixture's TestClient owns its own loop for the
+    lifespan, so the run itself is driven on a loop the test controls, and
+    `process_ticket` is awaited directly to get at `body_iterator`.
+
+    Subscription happens INSIDE the coroutine on purpose. `asyncio.Queue` binds to the
+    loop it is first awaited on, and the broker was constructed on the TestClient's
+    lifespan loop; subscribing out here and draining in there is the loop-binding
+    hazard `runs.py` documents, arrived at from the other direction. Only
+    `put_nowait`/`get_nowait` are used, so nothing binds either way — subscribing
+    inside keeps that true even if the broker's internals change.
+
+    The queue is drained after the stream ends rather than concurrently: publish is a
+    plain `def` with a bounded drop-oldest queue, so a run cannot block on a reader,
+    and reading afterwards is the only way to be sure no frame is missed between the
+    last publish and the assertion. `events_queue_maxsize` is 256 against a run of ~15
+    events, so nothing is dropped; a test scripting a longer run must raise it.
+
+    No reset hook is needed: the broker lives on `app.state` and is rebuilt by every
+    `client` fixture's lifespan, and unsubscribe in the finally leaves it empty.
+    """
+
+    async def _drive(ticket_id: int, *, dry_run: bool = False):
+        q = app.state.broker.subscribe()
+        try:
+            stream = await process_ticket(ticket_id, dry_run=dry_run)
+            body = "".join([chunk async for chunk in stream.body_iterator])
+        finally:
+            # In a finally because a scripted run that raises mid-stream would
+            # otherwise leave a dead queue in the broker for the rest of the session,
+            # which is Pitfall 3 reproduced inside the test suite.
+            app.state.broker.unsubscribe(q)
+        frames = []
+        while True:
+            try:
+                frames.append(q.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return body, frames
+
+    return _drive
 
 
 @pytest.fixture(autouse=True)

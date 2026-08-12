@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     # keep a refusal cheaper than a retry loop. It is a separate bucket rather than the
     # tiered one so a global outage still does not spend the caller's own allowance.
     outage_process_limit: str = "10/minute"
+    # The public live feed's own per-IP bucket (phase 5). /events resolves no credential,
+    # so there is no tier to key on and this is the only per-caller bound on it. A
+    # separate bucket rather than the shared anon one because a viewer reconnecting on
+    # its idle ceiling must not spend the allowance that meters key guessing, and a feed
+    # flood must be visible in the logs as itself. Generous against real use — an
+    # EventSource reconnects once per idle close (5 min) — and small against a
+    # reconnect loop, which is the connection-holding attack that defeats scale-to-zero.
+    anon_events_limit: str = "30/minute"
 
     # Guardrails (phase 2). Prices default to Claude Sonnet 5 per-MTok rates.
     max_run_cost_usd: float = 0.50
@@ -104,6 +112,42 @@ class Settings(BaseSettings):
     # twelve golden queries cleared it, so the phase's semantic ranking would have been
     # silently inert and every case keyword-ranked.
     retrieval_floor: float = 0.30
+
+    # Run-event live feed (phase 5). All defaulted: /events is public and projection-only,
+    # so this layer adds no key and nothing here needs to be configured to deploy.
+    #
+    # Per-subscriber bounded queue. Above this the broker drops the oldest frame rather
+    # than awaiting the slow subscriber — a stalled dashboard tab must not backpressure
+    # the paid run that is publishing to it.
+    events_queue_maxsize: int = 256
+    # SSE comment keep-alive, so a quiet feed does not look dead to a proxy or a browser
+    # that would otherwise time the connection out mid-idle.
+    events_heartbeat_seconds: float = 15.0
+    # Close an idle /events stream, so a forgotten tab cannot hold the Fly machine awake
+    # and defeat min_machines_running=0 (D-09). The deadline resets on real frames only,
+    # never on heartbeats — otherwise the server's own keep-alive would keep it alive
+    # forever. EventSource reconnects by itself when the viewer comes back.
+    events_idle_seconds: float = 300.0
+    # Hard ceiling on concurrent live viewers. publish() is O(subscribers) and runs on
+    # the loop that answers the container HEALTHCHECK, and each subscriber holds up to
+    # events_queue_maxsize frames on a 512MB machine — so an uncapped subscriber set is
+    # an attacker-chosen cost charged to every paid run. Over the cap /events refuses
+    # with a 503 rather than growing: a viewer turned away costs nothing, a viewer
+    # admitted costs every run that publishes afterwards.
+    events_max_subscribers: int = 50
+    # How long a run's per-step rows are kept before the startup sweep deletes them.
+    #
+    # `run_events.payload` is stored RAW by design (D-01) — it is the full-fidelity
+    # record phase 6 drills into — so it holds customer emails, ticket bodies, reply
+    # text and every tool argument. Without a window that is unbounded personal data
+    # accumulating on the Fly volume for the life of the deployment, on a demo anyone
+    # can drive, plus a disk-exhaustion path on a 512MB machine (WR-05).
+    #
+    # 30 days: long enough that the drill-down is useful for any run a visitor or an
+    # operator would still be looking at, short enough that the demo is not a long-term
+    # store of other people's support tickets. The `runs` summary table is NOT swept —
+    # it carries no message content and /metrics is built from it.
+    events_retention_days: int = 30
 
 
 settings = Settings()

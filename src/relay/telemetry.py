@@ -65,6 +65,9 @@ def record_run(
     output_tokens: int,
     cost_usd: float,
     outcome: str,
+    # Optional so every pre-phase-5 caller (evals, the MCP path, direct test callers)
+    # keeps working; legacy rows and un-stamped runs simply store NULL.
+    run_uid: str | None = None,
 ) -> None:
     # One statement, but the commit is what matters: a bare commit() is connection-scoped
     # and would land another request's half-finished write alongside this row.
@@ -73,8 +76,18 @@ def record_run(
     with conn.transaction():
         conn.execute(
             "INSERT INTO runs (ticket_id, model, duration_ms, steps, input_tokens,"
-            " output_tokens, cost_usd, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (ticket_id, model, duration_ms, steps, input_tokens, output_tokens, cost_usd, outcome),
+            " output_tokens, cost_usd, outcome, run_uid) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                ticket_id,
+                model,
+                duration_ms,
+                steps,
+                input_tokens,
+                output_tokens,
+                cost_usd,
+                outcome,
+                run_uid,
+            ),
         )
 
 
@@ -85,8 +98,24 @@ def _percentile(sorted_values: list[int], pct: float) -> int:
     return sorted_values[index]
 
 
+# The public shape of /metrics, named rather than taken from `SELECT *` (WR-10). The
+# star used to mean every column of `runs` was published: phase 5's `run_uid` joined
+# the payload the moment it was added, and it is the key into `run_events` — a table
+# deliberately filled with unredacted customer data, whose access model phase 6 has not
+# decided yet. Naming the columns also makes the next one somebody adds a decision
+# rather than a silent public API change.
+_PUBLIC_RUN_COLUMNS = (
+    "id", "ticket_id", "model", "duration_ms", "steps",
+    "input_tokens", "output_tokens", "cost_usd", "outcome", "created_at",
+)
+
+
 def run_metrics(conn: Database) -> dict[str, Any]:
-    rows = [dict(r) for r in conn.execute("SELECT * FROM runs ORDER BY id").fetchall()]
+    rows = [
+        dict(r) for r in conn.execute(
+            f"SELECT {', '.join(_PUBLIC_RUN_COLUMNS)} FROM runs ORDER BY id"
+        ).fetchall()
+    ]
     durations = sorted(r["duration_ms"] for r in rows)
     outcomes: dict[str, int] = {}
     for r in rows:

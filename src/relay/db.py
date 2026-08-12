@@ -62,9 +62,29 @@ CREATE TABLE IF NOT EXISTS replies (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- One row per agent step, written during the stream (the `runs` row above is a single
+-- end-of-run summary and cannot answer "what did it do"). payload holds the RAW
+-- event data as JSON: the DB is private and is the source of truth, so redaction
+-- happens only at the public /events boundary, never here. run_uid is a soft join key,
+-- not a foreign key — the runs row is inserted at end of stream, long after the first
+-- event row, so a real FK would fail on every insert.
+CREATE TABLE IF NOT EXISTS run_events (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_uid    TEXT NOT NULL,
+    ticket_id  INTEGER NOT NULL,
+    seq        INTEGER NOT NULL,
+    type       TEXT NOT NULL,
+    payload    TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- spent_today() sums today's runs on the event loop for every gated request; without
 -- this it is a full table scan that grows for the life of the Fly volume.
 CREATE INDEX IF NOT EXISTS idx_runs_created_at ON runs(created_at);
+
+-- Phase 6's per-run drill-down selects every event for one run_uid; without this it is
+-- a full scan of a table that grows by ~10 rows per run for the life of the volume.
+CREATE INDEX IF NOT EXISTS idx_run_events_run_uid ON run_events(run_uid);
 """
 
 SEED_CUSTOMERS = [
@@ -217,8 +237,45 @@ def connect(db_path: str | Path) -> Database:
     return Database(conn)
 
 
+def purge_expired_run_events(conn: Database, *, retention_days: int) -> int:
+    """Delete run_events rows older than the retention window. Returns how many went.
+
+    `payload` is raw by design (D-01): it is the record phase 6 drills into, so it holds
+    customer emails, ticket bodies, reply text and every tool argument. Nothing else in
+    this codebase ever deletes from that table, so without this the live volume
+    accumulates other people's support tickets for the life of the deployment — a
+    data-protection posture nobody chose, and a disk-exhaustion path on a 512MB machine
+    (WR-05). Redacting at write time is not the alternative: it would leave phase 6
+    nothing to drill into, which is the whole reason the table exists.
+
+    Deliberately scoped to run_events. The `runs` summary rows carry no message content,
+    /metrics is built from them, and SEC-03's daily ceiling sums them — deleting those
+    would erase spend the ceiling can never see again.
+
+    Synchronous, like every other statement in this module: the one caller offloads it
+    with asyncio.to_thread, because Database holds its lock for the whole transaction.
+    """
+    with conn.transaction():
+        # SQLite's own clock arithmetic on the same 'now' the DEFAULT uses, so the
+        # comparison cannot drift with the process's timezone or with Python's clock.
+        deleted = conn.execute(
+            "DELETE FROM run_events WHERE created_at < datetime('now', ?)",
+            (f"-{int(retention_days)} days",),
+        ).rowcount
+    return max(deleted, 0)
+
+
 def init_db(conn: Database) -> None:
     conn.executescript(SCHEMA)
+    # `runs` already exists on the live Fly volume, and CREATE TABLE IF NOT EXISTS does
+    # not add columns to a table it declines to create — adding run_uid to the DDL above
+    # would be a silent no-op in production only: no error, no signal, and every event
+    # join returning NULL. So the column is added explicitly. ALTER TABLE is not
+    # idempotent (a second one raises "duplicate column name"), and init_db runs on every
+    # boot, so the PRAGMA guard is what makes the re-run safe. Legacy rows keep NULL.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if "run_uid" not in cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN run_uid TEXT")
     existing = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
     if existing == 0:
         conn.executemany(
