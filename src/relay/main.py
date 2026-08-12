@@ -176,6 +176,15 @@ process_gate = _gate("process", meter_spend=True)
 # ceiling, which is exactly what a reconnect loop needs to keep the machine awake.
 events_gate = _gate("events", public=True)
 
+# Declared once at module level for the same reason _ANY_TIER/_API_KEY are: ruff's B008
+# rightly rejects a call in an argument default. create_ticket takes the gate as a
+# PARAMETER rather than in dependencies=[...] because _gate's dependency returns the
+# resolved tier, and that tier is the only server-side signal that a ticket is
+# visitor-authored (D-02). A gate declared in dependencies=[...] throws its return value
+# away; declared in BOTH places it would run — and meter — the perimeter twice per
+# request, silently halving every demo limit in D-04.
+_CREATE_GATE = Depends(create_gate)
+
 
 @app.get("/", include_in_schema=False)
 async def root() -> RedirectResponse:
@@ -188,18 +197,28 @@ async def health() -> dict:
     return {"status": "ok", "version": __version__, "model": settings.model}
 
 
-@app.post(
-    "/tickets",
-    response_model=Ticket,
-    status_code=201,
-    dependencies=[Depends(create_gate)],
-)
-async def create_ticket(payload: TicketCreate) -> Ticket:
+@app.post("/tickets", response_model=Ticket, status_code=201)
+async def create_ticket(payload: TicketCreate, tier: Tier | None = _CREATE_GATE) -> Ticket:
+    """Create a ticket, recording the tier that created it (D-02).
+
+    `origin` is the CREATION tier and never the processing one, and the difference is a
+    disclosure boundary rather than a naming preference. Full fidelity discloses ticket
+    CONTENT — the subject, the body, the raw tool inputs the run saw — and what makes
+    that safe is that the visitor holding the published demo key authored that content
+    themselves. A flag set from the /process tier instead would make an owner-authored
+    ticket, carrying a real customer's words, full fidelity the moment anyone ran it
+    with the published key: a disclosure reachable with one curl (threat T-06-15).
+
+    NULL is the legacy value and reads as NOT demo everywhere — the read side compares
+    `origin == "demo"` by equality, never truthiness, so an unclassified row fails
+    closed.
+    """
     def _insert() -> int:
         with app.state.conn.transaction() as db:
             cur = db.execute(
-                "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
-                (payload.customer_email, payload.subject, payload.body),
+                "INSERT INTO tickets (customer_email, subject, body, origin)"
+                " VALUES (?, ?, ?, ?)",
+                (payload.customer_email, payload.subject, payload.body, tier),
             )
             # Read inside the block: once the lock drops another thread's insert has
             # already moved lastrowid, and this row's id is what the caller gets back.
@@ -247,6 +266,22 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     # on its own rather than trusting this handoff.
     token = reserve_run()
 
+    # This run's identity, minted before the first event so every run_events row and the
+    # runs row written in the finally below carry the same key. Not the runs row's id:
+    # that row does not exist until the stream ends, long after the first event has to be
+    # written (hence a soft join key, not a foreign one).
+    #
+    # Minted in the HANDLER rather than inside event_stream, so it can also travel back
+    # on the response as X-Relay-Run-Uid. Try-it streams this route with `fetch` while
+    # simultaneously watching the ambient /events feed, which carries the REDACTED
+    # projection of this same run: without the uid the page renders one run twice, in
+    # two fidelities, with nothing connecting them — and cannot deep-link its own
+    # drill-down. A header touches ZERO of the SSE event contract (the milestone's
+    # compatibility constraint) where an extra `event: run` frame would change it, and
+    # scripts/demo.sh would print it. Same-origin fetch reads response headers with no
+    # CORS allowlist needed.
+    run_uid = uuid.uuid4().hex
+
     async def event_stream():
         started = time.perf_counter()
         # Registered here rather than beside reserve_run() above, and the difference
@@ -275,11 +310,6 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
         usage: dict = {}
         outcome = "incomplete"
         recorded = False
-        # This run's identity, minted before the first event so every run_events row
-        # and the runs row written in the finally below carry the same key. Not the
-        # runs row's id: that row does not exist until the stream ends, long after the
-        # first event has to be written (hence a soft join key, not a foreign one).
-        run_uid = uuid.uuid4().hex
         recorder = RunRecorder(app.state.conn, run_uid=run_uid, ticket_id=ticket.id)
         try:
             async for event in run_ticket(
@@ -404,13 +434,27 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                 # Last, so a drain waiting on this run only wakes once its row is written.
                 app.state.runs.deregister(run_token)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        # The uid its submitter needs (above), plus the two headers 05-REVIEW IN-02
+        # names. X-Accel-Buffering is nginx's opt-out and is honoured across the proxy
+        # chain in front of this app; without it a buffering hop collects the whole
+        # stream and delivers it at once, which is the difference between "the run
+        # streams" and "the page hangs for 20 seconds and then dumps everything".
+        # no-cache stops an intermediary serving a second visitor the first one's run.
+        headers={
+            "X-Relay-Run-Uid": run_uid,
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/metrics")
 async def metrics() -> dict:
-    # run_metrics does SELECT * FROM runs, the one read here that grows unbounded:
-    # the dashboard polls this every 5s, so it is the last place to hold the loop.
+    # Offloaded because the dashboard polls this every 5s per open tab, so it is the
+    # last place that may hold the loop while a worker thread has Database's lock.
     return await asyncio.to_thread(run_metrics, app.state.conn)
 
 
@@ -508,7 +552,14 @@ async def events() -> StreamingResponse:
             # double-unsubscribe a close() plus a disconnect can produce is harmless.
             app.state.broker.unsubscribe(q)
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    # Same anti-buffering pair as /process (05-REVIEW IN-02). It matters more here: a
+    # buffered live feed is indistinguishable from a dead one, and the page's own status
+    # line would sit on "connecting" while frames pile up in a proxy.
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 DASHBOARD_HTML = """<!doctype html>
@@ -653,13 +704,23 @@ async def dashboard() -> str:
     return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
 
 
+# Exactly the fields the Ticket model declares, named for the same reason
+# _PUBLIC_RUN_COLUMNS and _DETAIL_RUN_COLUMNS are: `tickets` just grew `origin`, which is
+# deliberately NOT part of the API model, and a star select would have pushed it straight
+# into Ticket(**dict(row)) the moment the migration ran. What a route publishes is a list
+# someone wrote down, never whatever the table happens to hold today.
+_TICKET_COLUMNS = (
+    "id", "customer_email", "subject", "body", "status", "category", "created_at",
+)
+
+
 async def _get_ticket(ticket_id: int) -> Ticket:
     # fetchone() is called inside the offloaded callable, not after it: Database
     # materialises rows while its lock is held, and stepping the result back on the
     # event loop would put the read half a statement outside the thread it belongs to.
     row = await asyncio.to_thread(
         lambda: app.state.conn.execute(
-            "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
+            f"SELECT {', '.join(_TICKET_COLUMNS)} FROM tickets WHERE id = ?", (ticket_id,)
         ).fetchone()
     )
     if row is None:
