@@ -185,7 +185,7 @@ Plans:
 
 **Goal**: A visitor can understand the system's cost, quality, and behavior in under a minute — and run it themselves
 **Depends on**: Phase 5
-**Requirements**: DASH-02, DASH-03, DASH-04, DASH-05
+**Requirements**: DASH-02, DASH-03, DASH-04, DASH-05 (+ DASH-01's browser clause, which Phase 5 left unowned — the designed page absorbs the live feed here)
 **Success Criteria** (what must be TRUE):
 
   1. The dashboard shows aggregate cards and an outcome distribution (resolved/escalated/error/budget_exceeded/step_limit) computed by SQL aggregation
@@ -193,8 +193,36 @@ Plans:
   3. Cost and latency over time render as inline SVG and a gauge shows remaining daily demo budget — with no CDN scripts and no build step
   4. A visitor can submit a prefilled example ticket from the page with the demo key and watch that run stream live
 
-**Plans**: TBD
-**UI hint**: yes
+
+**Plans**: 7 plans
+
+Plans:
+**Wave 1**
+
+- [ ] 06-01-PLAN.md — Guarded `run_events.elapsed_ms` + `tickets.origin` migrations, `RunRecorder` timing stamp, `budget_snapshot` (one arithmetic for gauge and gate), drill-down limit bucket + settings (DASH-03/04)
+
+**Wave 2** *(blocked on Wave 1 completion)*
+
+- [ ] 06-02-PLAN.md — `/metrics` by SQL aggregation: outcome distribution, dense daily cost/latency buckets, bounded `last_runs`, half-up percentiles, `run_uid` restored deliberately (DASH-02/04)
+- [ ] 06-03-PLAN.md — `events.project_run_detail`: the drill-down allowlist beside `project()`, its named demo branch, cited-vs-not through one shared normalisation (DASH-03)
+
+**Wave 3** *(blocked on Wave 2 completion)*
+
+- [ ] 06-04-PLAN.md — Public `GET /runs/{run_uid}` + `tickets.origin` from the creation tier + `X-Relay-Run-Uid` + `/metrics.budget`; the load-bearing leak test, its tampering assertion and the demo inverse (DASH-03/04/05)
+
+**Wave 4** *(blocked on Wave 3 completion)*
+
+- [ ] 06-05-PLAN.md — `DASHBOARD_HTML` out of `main.py` into a packaged template; cards + outcome bars; inline SVG cost/latency charts and the budget gauge; whole-page textContent rule; CI docker smoke on `/dashboard` + `/metrics` (DASH-01/02/04)
+
+**Wave 5** *(blocked on Wave 4 completion)*
+
+- [ ] 06-06-PLAN.md — The drill-down panel: `<dialog>` + `openDrill`, step renderer with timings, grounding and denials, entry points from the runs table and the live feed (DASH-03)
+
+**Wave 6** *(blocked on Wave 5 completion)*
+
+- [ ] 06-07-PLAN.md — "Try it": three prefilled examples, `fetch` + buffered SSE stream, own-run badge and deep link, refusals as designed states; the phase's human verification checkpoint (DASH-05)
+
+**UI hint**: yes — this phase IS the interface; the last task is a blocking human check, since the suite has no DOM
 
 ## Progress
 
@@ -208,4 +236,4 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6
 | 3. Semantic Retrieval | 5/6 | In Progress|  |
 | 4. Evaluation Coverage | 0/3 | Not started | - |
 | 5. Run Event Persistence & Live Feed | 0/4 | Not started | - |
-| 6. Dashboard Experience | 0/TBD | Not started | - |
+| 6. Dashboard Experience | 0/7 | Not started | - |
