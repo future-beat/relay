@@ -167,6 +167,38 @@ GLOBAL_PERCENTILE_SQL = (
     " FROM ranked"
 )
 
+# DASH-02's distribution, as a GROUP BY over a closed bucket mapping.
+#
+# The two specific error branches MUST precede the `LIKE 'error:%'` branch: SQLite
+# evaluates CASE WHEN in source order, so reordering them silently collapses
+# budget_exceeded and step_limit into `error` — the chart still renders, with two bars
+# quietly at zero.
+#
+# The branch list is derived from the single `record_run` call site (main.py), which is
+# the only place `runs.outcome` is written. A new outcome string added there without a
+# branch here falls through to `incomplete`: wrong, but visible on the chart, rather
+# than dropped.
+OUTCOME_DISTRIBUTION_SQL = (
+    "SELECT CASE"
+    "   WHEN outcome = 'send_reply'               THEN 'resolved'"
+    "   WHEN outcome = 'create_escalation'        THEN 'escalated'"
+    "   WHEN outcome = 'dry_run_complete'         THEN 'dry_run'"
+    "   WHEN outcome = 'error:budget_exceeded'    THEN 'budget_exceeded'"
+    "   WHEN outcome = 'error:step_limit_reached' THEN 'step_limit'"
+    "   WHEN outcome LIKE 'error:%'               THEN 'error'"
+    "   ELSE 'incomplete'"
+    " END AS bucket, COUNT(*) AS n"
+    " FROM runs GROUP BY bucket ORDER BY n DESC, bucket"
+)
+
+# Zero-filled first, then overlaid with the query's rows: only buckets with runs come
+# back from SQL, and a bar chart that grows its bars one at a time as outcomes first
+# occur reads as a broken chart rather than as an honest empty state.
+_OUTCOME_BUCKETS = (
+    "resolved", "escalated", "dry_run", "incomplete",
+    "budget_exceeded", "step_limit", "error",
+)
+
 LAST_RUNS_LIMIT = 20
 
 # ORDER BY id DESC LIMIT 20 in SQL, not `rows[-20:][::-1]` in Python: the slice was
@@ -188,9 +220,13 @@ def run_metrics(conn: Database) -> dict[str, Any]:
     n_runs = int(totals["runs"])
     total_cost = float(totals["cost_usd"])
     outcomes = {r["outcome"]: r["n"] for r in conn.execute(OUTCOMES_SQL).fetchall()}
+    distribution = dict.fromkeys(_OUTCOME_BUCKETS, 0)
+    for row in conn.execute(OUTCOME_DISTRIBUTION_SQL).fetchall():
+        distribution[row["bucket"]] = row["n"]
     return {
         "runs": n_runs,
         "outcomes": outcomes,
+        "outcome_distribution": distribution,
         "tokens": {
             "input": int(totals["input_tokens"]),
             "output": int(totals["output_tokens"]),

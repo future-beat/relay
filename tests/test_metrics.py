@@ -179,6 +179,83 @@ def test_totals_are_sql_aggregates(conn):
     assert payload["outcomes"] == {"send_reply": 3}
 
 
+# ---------------------------------------------------------------------------
+# Task 2: outcome_distribution (DASH-02)
+# ---------------------------------------------------------------------------
+
+# Every string the ONE record_run call site (main.py:292-297, 348, 385-398) can write.
+# If a new outcome is added there without a CASE branch here, the last assertion in
+# test_outcome_distribution_buckets_every_outcome is what notices.
+_ALL_OUTCOMES = {
+    "send_reply": "resolved",
+    "create_escalation": "escalated",
+    "dry_run_complete": "dry_run",
+    "incomplete": "incomplete",
+    "error:budget_exceeded": "budget_exceeded",
+    "error:step_limit_reached": "step_limit",
+    "error:api_connection_error": "error",
+    "error:api_error": "error",
+    "error:model_refusal": "error",
+    "error:ended_without_action": "error",
+    "error:persistence_failed": "error",
+}
+
+
+def test_outcome_distribution_buckets_every_outcome(conn):
+    """Every outcome the agent can record lands in a named bucket, and none is lost.
+
+    MUTATION that must turn this red: in OUTCOME_DISTRIBUTION_SQL, move the
+    `WHEN outcome LIKE 'error:%'` branch above the two specific error branches.
+    SQLite evaluates CASE WHEN in source order, so `error:budget_exceeded` and
+    `error:step_limit_reached` are swallowed by the generic branch — their bars drop
+    to zero and the `error` bar silently absorbs them. The chart still renders, which
+    is why the counts are asserted per bucket rather than just summed.
+    """
+    for outcome in _ALL_OUTCOMES:
+        _insert_run(conn, outcome=outcome)
+
+    dist = run_metrics(conn)["outcome_distribution"]
+
+    expected: dict[str, int] = dict.fromkeys(set(_ALL_OUTCOMES.values()), 0)
+    for bucket in _ALL_OUTCOMES.values():
+        expected[bucket] += 1
+    assert dist == expected
+    assert dist["budget_exceeded"] == 1, "the specific error branches must precede LIKE"
+    assert dist["step_limit"] == 1
+    assert dist["error"] == 5, "only the unnamed error reasons belong in `error`"
+    # Nothing fell into an unnamed bucket, and nothing was double-counted.
+    assert sum(dist.values()) == len(_ALL_OUTCOMES) == run_metrics(conn)["runs"]
+
+
+def test_outcome_distribution_is_zero_filled_when_empty(conn):
+    """The bar chart has a stable shape before the first run, not one bar appearing.
+
+    MUTATION: return the query's rows directly instead of overlaying them onto the
+    zero-filled bucket dict — on an empty DB the distribution is `{}` and the chart
+    reshapes itself on the first run.
+    """
+    dist = run_metrics(conn)["outcome_distribution"]
+
+    assert dist == {
+        "resolved": 0, "escalated": 0, "dry_run": 0, "incomplete": 0,
+        "budget_exceeded": 0, "step_limit": 0, "error": 0,
+    }
+    # The raw map is kept alongside it and is genuinely empty — the zero-fill is a
+    # property of the distribution, not of the database.
+    assert run_metrics(conn)["outcomes"] == {}
+
+
+def test_unknown_outcome_lands_visibly_in_incomplete(conn):
+    # A future outcome string added at the call site without a branch here does not
+    # vanish: it shows up as `incomplete`, which is wrong-but-visible rather than lost.
+    _insert_run(conn, outcome="outcome_nobody_added_a_branch_for")
+
+    dist = run_metrics(conn)["outcome_distribution"]
+
+    assert dist["incomplete"] == 1
+    assert sum(dist.values()) == 1
+
+
 def test_metrics_window_days_is_a_setting():
     # The window is configuration, not a literal buried in the SQL — 06-01 put it in
     # config.py precisely so the chart's span is deployable.
