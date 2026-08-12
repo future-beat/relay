@@ -19,7 +19,10 @@ import json
 import sqlite3
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
+import anthropic
+import httpx
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -43,7 +46,7 @@ from relay.events import (
     project,
     snapshot_frame,
 )
-from relay.guardrails import ToolPolicy
+from relay.guardrails import RunBudget, ToolPolicy
 from relay.main import app, events, process_ticket
 from relay.models import AgentEvent
 from relay.runs import ActiveRun
@@ -1180,6 +1183,217 @@ async def test_the_frozen_callers_call_shapes_still_work_with_no_recorder(conn, 
     )
     assert denied_is_error is True
     assert json.loads(denied)["denied_by"] == "policy"
+
+
+# --------------------------------------------------------------------------------------
+# WR-07: the early-return paths. Every scripted run in this file used to end on
+# stop_reason="end_turn", so `_persisted` was never exercised on any of the five returns
+# that end a run badly — and the review's own mutation (deleting `await _persisted(...)`
+# from the budget_exceeded yield) survived the whole 315-test suite. A run that ends on
+# an API failure, a refusal, the cost ceiling or the step limit is exactly the run phase
+# 6's drill-down most needs a terminating row for.
+#
+# Driven straight through run_ticket with a real RunRecorder rather than through the HTTP
+# layer: these are properties of the loop's return paths, and the SSE route adds nothing
+# to them but latency.
+# --------------------------------------------------------------------------------------
+
+TERMINAL_RUN_UID = "u-terminal"
+
+
+class _RaisingClient:
+    """A Claude client whose every request fails, for the two API error returns."""
+
+    def __init__(self, exc: BaseException):
+        self._exc = exc
+        self.messages = SimpleNamespace(create=self._create)
+
+    async def _create(self, **kwargs):
+        raise self._exc
+
+
+async def _drive_to_termination(conn, client, ticket_id, **kwargs):
+    """One recorder-backed run, returning (events, persisted rows) for comparison."""
+    registry = build_registry(conn, KB_DIR)
+    recorder = RunRecorder(conn, run_uid=TERMINAL_RUN_UID, ticket_id=ticket_id)
+    ticket = {
+        "id": ticket_id,
+        "customer_email": "ava@acmecorp.com",
+        "subject": "Refund",
+        "body": "I was charged twice for March.",
+    }
+    events_seen = [
+        e async for e in run_ticket(client, registry, ticket, recorder=recorder, **kwargs)
+    ]
+    rows = conn.execute(
+        "SELECT seq, type, payload FROM run_events WHERE run_uid = ? ORDER BY seq",
+        (TERMINAL_RUN_UID,),
+    ).fetchall()
+    return events_seen, rows
+
+
+def _assert_terminal_row(events_seen, rows, reason: str) -> dict:
+    """Every yielded event has its row, in order, and the run's last word is `reason`."""
+    assert events_seen, "the run yielded nothing — the assertions below would be vacuous"
+    assert events_seen[-1].type == "error"
+    assert events_seen[-1].data["reason"] == reason, (
+        f"the run ended on {events_seen[-1].data} rather than {reason} — this test is"
+        " no longer exercising the path it names"
+    )
+    # Whole sequence, not just the last row: a fix that persisted the terminator by
+    # dropping an earlier row would pass a count or a "last row" check.
+    assert [r["type"] for r in rows] == [e.type for e in events_seen], (
+        f"run_events does not match the yielded sequence: {[r['type'] for r in rows]}"
+    )
+    assert [r["seq"] for r in rows] == list(range(1, len(events_seen) + 1))
+    terminal = json.loads(rows[-1]["payload"])
+    assert terminal["reason"] == reason, (
+        f"the terminating event was not persisted — a {reason} run's durable record"
+        " simply stops, with nothing to say why"
+    )
+    return terminal
+
+
+async def test_budget_exceeded_run_persists_its_terminating_row(conn, monkeypatch):
+    """WR-07: the review's own surviving mutation, pinned.
+
+    MUTATION that must turn this red: delete the `await _persisted(...)` wrapper from
+    the budget_exceeded yield in agent.py, leaving a bare `yield AgentEvent(...)` — the
+    run's last event never reaches run_events, so the durable record of a run killed by
+    the cost ceiling ends mid-step with nothing recording why. 322 tests passed under
+    exactly this before.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _seed_ticket(conn)
+    conn.commit()
+    client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": "ava@acmecorp.com"})]),
+    ])
+    # A ceiling the first step's own usage clears, so the loop takes the budget return
+    # rather than running to a resolution.
+    budget = RunBudget(0.0001, settings.price_in_per_mtok, settings.price_out_per_mtok)
+
+    events_seen, rows = await _drive_to_termination(conn, client, ticket_id, budget=budget)
+
+    terminal = _assert_terminal_row(events_seen, rows, "budget_exceeded")
+    # The snapshot rides with it: phase 6's drill-down has to show what it cost to hit
+    # the ceiling, not merely that it did.
+    assert terminal["cost_usd"] > 0
+    assert project(events_seen[-1])["reason"] == "budget_exceeded"
+
+
+async def test_step_limit_run_persists_its_terminating_row(conn, monkeypatch):
+    """WR-07: the run that never stopped calling tools.
+
+    MUTATION that must turn this red: delete the `await _persisted(...)` wrapper from
+    the step_limit_reached yield (agent.py's final `else`) — the row goes missing.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    monkeypatch.setattr(settings, "max_agent_steps", 1)
+    ticket_id = _seed_ticket(conn)
+    conn.commit()
+    client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": "ava@acmecorp.com"})]),
+    ])
+
+    events_seen, rows = await _drive_to_termination(conn, client, ticket_id)
+
+    terminal = _assert_terminal_row(events_seen, rows, "step_limit_reached")
+    assert terminal["max_steps"] == 1
+    assert project(events_seen[-1])["reason"] == "step_limit_reached"
+
+
+async def test_ended_without_action_run_persists_its_terminating_row(conn, monkeypatch):
+    """WR-07: the model stopped talking without doing anything.
+
+    MUTATION that must turn this red: delete the `await _persisted(...)` wrapper from
+    the ended_without_action yield.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _seed_ticket(conn)
+    conn.commit()
+    client = FakeClient([response([text_block("no action needed")], stop_reason="end_turn")])
+
+    events_seen, rows = await _drive_to_termination(conn, client, ticket_id)
+
+    _assert_terminal_row(events_seen, rows, "ended_without_action")
+
+
+async def test_model_refusal_run_persists_its_terminating_row(conn, monkeypatch):
+    """WR-07: the model refused the request outright.
+
+    MUTATION that must turn this red: delete the `await _persisted(...)` wrapper from
+    the model_refusal yield.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _seed_ticket(conn)
+    conn.commit()
+    client = FakeClient([response([], stop_reason="refusal")])
+
+    events_seen, rows = await _drive_to_termination(conn, client, ticket_id)
+
+    _assert_terminal_row(events_seen, rows, "model_refusal")
+    assert project(events_seen[-1]) == {
+        "type": "error", "reason": "model_refusal", "status": None, "error_type": None,
+    }
+
+
+async def test_api_connection_error_run_persists_its_terminating_row(conn, monkeypatch):
+    """WR-07: the very first request never reached Anthropic.
+
+    The narrowest early return in the loop — it fires before any usage event, so this
+    run's ENTIRE durable record is the one row.
+
+    MUTATION that must turn this red: delete the `await _persisted(...)` wrapper from
+    the api_connection_error yield — run_events holds nothing at all for the run, and
+    the row assertion fails on an empty table.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _seed_ticket(conn)
+    conn.commit()
+    client = _RaisingClient(
+        anthropic.APIConnectionError(request=httpx.Request("POST", "https://api.anthropic.com"))
+    )
+
+    events_seen, rows = await _drive_to_termination(conn, client, ticket_id)
+
+    _assert_terminal_row(events_seen, rows, "api_connection_error")
+    assert len(rows) == 1, "a run that failed on its first request wrote more than one row"
+
+
+async def test_api_status_error_run_persists_and_projects_an_upstream_type(conn, monkeypatch):
+    """WR-07: an upstream 529, and what the feed says about it.
+
+    project()'s error branch republishes `d.get("type")` — the Anthropic response body's
+    own `error.type` — to an unauthenticated endpoint, and nothing asserted its shape.
+    Pinned here against a REAL anthropic.APIStatusError rather than a hand-built dict, so
+    the field is whatever the SDK actually puts there.
+
+    MUTATION that must turn this red: delete the `await _persisted(...)` wrapper from the
+    api_error yield. A second mutation this also catches: publishing the exception's
+    message instead of its type — the frame would carry upstream prose rather than the
+    enumerated string, and the exact-frame assertion fails.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    ticket_id = _seed_ticket(conn)
+    conn.commit()
+    request = httpx.Request("POST", "https://api.anthropic.com")
+    client = _RaisingClient(anthropic.APIStatusError(
+        "Overloaded: SENSITIVE-UPSTREAM-PROSE",
+        response=httpx.Response(529, request=request),
+        body={"error": {"type": "overloaded_error", "message": "SENSITIVE-UPSTREAM-PROSE"}},
+    ))
+
+    events_seen, rows = await _drive_to_termination(conn, client, ticket_id)
+
+    terminal = _assert_terminal_row(events_seen, rows, "api_error")
+    assert (terminal["status"], terminal["type"]) == (529, "overloaded_error")
+    # An exact frame: enumerated type and numeric status only. No upstream message text
+    # reaches the public feed, and `error_type` never collides with the frame's own.
+    assert project(events_seen[-1]) == {
+        "type": "error", "reason": "api_error", "status": 529, "error_type": "overloaded_error",
+    }
+    assert "SENSITIVE-UPSTREAM-PROSE" not in json.dumps(project(events_seen[-1]))
 
 
 # --------------------------------------------------------------------------------------
