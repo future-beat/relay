@@ -117,6 +117,44 @@ def test_record_run_persists_run_uid(conn):
     assert conn.execute("SELECT run_uid FROM runs").fetchone()["run_uid"] == "abc123"
 
 
+def test_metrics_does_not_publish_run_uid(client):
+    """WR-10: the join key into the PII table is not on the public endpoint.
+
+    /metrics is ungated (D-07 keeps it public beside /health and /dashboard) and was
+    built with `SELECT * FROM runs`, so phase 5's new `run_uid` column joined the public
+    payload the moment it was added — the key into `run_events`, which this phase
+    deliberately fills with unredacted customer data, published before phase 6 has
+    decided the drill-down's access model.
+
+    MUTATION that must turn this red: restore `SELECT * FROM runs` in run_metrics — the
+    uid reappears in last_runs and both assertions fail. The exact key set is asserted
+    rather than just the uid's absence, so the NEXT column somebody adds to `runs` is a
+    decision here rather than a silent public API change.
+    """
+    record_run(app.state.conn, ticket_id=1, model="claude-sonnet-5", duration_ms=100,
+               steps=2, input_tokens=10, output_tokens=5, cost_usd=0.002,
+               outcome="send_reply", run_uid="JOIN-KEY-SENTINEL")
+
+    payload = client.get("/metrics").json()
+
+    assert "JOIN-KEY-SENTINEL" not in json.dumps(payload), (
+        "/metrics published the run_uid — the join key into the raw run_events payloads"
+    )
+    assert payload["last_runs"], "no run reached /metrics — this test would prove nothing"
+    assert set(payload["last_runs"][0]) == {
+        "id", "ticket_id", "model", "duration_ms", "steps",
+        "input_tokens", "output_tokens", "cost_usd", "outcome", "created_at",
+    }
+    # The dashboard's own fields still arrive: an endpoint tuned to leak nothing by
+    # publishing nothing is not a metrics endpoint.
+    assert payload["last_runs"][0]["outcome"] == "send_reply"
+    assert payload["runs"] == 1
+    # The uid is still WRITTEN — it is the phase's join key — it is just not published.
+    assert app.state.conn.execute(
+        "SELECT run_uid FROM runs"
+    ).fetchone()["run_uid"] == "JOIN-KEY-SENTINEL"
+
+
 def test_record_run_without_run_uid_still_works(conn):
     # The default is what keeps every pre-phase-5 caller (evals, mcp_server, the tests
     # that call record_run directly) working unchanged.
