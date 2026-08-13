@@ -2072,6 +2072,91 @@ def test_dashboard_never_renders_through_a_markup_sink(client):
     assert "createElement" in html
 
 
+def _el_body(html: str) -> str:
+    """The source of `el()` alone, from the render-helpers block.
+
+    Scoped to the ONE function, not the block and not the page: `textContent` appears in
+    `svg()`, in `line.textContent`, in `feedStatus.textContent` and in
+    `drillTitle.textContent`, so a page-wide grep for the token survives el() losing its
+    only rendering statement — which is WR-08.
+    """
+    helpers = _block(html, "render helpers")
+    assert "function el(" in helpers, "el() is not in the render-helpers block any more"
+    return helpers.split("function el(", 1)[1].split("\n}", 1)[0]
+
+
+def test_el_writes_its_text_argument_as_text(client):
+    """WR-08: `el()` renders. Every card, chart label, chip, step line and drill-down
+    fact on this page is built by it, so this one statement is the page's whole visible
+    output — and until now nothing in the suite could see it go.
+
+    NAMED MUTATION this closes (a plausible refactor, not an adversarial alias): replace
+    `n.textContent = text` with `n.setAttribute("title", text)`. Every rendered value on
+    the page disappears while the whole 407-test suite, including
+    `test_dashboard_never_renders_through_a_markup_sink` above, stays green — the token
+    `textContent` survives in four other places and no markup sink appears.
+
+    WEAK BY CONSTRUCTION, and specifically weaker than it looks: this is still a grep,
+    scoped to one function's source. It proves that el() contains an assignment of its
+    `text` parameter to `.textContent`; it does NOT prove a browser calls el(), that
+    callers pass a value, or that anything is on screen. There is no DOM in this suite
+    and adding one would make Node a test dependency (ruled out by the threat register),
+    so the rendering claim itself stays a human check — 06-07's checkpoint. What this
+    closes is the specific class where the page's only rendering statement can be
+    deleted in silence.
+    """
+    body = _el_body(client.get("/dashboard").text)
+
+    # The assignment, not the token: `.textContent = text` and nothing weaker.
+    assert re.search(r"\.textContent\s*=\s*text\b", body), (
+        "el() no longer writes its `text` argument through textContent — every value"
+        " the page renders would be invisible, and nothing else in this suite sees it"
+    )
+    # ...and the parameter it writes is genuinely el()'s third argument, so a rename
+    # cannot leave this matching some other `text` in scope.
+    assert re.match(r"\s*tag\s*,\s*attrs\s*,\s*text\s*\)", body), body[:80]
+
+
+def _ci_workflow() -> str:
+    path = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+    assert path.exists(), f"the CI workflow moved: {path}"
+    return path.read_text(encoding="utf-8")
+
+
+def test_the_docker_smoke_greps_for_content_only_this_page_has(client):
+    """WR-08: the container smoke asserts the PAGE, not just that something answered.
+
+    `curl -sf /dashboard | grep -q "Relay"` is satisfied by `<title>Relay dashboard</title>`
+    alone — so a build that served `<html><head><title>Relay dashboard</title></head>
+    <body></body></html>` printed "smoke ok". The smoke exists to catch a *served but
+    broken* page (a missing template is already caught by /health never coming up), and
+    that is exactly what a title match cannot see.
+
+    This test is the link between the two files: the tokens the workflow greps for must
+    be tokens the served page actually has, so neither can rot without the other going
+    red. MUTATION: rename `id="try-examples"` in the template — this fails here rather
+    than as a confusing red X in CI on main.
+    """
+    html = client.get("/dashboard").text
+    workflow = _ci_workflow()
+
+    # The workflow greps for these as FIXED strings (`grep -qF`), so the token in the
+    # YAML and the token in the page are byte-for-byte the same thing.
+    for token in ('id="try-examples"', "openDrill"):
+        assert token in workflow, (
+            f"the docker smoke no longer greps for {token} — it is back to a check that"
+            " a bare <title> would satisfy"
+        )
+        assert token in html, f"the served page has no {token} for the smoke to find"
+    # And the migration path: the smoke must start the image a second time against a
+    # database that already exists, which is the only place CI exercises
+    # _add_column_if_missing against a pre-existing table (db.py).
+    assert "docker volume create" in workflow, (
+        "the docker smoke runs with no volume, so a second start against an existing"
+        " database — the whole point of _add_column_if_missing — is never exercised"
+    )
+
+
 def test_dashboard_renders_the_summary_from_metrics(client):
     """DASH-02: the cards and the outcome bars are fed by /metrics' SQL-computed values.
 

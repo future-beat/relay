@@ -39,27 +39,55 @@ jobs:
       #                 without them 500s here rather than in production.
       # Both are asserted non-empty and for expected content: `curl -sf` alone would
       # pass on a 200 that served nothing.
+      #
+      # The /dashboard patterns are markup only the SHIPPED page has (WR-08). The old
+      # `grep -q "Relay"` was satisfied by `<title>Relay dashboard</title>` alone, so an
+      # image serving an empty <body> printed "smoke ok" — and a served-but-broken page
+      # is the one failure mode this curl uniquely adds, since a missing template
+      # already stops /health from ever coming up. tests/test_dashboard.py pins these
+      # same tokens against the served page, so the two cannot drift apart silently.
+      #
+      # The container is then started a SECOND time against the same volume, because
+      # that is the only place CI runs this image against a database that already
+      # exists — which is the entire stated purpose of _add_column_if_missing (db.py),
+      # written to be safe against the table already on the Fly volume and until now
+      # never exercised that way anywhere.
       - name: Smoke test container
         run: |
-          docker run -d --name relay -p 8000:8000 -e ANTHROPIC_API_KEY=ci-placeholder relay:ci
-          up=""
-          for i in $(seq 1 15); do
-            if curl -sf http://127.0.0.1:8000/health; then up=yes; break; fi
-            sleep 1
-          done
-          if [ -z "$up" ]; then
-            echo "health check never came up" >&2
-            docker logs relay >&2
-            exit 1
-          fi
-          if ! curl -sf http://127.0.0.1:8000/dashboard | grep -q "Relay"; then
-            echo "/dashboard did not serve the page — template missing from the image?" >&2
-            docker logs relay >&2
-            exit 1
-          fi
-          if ! curl -sf http://127.0.0.1:8000/metrics | grep -q '"outcome_distribution"'; then
-            echo "/metrics did not answer — SQLite window functions missing?" >&2
-            docker logs relay >&2
-            exit 1
-          fi
-          echo "smoke ok: /health, /dashboard, /metrics"
+          docker volume create relay-ci-data
+
+          start() {   # start <container-name>
+            docker run -d --name "$1" -p 8000:8000 -v relay-ci-data:/data \
+              -e ANTHROPIC_API_KEY=ci-placeholder relay:ci
+            up=""
+            for i in $(seq 1 15); do
+              if curl -sf http://127.0.0.1:8000/health; then up=yes; break; fi
+              sleep 1
+            done
+            if [ -z "$up" ]; then
+              echo "[$1] health check never came up" >&2
+              docker logs "$1" >&2
+              exit 1
+            fi
+          }
+
+          want() {    # want <container-name> <path> <pattern> <explanation>
+            if ! curl -sf "http://127.0.0.1:8000$2" | grep -qF -- "$3"; then
+              echo "[$1] $2 did not contain $3 — $4" >&2
+              docker logs "$1" >&2
+              exit 1
+            fi
+          }
+
+          start relay
+          want relay /dashboard 'id="try-examples"' "the page served no Try-it panel"
+          want relay /dashboard 'openDrill' "the page served no drill-down"
+          want relay /metrics '"outcome_distribution"' "SQLite window functions missing?"
+
+          # Second boot, same volume: init_db now runs against tables that exist.
+          docker rm -f relay
+          start relay-again
+          want relay-again /metrics '"outcome_distribution"' "migration against an existing DB failed"
+          want relay-again /dashboard 'id="try-examples"' "the page broke on the second boot"
+
+          echo "smoke ok: /health, /dashboard, /metrics — twice, second time on an existing volume"
