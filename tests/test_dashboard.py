@@ -2058,6 +2058,49 @@ def test_charts_have_an_empty_state(client):
     assert "None" not in html
 
 
+def test_the_latency_chart_explains_a_single_day_of_runs(client):
+    """The sparse render is the demo's NORMAL render, so it has to read as deliberate.
+
+    `min_machines_running = 0` plus real traffic means a 14-day window usually holds
+    one busy day. The drawing rule then does the right thing and draws no segment — a
+    line across an idle fortnight would be an invention — but a visitor sees two dots
+    in an empty box, which reads as a broken chart on the one page whose job is
+    credibility. This pins the caption that names the cause, and pins that it did NOT
+    buy legibility by inventing the line.
+
+    The guard is asserted as `points.some(` over `adjacent`, not as a hand-rolled
+    index comparison, because `adjacent` is also what gates the segment: one predicate,
+    so the copy cannot announce a missing line that the drawing just drew.
+
+    MUTATION that must turn this red: delete the sparse branch (the
+    `if (!points.some(...)) { host.append(...) }` block) from renderLatencyChart — the
+    one-day case goes back to two unexplained dots.
+
+    WEAK BY CONSTRUCTION: grep-level, like every front-end assertion in this file.
+    There is no DOM here, so nothing below renders a chart or counts a dot; it sees
+    that the branch and its copy shipped, and that the zero-data branch survived
+    alongside it.
+    """
+    html = client.get("/dashboard").text
+    block = _block(html, "charts (SVG)")
+    code = _code_only(block)
+
+    # Three distinct states, not two: no runs at all, runs on one day, runs on days.
+    assert "!points.length" in code, "the zero-data branch was replaced, not extended"
+    assert "!points.some(" in code, "no sparse branch in the latency chart"
+    assert "adjacent(points[n - 1], p)" in code, (
+        "the sparse branch re-derives adjacency instead of sharing the draw's predicate"
+    )
+    assert "one day with runs in this window" in code, "the one-day case is unexplained"
+    assert "none next to" in code, "days far apart draw no line and say nothing"
+
+    # The caption buys nothing if the fix was to draw the line anyway: the segment is
+    # still gated on adjacency, and no unconditional polyline appeared.
+    assert "if (adjacent(prev, p)) {" in code, "a segment is no longer gated on adjacency"
+    assert "polyline" not in code and "path" not in code.split("renderGauge", 1)[0]
+    assert "None" not in html
+
+
 # --- Wave 5: the drill-down panel (DASH-03) ------------------------------------------
 #
 # NOTE ON STRENGTH, restated for this wave: there is still no DOM in this suite — no

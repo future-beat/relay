@@ -346,6 +346,15 @@ function renderCostChart(series) {
 // would draw a spike to the floor and read as "every run was instant"), so they are
 // skipped, and a segment is drawn only between adjacent days that both have a value —
 // a line straight across an idle week would be an invention.
+//
+// On a scale-to-zero demo the usual window holds ONE day with traffic, so that rule
+// draws a couple of dots and no line at all, which reads as a broken chart rather
+// than as a quiet fortnight. The sparse caption below says what is actually true
+// instead; the geometry is untouched. `adjacent` is the single predicate behind both
+// the segment and the caption, so the copy cannot claim an absent line the drawing
+// just drew.
+const adjacent = (prev, p) => prev !== undefined && p.i - prev.i === 1;
+
 function renderLatencyChart(series) {
   const host = document.getElementById("chart-latency");
   clear(host);
@@ -368,7 +377,7 @@ function renderLatencyChart(series) {
     points.forEach((p, n) => {
       const value = key === "p95" ? (p.p95 || p.p50) : p.p50;
       const prev = points[n - 1];
-      if (prev && p.i - prev.i === 1) {
+      if (adjacent(prev, p)) {
         const prevValue = key === "p95" ? (prev.p95 || prev.p50) : prev.p50;
         root.append(svg("line", {
           x1: x(prev.i), y1: y(prevValue), x2: x(p.i), y2: y(value),
@@ -381,6 +390,14 @@ function renderLatencyChart(series) {
   root.append(svg("text", { x: pad, y: 12, "font-size": "10", fill: "#666" },
                   "peak " + max + " ms"));
   host.append(root);
+  if (!points.some((p, n) => adjacent(points[n - 1], p))) {
+    host.append(el("p", { class: "empty" },
+                   points.length === 1
+                     ? "one day with runs in this window — a line joins two days in a"
+                       + " row, so the dots stand alone until the next busy day"
+                     : points.length + " days with runs in this window, none next to"
+                       + " each other — a line is only drawn between consecutive days"));
+  }
 }
 
 // --- budget gauge — begin ---
