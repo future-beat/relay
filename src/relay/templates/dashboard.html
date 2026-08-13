@@ -437,6 +437,16 @@ function renderGauge(budget) {
   labels.append(el("div", {}, "$" + budget.remaining_usd + " left today"));
   labels.append(el("div", {}, "resets at " + budget.resets_at));
   host.append(labels);
+  // The hollow track is the demo's resting state, and a grey ring with no copy is
+  // indistinguishable from a gauge that failed to load. `spent` is the server's own
+  // number, read once above and only compared here — nothing is re-derived to decide
+  // what to say (D-11). Deliberately not keyed off `fraction`, which is also 0 when
+  // the ceiling is unset: that case has spend to report and this sentence would lie.
+  if (spent === 0) {
+    host.append(el("p", { class: "gauge-note" },
+                   "Nothing spent yet today — the arc fills as runs complete, and"
+                   + " resets with the daily ceiling."));
+  }
   host.append(el("p", { class: "gauge-note" },
                  "Includes runs in flight — this is the figure the spend gate compares,"
                  + " reservations and all, so it can move while a run is working."));

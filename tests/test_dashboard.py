@@ -2034,6 +2034,42 @@ def test_the_gauge_reads_the_servers_budget_object(client):
     assert "in flight" in gauge
 
 
+def test_the_gauge_explains_an_idle_day(client):
+    """A hollow ring is honest and unreadable: $0 today looks exactly like a load error.
+
+    The scale-to-zero demo spends nothing on a quiet day, so the gauge's usual render
+    is a grey track with no fill. This pins the copy that makes that a reading rather
+    than a symptom — and pins that it stayed COPY: the branch compares the server's
+    `spent` and adds a sentence, it does not compute a fraction, sum `last_runs`, or
+    substitute a floor for the empty arc (D-11 — the gauge and the spend gate must be
+    incapable of disagreeing).
+
+    MUTATION that must turn this red: delete the `if (spent === 0)` branch — the idle
+    gauge goes back to an unexplained grey ring.
+
+    WEAK BY CONSTRUCTION: grep-level. No DOM, no arc is drawn or measured here; this
+    sees the branch and its copy in the served document.
+    """
+    html = client.get("/dashboard").text
+    gauge = _block(html, "budget gauge")
+    code = _code_only(gauge)
+
+    assert "if (spent === 0) {" in code, "no idle branch in the gauge"
+    assert "Nothing spent yet today" in code, "the idle gauge is unexplained"
+    # Still copy only: the arithmetic below the branch is the server's, unchanged.
+    assert "last_runs" not in code and "reduce(" not in code
+    assert code.count("fraction =") == 1, "the idle branch re-derives the fraction"
+    # The empty arc is still empty, and the one clamp is still the server's two numbers
+    # bounded to [0, 1] — pinned literally, because the tempting way to make an idle
+    # gauge look alive is a minimum fill (`Math.max(0.05, ...)`), which draws spend
+    # that did not happen on the page whose whole claim is that its numbers are real.
+    assert "Math.min(1, Math.max(0, spent / ceiling))" in code, (
+        "the fraction is no longer the server's spend over the server's ceiling"
+    )
+    assert "if (fraction > 0) {" in code, "the fill is no longer gated on real spend"
+    assert "None" not in html
+
+
 def test_charts_have_an_empty_state(client):
     """A demo whose volume was just created must render empty charts, not broken ones.
 
