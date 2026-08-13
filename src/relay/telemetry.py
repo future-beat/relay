@@ -9,6 +9,7 @@
 
 import json
 import logging
+import math
 import os
 from datetime import UTC, datetime
 from typing import Any
@@ -18,6 +19,7 @@ from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
+from .config import settings
 from .db import Database
 
 
@@ -92,50 +94,223 @@ def record_run(
 
 
 def _percentile(sorted_values: list[int], pct: float) -> int:
+    """Nearest-rank percentile, half-up — this codebase's one definition of "median".
+
+    Half-up, not Python's `round()`, which is banker's rounding. The percentiles on
+    /metrics are now computed by SQL (below), and SQLite's `ROUND` is half-up: ship
+    both roundings and the p50 card and the p50 line on the latency chart show
+    different numbers for the same runs, on a page whose entire purpose is looking
+    credible. Research measured the two disagreeing on 16 of 177 sampled (n, pct)
+    pairs, so this is not a theoretical tie-break.
+
+    Its production role is now to be that statement of the definition in Python:
+    tests/test_metrics.py::test_percentile_is_half_up asserts this function and
+    GLOBAL_PERCENTILE_SQL agree for every sampled pair, which is what stops the two
+    from drifting apart the next time either is touched.
+    """
     if not sorted_values:
         return 0
-    index = min(len(sorted_values) - 1, round(pct * (len(sorted_values) - 1)))
+    index = min(len(sorted_values) - 1, math.floor(pct * (len(sorted_values) - 1) + 0.5))
     return sorted_values[index]
 
 
-# The public shape of /metrics, named rather than taken from `SELECT *` (WR-10). The
-# star used to mean every column of `runs` was published: phase 5's `run_uid` joined
-# the payload the moment it was added, and it is the key into `run_events` — a table
-# deliberately filled with unredacted customer data, whose access model phase 6 has not
-# decided yet. Naming the columns also makes the next one somebody adds a decision
-# rather than a silent public API change.
+# The public shape of /metrics, named rather than taken from a star select (WR-10). The
+# star meant every column of `runs` was published, so phase 5's `run_uid` joined the
+# payload the moment the column was added — an undecided disclosure, made silently.
+# The explicit tuple is what makes the NEXT column somebody adds to `runs` a decision
+# taken here rather than a silent change to a public API.
+#
+# `run_uid` is on the list deliberately, reversing WR-10's removal. WR-10 was right
+# while the uid was a handle into `run_events`' raw payloads with no decided access
+# model; phase 6 decided that model (D-01/D-03): the drill-down the uid opens is
+# public and server-redacted, and its full-fidelity branch keys off `tickets.origin`,
+# read server-side and unreachable from the request. Holding the uid therefore grants
+# nothing that is not already redacted — and it is the one thing that makes a row in
+# the last-runs table clickable.
 _PUBLIC_RUN_COLUMNS = (
     "id", "ticket_id", "model", "duration_ms", "steps",
     "input_tokens", "output_tokens", "cost_usd", "outcome", "created_at",
+    "run_uid",
 )
 
 
-def run_metrics(conn: Database) -> dict[str, Any]:
-    rows = [
-        dict(r) for r in conn.execute(
-            f"SELECT {', '.join(_PUBLIC_RUN_COLUMNS)} FROM runs ORDER BY id"
-        ).fetchall()
+# --- /metrics aggregation ---------------------------------------------------------
+# Named module-level constants, following ratelimit.DAILY_SPEND_SQL's precedent: these
+# run on an ungated route polled every 5s per open tab, so they are the queries you
+# want to be able to grep for. Every one of them replaces a Python aggregation over a
+# full materialisation of `runs` — a read whose cost grew for the life of the volume.
+
+TOTALS_SQL = (
+    "SELECT COUNT(*)                        AS runs,"
+    "       COALESCE(SUM(input_tokens), 0)  AS input_tokens,"
+    "       COALESCE(SUM(output_tokens), 0) AS output_tokens,"
+    "       COALESCE(SUM(cost_usd), 0.0)    AS cost_usd,"
+    "       COALESCE(MAX(duration_ms), 0)   AS max_ms"
+    " FROM runs"
+)
+
+# The raw outcome strings, kept alongside outcome_distribution: it is one cheap
+# GROUP BY, it is part of /metrics' published shape, and nothing on the page reads it.
+OUTCOMES_SQL = "SELECT outcome, COUNT(*) AS n FROM runs GROUP BY outcome"
+
+# Nearest-rank percentile in SQL. `MIN(n - 1, ...)` is the two-argument scalar min;
+# `MAX(CASE ...)` is the aggregate picking the single ranked row out. Empty table ->
+# one row of NULL, which the caller floors to 0. The `? * (n - 1)` rank must stay
+# identical to _percentile's index, and test_percentile_is_half_up pins that.
+GLOBAL_PERCENTILE_SQL = (
+    "WITH ranked AS ("
+    " SELECT duration_ms,"
+    "        ROW_NUMBER() OVER (ORDER BY duration_ms) AS rn,"
+    "        COUNT(*)     OVER ()                     AS n"
+    " FROM runs)"
+    " SELECT MAX(CASE WHEN rn = 1 + MIN(n - 1, CAST(ROUND(? * (n - 1)) AS INTEGER))"
+    "                 THEN duration_ms END) AS value"
+    " FROM ranked"
+)
+
+# DASH-02's distribution, as a GROUP BY over a closed bucket mapping.
+#
+# The two specific error branches MUST precede the `LIKE 'error:%'` branch: SQLite
+# evaluates CASE WHEN in source order, so reordering them silently collapses
+# budget_exceeded and step_limit into `error` — the chart still renders, with two bars
+# quietly at zero.
+#
+# The branch list is derived from the single `record_run` call site (main.py), which is
+# the only place `runs.outcome` is written. A new outcome string added there without a
+# branch here falls through to `incomplete`: wrong, but visible on the chart, rather
+# than dropped.
+OUTCOME_DISTRIBUTION_SQL = (
+    "SELECT CASE"
+    "   WHEN outcome = 'send_reply'               THEN 'resolved'"
+    "   WHEN outcome = 'create_escalation'        THEN 'escalated'"
+    "   WHEN outcome = 'dry_run_complete'         THEN 'dry_run'"
+    "   WHEN outcome = 'error:budget_exceeded'    THEN 'budget_exceeded'"
+    "   WHEN outcome = 'error:step_limit_reached' THEN 'step_limit'"
+    "   WHEN outcome LIKE 'error:%'               THEN 'error'"
+    "   ELSE 'incomplete'"
+    " END AS bucket, COUNT(*) AS n"
+    " FROM runs GROUP BY bucket ORDER BY n DESC, bucket"
+)
+
+# Zero-filled first, then overlaid with the query's rows: only buckets with runs come
+# back from SQL, and a bar chart that grows its bars one at a time as outcomes first
+# occur reads as a broken chart rather than as an honest empty state.
+_OUTCOME_BUCKETS = (
+    "resolved", "escalated", "dry_run", "incomplete",
+    "budget_exceeded", "step_limit", "error",
+)
+
+LAST_RUNS_LIMIT = 20
+
+# ORDER BY id DESC LIMIT 20 in SQL, not `rows[-20:][::-1]` in Python: the slice was
+# the last unbounded read left on this route.
+LAST_RUNS_SQL = (
+    f"SELECT {', '.join(_PUBLIC_RUN_COLUMNS)} FROM runs"
+    f" ORDER BY id DESC LIMIT {LAST_RUNS_LIMIT}"
+)
+
+
+# DASH-04 / D-10: cost and latency bucketed by day, not per run — legible at 3 runs
+# and at 300. The rank expression is character-for-character the one in
+# GLOBAL_PERCENTILE_SQL, so the chart's p50 and the card's p50 are the same statistic.
+#
+# The `WHERE` is what keeps this bounded, and it is served by idx_runs_created_at
+# (db.py:83); `date(created_at)` in the GROUP BY is then a function over already-pruned
+# rows. The offset is a parameter rather than an interpolated literal so the window is
+# configuration (settings.metrics_window_days), not a number buried in a query.
+DAILY_BUCKETS_SQL = (
+    "WITH windowed AS ("
+    " SELECT date(created_at) AS day, duration_ms, cost_usd,"
+    "        ROW_NUMBER() OVER (PARTITION BY date(created_at) ORDER BY duration_ms) AS rn,"
+    "        COUNT(*)     OVER (PARTITION BY date(created_at))                      AS n"
+    " FROM runs"
+    " WHERE created_at >= datetime('now', ?, 'start of day'))"
+    " SELECT day,"
+    "        n                              AS runs,"
+    "        ROUND(SUM(cost_usd), 4)        AS cost_usd,"
+    "        MAX(CASE WHEN rn = 1 + MIN(n - 1, CAST(ROUND(0.50 * (n - 1)) AS INTEGER))"
+    "                 THEN duration_ms END) AS p50_ms,"
+    "        MAX(CASE WHEN rn = 1 + MIN(n - 1, CAST(ROUND(0.95 * (n - 1)) AS INTEGER))"
+    "                 THEN duration_ms END) AS p95_ms"
+    " FROM windowed GROUP BY day, n ORDER BY day"
+)
+
+# The window's day labels, generated by SQLite rather than Python's datetime: the rows
+# are stamped by datetime('now') (UTC) and matched by datetime('now', ...), so a
+# Python-side date would drift with the process timezone and the last bucket of the
+# chart would silently belong to the wrong day — db.py:258-264's reasoning, from the
+# read side.
+WINDOW_DAYS_SQL = (
+    "WITH RECURSIVE window_days(day) AS ("
+    " SELECT date('now', ?)"
+    " UNION ALL"
+    " SELECT date(day, '+1 day') FROM window_days WHERE day < date('now'))"
+    " SELECT day FROM window_days"
+)
+
+
+def _daily_series(conn: Database) -> list[dict[str, Any]]:
+    """Cost and latency per day across the window, with no gaps.
+
+    Densifying is done here rather than on the client because SQL only returns days
+    that have runs: a quiet Tuesday comes back as a *missing* point, which a line
+    chart draws straight through — the graph then says "nothing happened" and "it was
+    busy" with the same picture. Filling server-side makes the chart a plain map on
+    the client and makes an idle day visibly idle.
+
+    Empty days carry runs=0 and cost_usd=0.0 (both true) but p50/p95 None, not 0: a
+    zero would plot a spike down to the floor and read as "every run was instant".
+    """
+    window = max(1, settings.metrics_window_days)
+    offset = f"-{window - 1} days"
+    rows = {
+        r["day"]: {
+            "day": r["day"],
+            "runs": int(r["runs"]),
+            "cost_usd": float(r["cost_usd"] or 0.0),
+            "p50_ms": None if r["p50_ms"] is None else int(r["p50_ms"]),
+            "p95_ms": None if r["p95_ms"] is None else int(r["p95_ms"]),
+        }
+        for r in conn.execute(DAILY_BUCKETS_SQL, (offset,)).fetchall()
+    }
+    days = [r["day"] for r in conn.execute(WINDOW_DAYS_SQL, (offset,)).fetchall()]
+    return [
+        rows.get(day, {"day": day, "runs": 0, "cost_usd": 0.0, "p50_ms": None, "p95_ms": None})
+        for day in days
     ]
-    durations = sorted(r["duration_ms"] for r in rows)
-    outcomes: dict[str, int] = {}
-    for r in rows:
-        outcomes[r["outcome"]] = outcomes.get(r["outcome"], 0) + 1
-    total_cost = sum(r["cost_usd"] for r in rows)
+
+
+def _sql_percentile(conn: Database, pct: float) -> int:
+    row = conn.execute(GLOBAL_PERCENTILE_SQL, (pct,)).fetchone()
+    value = row["value"] if row is not None else None
+    return int(value) if value is not None else 0
+
+
+def run_metrics(conn: Database) -> dict[str, Any]:
+    totals = conn.execute(TOTALS_SQL).fetchone()
+    n_runs = int(totals["runs"])
+    total_cost = float(totals["cost_usd"])
+    outcomes = {r["outcome"]: r["n"] for r in conn.execute(OUTCOMES_SQL).fetchall()}
+    distribution = dict.fromkeys(_OUTCOME_BUCKETS, 0)
+    for row in conn.execute(OUTCOME_DISTRIBUTION_SQL).fetchall():
+        distribution[row["bucket"]] = row["n"]
     return {
-        "runs": len(rows),
+        "runs": n_runs,
         "outcomes": outcomes,
+        "outcome_distribution": distribution,
         "tokens": {
-            "input": sum(r["input_tokens"] for r in rows),
-            "output": sum(r["output_tokens"] for r in rows),
+            "input": int(totals["input_tokens"]),
+            "output": int(totals["output_tokens"]),
         },
         "cost_usd": {
             "total": round(total_cost, 4),
-            "mean_per_run": round(total_cost / len(rows), 4) if rows else 0.0,
+            "mean_per_run": round(total_cost / n_runs, 4) if n_runs else 0.0,
         },
         "latency_ms": {
-            "p50": _percentile(durations, 0.50),
-            "p95": _percentile(durations, 0.95),
-            "max": durations[-1] if durations else 0,
+            "p50": _sql_percentile(conn, 0.50),
+            "p95": _sql_percentile(conn, 0.95),
+            "max": int(totals["max_ms"]),
         },
-        "last_runs": rows[-20:][::-1],
+        "daily": _daily_series(conn),
+        "last_runs": [dict(r) for r in conn.execute(LAST_RUNS_SQL).fetchall()],
     }

@@ -1,11 +1,13 @@
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 import time
 import uuid
 from contextlib import asynccontextmanager
 from html import escape
+from pathlib import Path
 
 from anthropic import AsyncAnthropic
 from fastapi import Depends, FastAPI, HTTPException, Request, Security
@@ -23,11 +25,18 @@ from .events import (
     RunRecorder,
     attribute_to_run,
     project,
+    project_run_detail,
     snapshot_frame,
 )
 from .guardrails import ToolPolicy
 from .models import Ticket, TicketCreate
-from .ratelimit import enforce, enforce_daily_budget, release_run, reserve_run
+from .ratelimit import (
+    budget_snapshot,
+    enforce,
+    enforce_daily_budget,
+    release_run,
+    reserve_run,
+)
 from .runs import RegistryDraining, RunRegistry
 from .telemetry import configure_logging, record_run, run_metrics, setup_tracing
 from .tools import build_registry
@@ -175,6 +184,35 @@ process_gate = _gate("process", meter_spend=True)
 # Public (D-11) but not unmetered: /events holds a connection open for its whole idle
 # ceiling, which is exactly what a reconnect loop needs to keep the machine awake.
 events_gate = _gate("events", public=True)
+# The per-run drill-down, public for the same reason and bounded for a different one.
+# Its OWN bucket, deliberately not the feed's: a visitor clicking through the back
+# catalogue would otherwise spend the live feed's reconnect allowance and silently break
+# their own feed, and a drill-down flood has to be visible as itself in the logs rather
+# than hidden inside the feed's line.
+run_detail_gate = _gate("run_detail", public=True)
+
+# uuid4().hex, which is what process_ticket mints. Lowercase hex, exactly 32 — the shape
+# is known precisely, so a scripted walk of made-up keys can be refused for the cost of a
+# regex instead of a query (T-06-17).
+_RUN_UID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+
+# The `runs` columns the drill-down envelope publishes. Explicit for the same reason
+# _PUBLIC_RUN_COLUMNS is: what a public route discloses is a list someone wrote down.
+# `run_uid` is not here (the caller already holds it, and the envelope carries it) and
+# neither is `id`, the local autoincrement nobody outside this database needs.
+_DETAIL_RUN_COLUMNS = (
+    "outcome", "cost_usd", "duration_ms", "steps",
+    "input_tokens", "output_tokens", "model", "created_at", "ticket_id",
+)
+
+# Declared once at module level for the same reason _ANY_TIER/_API_KEY are: ruff's B008
+# rightly rejects a call in an argument default. create_ticket takes the gate as a
+# PARAMETER rather than in dependencies=[...] because _gate's dependency returns the
+# resolved tier, and that tier is the only server-side signal that a ticket is
+# visitor-authored (D-02). A gate declared in dependencies=[...] throws its return value
+# away; declared in BOTH places it would run — and meter — the perimeter twice per
+# request, silently halving every demo limit in D-04.
+_CREATE_GATE = Depends(create_gate)
 
 
 @app.get("/", include_in_schema=False)
@@ -188,18 +226,28 @@ async def health() -> dict:
     return {"status": "ok", "version": __version__, "model": settings.model}
 
 
-@app.post(
-    "/tickets",
-    response_model=Ticket,
-    status_code=201,
-    dependencies=[Depends(create_gate)],
-)
-async def create_ticket(payload: TicketCreate) -> Ticket:
+@app.post("/tickets", response_model=Ticket, status_code=201)
+async def create_ticket(payload: TicketCreate, tier: Tier | None = _CREATE_GATE) -> Ticket:
+    """Create a ticket, recording the tier that created it (D-02).
+
+    `origin` is the CREATION tier and never the processing one, and the difference is a
+    disclosure boundary rather than a naming preference. Full fidelity discloses ticket
+    CONTENT — the subject, the body, the raw tool inputs the run saw — and what makes
+    that safe is that the visitor holding the published demo key authored that content
+    themselves. A flag set from the /process tier instead would make an owner-authored
+    ticket, carrying a real customer's words, full fidelity the moment anyone ran it
+    with the published key: a disclosure reachable with one curl (threat T-06-15).
+
+    NULL is the legacy value and reads as NOT demo everywhere — the read side compares
+    `origin == "demo"` by equality, never truthiness, so an unclassified row fails
+    closed.
+    """
     def _insert() -> int:
         with app.state.conn.transaction() as db:
             cur = db.execute(
-                "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
-                (payload.customer_email, payload.subject, payload.body),
+                "INSERT INTO tickets (customer_email, subject, body, origin)"
+                " VALUES (?, ?, ?, ?)",
+                (payload.customer_email, payload.subject, payload.body, tier),
             )
             # Read inside the block: once the lock drops another thread's insert has
             # already moved lastrowid, and this row's id is what the caller gets back.
@@ -247,6 +295,22 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
     # on its own rather than trusting this handoff.
     token = reserve_run()
 
+    # This run's identity, minted before the first event so every run_events row and the
+    # runs row written in the finally below carry the same key. Not the runs row's id:
+    # that row does not exist until the stream ends, long after the first event has to be
+    # written (hence a soft join key, not a foreign one).
+    #
+    # Minted in the HANDLER rather than inside event_stream, so it can also travel back
+    # on the response as X-Relay-Run-Uid. Try-it streams this route with `fetch` while
+    # simultaneously watching the ambient /events feed, which carries the REDACTED
+    # projection of this same run: without the uid the page renders one run twice, in
+    # two fidelities, with nothing connecting them — and cannot deep-link its own
+    # drill-down. A header touches ZERO of the SSE event contract (the milestone's
+    # compatibility constraint) where an extra `event: run` frame would change it, and
+    # scripts/demo.sh would print it. Same-origin fetch reads response headers with no
+    # CORS allowlist needed.
+    run_uid = uuid.uuid4().hex
+
     async def event_stream():
         started = time.perf_counter()
         # Registered here rather than beside reserve_run() above, and the difference
@@ -275,11 +339,6 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
         usage: dict = {}
         outcome = "incomplete"
         recorded = False
-        # This run's identity, minted before the first event so every run_events row
-        # and the runs row written in the finally below carry the same key. Not the
-        # runs row's id: that row does not exist until the stream ends, long after the
-        # first event has to be written (hence a soft join key, not a foreign one).
-        run_uid = uuid.uuid4().hex
         recorder = RunRecorder(app.state.conn, run_uid=run_uid, ticket_id=ticket.id)
         try:
             async for event in run_ticket(
@@ -404,14 +463,171 @@ async def process_ticket(ticket_id: int, dry_run: bool = False) -> StreamingResp
                 # Last, so a drain waiting on this run only wakes once its row is written.
                 app.state.runs.deregister(run_token)
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        # The uid its submitter needs (above), plus the two headers 05-REVIEW IN-02
+        # names. X-Accel-Buffering is nginx's opt-out and is honoured across the proxy
+        # chain in front of this app; without it a buffering hop collects the whole
+        # stream and delivers it at once, which is the difference between "the run
+        # streams" and "the page hangs for 20 seconds and then dumps everything".
+        # no-cache stops an intermediary serving a second visitor the first one's run.
+        headers={
+            "X-Relay-Run-Uid": run_uid,
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.get("/metrics")
 async def metrics() -> dict:
-    # run_metrics does SELECT * FROM runs, the one read here that grows unbounded:
-    # the dashboard polls this every 5s, so it is the last place to hold the loop.
-    return await asyncio.to_thread(run_metrics, app.state.conn)
+    def _read() -> dict:
+        payload = run_metrics(app.state.conn)
+        # Composed HERE rather than inside run_metrics, so telemetry does not import
+        # ratelimit — the aggregation layer has no business knowing about the
+        # perimeter. And it is budget_snapshot's own arithmetic, never a second
+        # derivation: the gauge renders the number that refuses the visitor's next run
+        # (D-11), which includes the spend reserved by runs still in flight. A gauge
+        # summing committed `runs` rows alone reads up to concurrency x max_run_cost_usd
+        # low and promises budget the very next request answers 503 to.
+        payload["budget"] = budget_snapshot(app.state.conn)
+        return payload
+
+    # ONE offload for both reads: two would take Database's lock twice for a route the
+    # dashboard polls every 5s per open tab, which is the last place that may hold the
+    # loop that also answers the 3s container HEALTHCHECK.
+    return await asyncio.to_thread(_read)
+
+
+@app.get("/runs/{run_uid}", dependencies=[Depends(run_detail_gate)])
+async def run_detail(run_uid: str) -> dict:
+    """One run's steps, redacted server-side (D-01, DASH-03).
+
+    Public and keyless, like /events and /metrics, and safe for the same reason:
+    content control, not access control. Every step below came out of
+    project_run_detail's field-by-field allowlist, so holding a uid grants nothing that
+    is not already redacted (D-03).
+
+    The one exception is a DEMO-originated ticket, where the visitor authored the
+    content themselves and D-02 makes the raw trace the payoff. That decision is made
+    HERE, from `tickets.origin`, and is unreachable from the request: this signature
+    takes no query parameter, reads no header and no cookie, and the comparison is
+    `origin == "demo"` by equality — NULL (a legacy row) and anything else fail closed
+    (T-06-14). `customer_email` is withheld even on the demo branch: /tickets accepts an
+    arbitrary address from anyone holding the published key, so it is the one field a
+    visitor could use to publish a third party's identifier.
+
+    A run whose steps the 30-day retention swept is NOT a 404. `purge_expired_run_events`
+    deliberately spares the `runs` row, so "no steps" is the normal end state of the back
+    catalogue, and a visitor following a link into it has to be able to tell "this run
+    happened and its detail expired" from "this uid is a lie" (T-06-18). The status
+    string discloses nothing about content.
+    """
+    if not _RUN_UID_RE.match(run_uid):
+        # Refused before the database is touched: the uid shape is known exactly, so a
+        # 404 for a malformed key costs a regex where a 404 for an absent key costs a
+        # query. The log carries a truncated echo only — enough to correlate a scan,
+        # never enough to be a mirror for arbitrary client text.
+        logger.info("run_detail.rejected_uid", extra={"ctx": {"uid": run_uid[:12]}})
+        raise HTTPException(404, "unknown run")
+
+    def _read():
+        conn = app.state.conn
+        # Events FIRST. Every event row is committed before the `runs` row exists (it is
+        # written in event_stream's finally), so a run that finishes between these two
+        # reads renders complete-with-all-its-steps rather than complete-with-a-hole.
+        # The LIMIT is what keeps one run's response bounded: nothing caps a single
+        # run's step count except the agent's own step limit, which is configuration.
+        rows = conn.execute(
+            "SELECT seq, type, payload, elapsed_ms, ticket_id FROM run_events"
+            " WHERE run_uid = ? ORDER BY seq LIMIT ?",
+            (run_uid, settings.run_detail_max_events),
+        ).fetchall()
+        run = conn.execute(
+            f"SELECT {', '.join(_DETAIL_RUN_COLUMNS)} FROM runs WHERE run_uid = ?",
+            (run_uid,),
+        ).fetchone()
+        expired = False
+        if run is not None and not rows:
+            # Asked of SQLite with the same expression purge_expired_run_events uses,
+            # rather than re-derived from a Python clock: the two must agree about what
+            # "older than the retention window" means or the page contradicts the sweep.
+            expired = bool(conn.execute(
+                "SELECT ? < datetime('now', ?) AS expired",
+                (run["created_at"], f"-{settings.events_retention_days} days"),
+            ).fetchone()["expired"])
+        ticket_id = rows[0]["ticket_id"] if rows else (run["ticket_id"] if run else None)
+        origin, ticket = None, None
+        if ticket_id is not None:
+            got = conn.execute(
+                "SELECT origin FROM tickets WHERE id = ?", (ticket_id,)
+            ).fetchone()
+            origin = got["origin"] if got else None
+            if origin == "demo":
+                # Read at all ONLY on the branch that publishes it. A single SELECT
+                # naming subject/body unconditionally would work identically today and
+                # leave the redacted path holding the text in a local, one edit away
+                # from disclosing it.
+                ticket = dict(conn.execute(
+                    "SELECT subject, body FROM tickets WHERE id = ?", (ticket_id,)
+                ).fetchone())
+        # fetchall()/fetchone() all happen in here, never after: Database materialises
+        # rows while its lock is held.
+        return rows, run, expired, ticket_id, origin, ticket
+
+    rows, run, expired, ticket_id, origin, ticket = await asyncio.to_thread(_read)
+    if run is None and not rows:
+        raise HTTPException(404, "unknown run")
+
+    demo = origin == "demo"
+    note = None
+    if rows and run is not None:
+        status = "complete"
+    elif rows:
+        # The `runs` row lands in event_stream's finally, so this is what every run
+        # looks like while it is still streaming.
+        status = "in_flight"
+    elif expired:
+        status = "swept"
+        note = (
+            f"Step detail is kept for {settings.events_retention_days} days."
+            " This run's steps have expired; its summary is kept."
+        )
+        logger.info("run_detail.swept", extra={"ctx": {
+            "uid": run_uid[:12], "status": status,
+        }})
+    else:
+        # A legacy pre-Phase-5 run, or one whose per-step writes failed. Nothing
+        # expired, so calling it "swept" would be a lie about retention.
+        status = "unrecorded"
+
+    detail = {
+        "run_uid": run_uid,
+        "ticket_id": ticket_id,
+        # The FLAG is not secret — the page labels "you submitted this" with it. The
+        # CONTENT it gates is.
+        "demo": demo,
+        "status": status,
+        "run": dict(run) if run is not None else None,
+        "steps": project_run_detail(
+            rows,
+            full_fidelity=demo,
+            # Each registered tool's DECLARED input keys — the schema the model was
+            # shown. The projector clamps model-chosen tool names and argument keys
+            # against this, so neither can carry a payload into a browser.
+            known_tools={
+                name: frozenset(spec.schema["input_schema"]["properties"])
+                for name, spec in app.state.registry.items()
+            },
+        ),
+    }
+    if note is not None:
+        detail["note"] = note
+    if demo and ticket is not None:
+        # The visitor's own words back, and only these two fields by name (Q3).
+        detail["ticket"] = {"subject": ticket["subject"], "body": ticket["body"]}
+    return detail
 
 
 @app.get("/events", dependencies=[Depends(events_gate)])
@@ -508,133 +724,24 @@ async def events() -> StreamingResponse:
             # double-unsubscribe a close() plus a disconnect can produce is harmless.
             app.state.broker.unsubscribe(q)
 
-    return StreamingResponse(stream(), media_type="text/event-stream")
+    # Same anti-buffering pair as /process (05-REVIEW IN-02). It matters more here: a
+    # buffered live feed is indistinguishable from a dead one, and the page's own status
+    # line would sit on "connecting" while frames pile up in a proxy.
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
-DASHBOARD_HTML = """<!doctype html>
-<html><head><title>Relay dashboard</title><style>
-body { font-family: ui-monospace, monospace; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
-h1 { font-size: 1.2rem; } .cards { display: flex; gap: 1rem; flex-wrap: wrap; }
-.card { border: 1px solid #ccc; border-radius: 8px; padding: .8rem 1.2rem; min-width: 140px; }
-.card b { display: block; font-size: 1.4rem; } .card span { color: #666; font-size: .8rem; }
-table { border-collapse: collapse; width: 100%; margin-top: 1.5rem; font-size: .85rem; }
-th, td { text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; }
-.demo { border: 1px solid #ccc; border-left: 4px solid #444; border-radius: 8px;
-        padding: .8rem 1.2rem; margin-bottom: 1.5rem; font-size: .85rem; }
-.demo code { background: #f4f4f4; padding: .1rem .3rem; border-radius: 4px; }
-.demo em { color: #666; font-style: normal; }
-h2 { font-size: 1rem; margin: 2rem 0 .4rem; }
-#feed-status { color: #666; font-size: .8rem; }
-#feed { list-style: none; padding: 0; margin: .6rem 0 0; font-size: .85rem; }
-#feed li { border: 1px solid #eee; border-radius: 6px; padding: .4rem .7rem;
-           margin: 0 0 .4rem; }
-#feed b { display: block; margin-bottom: .2rem; }
-#feed .step { color: #444; }
-</style></head><body>
-<h1>Relay — agent runs</h1>
-<div class="demo">
-Try it yourself — this key is published on purpose:
-<code>X-API-Key: __RELAY_DEMO_KEY__</code><br>
-<em>Deliberately limited: 5 runs/hour per IP, and the demo caps Claude spend at $5/day.</em>
-</div>
-<div class="cards" id="cards"></div>
-<h2>Live feed <span id="feed-status">connecting</span></h2>
-<ul id="feed"></ul>
-<table id="runs"><thead><tr><th>id</th><th>ticket</th><th>outcome</th><th>steps</th>
-<th>tokens in/out</th><th>cost</th><th>ms</th><th>at</th></tr></thead><tbody></tbody></table>
-<script>
-async function refresh() {
-  const m = await (await fetch("/metrics")).json();
-  document.getElementById("cards").innerHTML = [
-    ["runs", m.runs], ["p50 ms", m.latency_ms.p50], ["p95 ms", m.latency_ms.p95],
-    ["total cost", "$" + m.cost_usd.total], ["mean cost", "$" + m.cost_usd.mean_per_run],
-    ["tokens in", m.tokens.input], ["tokens out", m.tokens.output],
-  ].map(([label, value]) => `<div class="card"><b>${value}</b><span>${label}</span></div>`).join("");
-  document.querySelector("#runs tbody").innerHTML = m.last_runs.map(r =>
-    `<tr><td>${r.id}</td><td>#${r.ticket_id}</td><td>${r.outcome}</td><td>${r.steps}</td>
-     <td>${r.input_tokens}/${r.output_tokens}</td><td>$${r.cost_usd.toFixed(4)}</td>
-     <td>${r.duration_ms}</td><td>${r.created_at}</td></tr>`).join("");
-}
-refresh(); setInterval(refresh, 5000);
-
-// --- live feed (/events) — begin ---
-// The aggregate numbers above still poll; this ADDS the live half DASH-01 names.
-// Everything below renders frames off the PUBLIC feed. They are allowlisted by
-// project(), but `tool` is a model-chosen string that reaches this page verbatim,
-// so every value from a frame is written with textContent and never as markup.
-// That is the one rule this block may not break — a test greps this block for the
-// markup sinks and fails if one appears.
-const FEED_TYPES = ["usage", "resolution", "error", "tool_use", "tool_result",
-                    "guardrail", "notice", "text"];
-const feedEl = document.getElementById("feed");
-const feedStatus = document.getElementById("feed-status");
-const runNodes = new Map();
-
-function describe(f) {
-  if (f.type === "tool_use") return "-> " + f.tool;
-  if (f.type === "tool_result") return (f.is_error ? "x " : "<- ") + f.tool +
-    (f.denied_by ? " denied by " + f.denied_by : "");
-  if (f.type === "guardrail") return "guardrail " + f.guard + " -> " + f.action;
-  if (f.type === "usage") return "step " + f.steps + " · $" + f.cost_usd;
-  if (f.type === "resolution") return "resolved via " + f.via + " · $" + f.cost_usd;
-  if (f.type === "error") return "error · " + f.reason;
-  if (f.type === "notice") return "notice · " + f.kind + " · " + f.tool;
-  return f.type;
-}
-
-// Grouped by run_uid, which is why CR-03 stamps it: several runs are in flight at
-// once on a live demo, and a flat list interleaves them into nonsense.
-function runNode(f) {
-  let node = runNodes.get(f.run_uid);
-  if (!node) {
-    node = document.createElement("li");
-    node.dataset.uid = f.run_uid;
-    const head = document.createElement("b");
-    head.textContent = "ticket #" + f.ticket_id + " · run " +
-                       String(f.run_uid).slice(0, 8);
-    node.append(head);
-    runNodes.set(f.run_uid, node);
-    feedEl.prepend(node);
-    while (feedEl.children.length > 6) {
-      const gone = feedEl.lastElementChild;
-      runNodes.delete(gone.dataset.uid);
-      gone.remove();
-    }
-  }
-  return node;
-}
-
-function onFrame(ev) {
-  const f = JSON.parse(ev.data);
-  const line = document.createElement("div");
-  line.className = "step";
-  line.textContent = describe(f);
-  runNode(f).append(line);
-}
-
-const es = new EventSource("/events");
-es.addEventListener("open", () => { feedStatus.textContent = "live"; });
-// D-14: the runs already in flight when this tab connects, so a viewer joining a
-// quiet moment mid-run sees them rather than a blank list until the next step.
-es.addEventListener("snapshot", ev => {
-  const runs = JSON.parse(ev.data).runs || [];
-  feedStatus.textContent = runs.length
-    ? "live · in flight: " + runs.map(r => "#" + r.ticket_id).join(", ")
-    : "live · nothing running";
-});
-// Every frame carries an `event:` name, so a page listening only for the default
-// `message` event would receive nothing at all.
-FEED_TYPES.forEach(t => es.addEventListener(t, onFrame));
-// D-09 closes an idle stream on purpose and EventSource reconnects on its own, so a
-// disconnect is this page's normal resting state, not a fault. No console noise and
-// no error styling unless the browser has genuinely given up (readyState CLOSED).
-es.onerror = () => {
-  feedStatus.textContent = es.readyState === EventSource.CLOSED
-    ? "feed closed — reload to watch again"
-    : "live · reconnecting";
-};
-// --- live feed (/events) — end ---
-</script></body></html>"""
+_TEMPLATE_PATH = Path(__file__).parent / "templates" / "dashboard.html"
+# Read once at import (D-04), not per request: /dashboard is the public landing
+# surface and this would otherwise be a syscall per visitor. Not in lifespan either —
+# nothing here binds to a loop, and an import-time failure is the loud, early signal
+# that the template did not make it into the image. The path is relative to the
+# PACKAGE, not to a settings value: db_path and kb_dir are deployment-configurable
+# data, whereas the page is package code and travels with the wheel.
+DASHBOARD_HTML = _TEMPLATE_PATH.read_text(encoding="utf-8")
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -653,13 +760,23 @@ async def dashboard() -> str:
     return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
 
 
+# Exactly the fields the Ticket model declares, named for the same reason
+# _PUBLIC_RUN_COLUMNS and _DETAIL_RUN_COLUMNS are: `tickets` just grew `origin`, which is
+# deliberately NOT part of the API model, and a star select would have pushed it straight
+# into Ticket(**dict(row)) the moment the migration ran. What a route publishes is a list
+# someone wrote down, never whatever the table happens to hold today.
+_TICKET_COLUMNS = (
+    "id", "customer_email", "subject", "body", "status", "category", "created_at",
+)
+
+
 async def _get_ticket(ticket_id: int) -> Ticket:
     # fetchone() is called inside the offloaded callable, not after it: Database
     # materialises rows while its lock is held, and stepping the result back on the
     # event loop would put the read half a statement outside the thread it belongs to.
     row = await asyncio.to_thread(
         lambda: app.state.conn.execute(
-            "SELECT * FROM tickets WHERE id = ?", (ticket_id,)
+            f"SELECT {', '.join(_TICKET_COLUMNS)} FROM tickets WHERE id = ?", (ticket_id,)
         ).fetchone()
     )
     if row is None:

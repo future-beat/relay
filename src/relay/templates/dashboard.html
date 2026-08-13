@@ -1,0 +1,1064 @@
+<!doctype html>
+<html><head><title>Relay dashboard</title><style>
+body { font-family: ui-monospace, monospace; max-width: 900px; margin: 2rem auto;
+       padding: 0 1rem; color: #222; }
+h1 { font-size: 1.2rem; margin-bottom: .3rem; }
+h2 { font-size: 1rem; margin: 2rem 0 .4rem; }
+.sub { color: #666; font-size: .8rem; margin: 0 0 1.2rem; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+         gap: .8rem; }
+.card { border: 1px solid #ccc; border-radius: 8px; padding: .8rem 1.2rem; }
+.card b { display: block; font-size: 1.4rem; } .card span { color: #666; font-size: .8rem; }
+table { border-collapse: collapse; width: 100%; margin-top: .6rem; font-size: .85rem; }
+th, td { text-align: left; padding: .3rem .6rem; border-bottom: 1px solid #eee; }
+.demo { border: 1px solid #ccc; border-left: 4px solid #444; border-radius: 8px;
+        padding: .8rem 1.2rem; margin-bottom: 1.5rem; font-size: .85rem; }
+.demo code { background: #f4f4f4; padding: .1rem .3rem; border-radius: 4px; }
+.demo em { color: #666; font-style: normal; }
+.dist { margin: 1.2rem 0 0; font-size: .8rem; }
+.dist .row { display: grid; grid-template-columns: 8.5rem 1fr 3rem; align-items: center;
+             gap: .5rem; margin-bottom: .25rem; }
+.dist .track { background: #f0f0f0; border-radius: 4px; height: .8rem; }
+.dist .fill { background: #444; border-radius: 4px; height: .8rem; min-width: 1px; }
+.dist .n { text-align: right; color: #666; }
+.empty { color: #666; font-size: .8rem; }
+h3 { font-size: .8rem; font-weight: normal; color: #666; margin: 1rem 0 .2rem; }
+#charts svg { display: block; max-width: 100%; }
+.gauge-labels { font-size: .8rem; } .gauge-labels b { font-size: 1.1rem; }
+.gauge-note { color: #666; font-size: .75rem; margin: .2rem 0 0; }
+#feed-status { color: #666; font-size: .8rem; }
+#feed-list { list-style: none; padding: 0; margin: .6rem 0 0; font-size: .85rem; }
+#feed-list li { border: 1px solid #eee; border-radius: 6px; padding: .4rem .7rem;
+                margin: 0 0 .4rem; }
+#feed-list b { display: block; margin-bottom: .2rem; }
+#feed-list .step { color: #444; }
+button { font: inherit; cursor: pointer; }
+.drill-open { background: none; border: 0; padding: 0; color: #036; text-decoration: underline; }
+dialog#drill { max-width: 780px; width: 90%; border: 1px solid #ccc; border-radius: 10px;
+               padding: 1rem 1.2rem; font-size: .85rem; color: #222; }
+dialog#drill::backdrop { background: rgba(0, 0, 0, .35); }
+.drill-head { display: flex; justify-content: space-between; align-items: baseline; }
+.drill-head h2 { margin: 0 0 .4rem; }
+.drill-facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+               gap: .4rem; margin: .6rem 0 .8rem; }
+.drill-facts b { display: block; } .drill-facts span { color: #666; font-size: .75rem; }
+.badge { background: #f4f4f4; border-left: 3px solid #444; padding: .4rem .6rem;
+         margin: 0 0 .6rem; }
+.drill-ticket p { white-space: pre-wrap; background: #fafafa; padding: .4rem .6rem;
+                  border-radius: 6px; }
+.steps { list-style: none; padding: 0; margin: 0; }
+.steps .step { border-left: 2px solid #e2e2e2; padding: .1rem 0 .5rem .7rem; }
+.step-head { display: flex; gap: .5rem; align-items: baseline; }
+.step-head .seq { color: #999; } .step-head .kind { font-weight: bold; }
+.step-head .at { color: #666; margin-left: auto; font-size: .75rem; }
+.step .line { color: #333; }
+.chips { display: flex; flex-wrap: wrap; gap: .3rem; margin: .2rem 0; }
+.chip { background: #f0f0f0; border-radius: 10px; padding: .05rem .5rem; font-size: .75rem; }
+.chip.other { background: #fff3d6; }
+.chunks { margin: .3rem 0; }
+.chunk { display: grid; grid-template-columns: 9rem 1fr 3.5rem; gap: .4rem;
+         padding: .15rem .4rem; border-radius: 4px; font-size: .78rem; }
+.chunk .score { text-align: right; color: #666; }
+.chunk.cited { background: #eaf4ea; border-left: 3px solid #2c6e2c; }
+.chunk.cited .tag { color: #2c6e2c; font-weight: bold; }
+.chunk.uncited { background: #f7f7f7; border-left: 3px solid #ccc; }
+.chunk.uncited .tag { color: #888; }
+.raw { margin: .3rem 0 0; color: #444; font-size: .78rem; }
+.raw .line { word-break: break-all; }
+#try-it { border: 1px solid #ccc; border-radius: 10px; padding: .2rem 1.2rem 1rem; }
+#try-examples .chip { cursor: pointer; border: 1px solid #ddd; }
+#try-examples .chip.on { background: #444; color: #fff; border-color: #444; }
+.try-fields { display: grid; gap: .2rem; margin: .6rem 0 .2rem; }
+.try-fields label { color: #666; font-size: .75rem; }
+.try-fields input, .try-fields textarea { font: inherit; font-size: .85rem; width: 100%;
+    box-sizing: border-box; padding: .35rem .5rem; border: 1px solid #ccc;
+    border-radius: 6px; }
+.try-note { color: #666; font-size: .75rem; margin: .2rem 0 .6rem; }
+.try-bar { display: flex; gap: .6rem; align-items: center; font-size: .8rem; }
+.try-bar button { border: 1px solid #444; background: #444; color: #fff;
+    border-radius: 6px; padding: .35rem .9rem; }
+.try-bar button[disabled] { background: #999; border-color: #999; cursor: default; }
+#try-state { color: #666; }
+#try-stream { margin-top: .6rem; font-size: .8rem; }
+#try-stream .step { color: #333; border-left: 2px solid #e2e2e2; padding: .05rem .6rem; }
+.refusal { border: 1px solid #d8c48a; border-left: 4px solid #b8912f; background: #fdf8ec;
+    border-radius: 8px; padding: .6rem .9rem; }
+.refusal b { display: block; margin-bottom: .2rem; }
+.refusal p { margin: .2rem 0; }
+.refusal .resets { color: #665; }
+#feed-list li.mine { border-color: #444; }
+#feed-list .mine-tag { color: #036; font-size: .75rem; }
+</style></head><body>
+<header>
+<h1>Relay — agent runs</h1>
+<p class="sub">A support-triage agent, working tickets live. Cost, quality and every
+step it takes are on this page.</p>
+<div class="demo">
+Try it yourself — this key is published on purpose:
+<code>X-API-Key: __RELAY_DEMO_KEY__</code><br>
+<em>Deliberately limited: 5 runs/hour per IP, and the demo caps Claude spend at $5/day.</em>
+</div>
+</header>
+
+<section id="try-it">
+<h2>Try it — run a real ticket</h2>
+<p class="sub">Pick an example, edit it if you like, and send it. This runs for real
+against Claude with the key above — no sandbox, no canned answer — and the trace stays
+publicly readable for 30 days. Capped at 5 runs/hour per IP and a daily spend ceiling;
+if it refuses, that is the cost control, not a fault.</p>
+<div class="chips" id="try-examples"></div>
+<div class="try-fields">
+<label for="try-subject">subject</label>
+<input id="try-subject" type="text" autocomplete="off">
+<label for="try-body">what the customer wrote</label>
+<textarea id="try-body" rows="3"></textarea>
+</div>
+<p class="try-note" id="try-who"></p>
+<div class="try-bar">
+<button id="try-send" type="button">send it</button>
+<span id="try-state"></span>
+<span id="try-actions"></span>
+</div>
+<div id="try-stream"></div>
+</section>
+
+<section id="summary">
+<h2>Summary</h2>
+<div class="cards" id="cards"></div>
+<div class="dist" id="distribution"></div>
+</section>
+
+<section id="charts">
+<h2>Over time</h2>
+<div id="chart-cost"></div>
+<div id="chart-latency"></div>
+<div id="gauge"></div>
+</section>
+
+<section id="feed">
+<h2>Live feed <span id="feed-status">connecting</span></h2>
+<ul id="feed-list"></ul>
+</section>
+
+<section id="recent">
+<h2>Recent runs</h2>
+<table id="runs"><thead><tr><th>id</th><th>ticket</th><th>outcome</th><th>steps</th>
+<th>tokens in/out</th><th>cost</th><th>ms</th><th>at</th></tr></thead><tbody></tbody></table>
+</section>
+
+<dialog id="drill">
+<div class="drill-head"><h2 id="drill-title">Run</h2>
+<button id="drill-close" type="button">close</button></div>
+<div id="drill-envelope"></div>
+<div id="drill-steps"></div>
+</dialog>
+
+<script>
+// ONE RENDERING RULE, WHOLE FILE: every value that comes from the server is written
+// with textContent, and every node is created with createElement/createElementNS.
+// No markup sinks anywhere on this page — a test greps the served document for them.
+//
+// This rule used to be scoped to the live-feed block, because that was the only place
+// a model-chosen string (a tool name) reached the browser. It widened because the
+// drill-down and the Try-it form render model-influenced strings too, and a
+// block-scoped rule does not cover a block that has not been written yet. The
+// polling half below was rewritten onto DOM APIs rather than left alone, so nothing
+// new inherits the old habit by sitting next to it.
+
+// --- render helpers — begin ---
+function el(tag, attrs, text) {
+  const n = document.createElement(tag);
+  for (const k in attrs) {
+    if (k === "class") n.className = attrs[k];
+    else n.setAttribute(k, attrs[k]);
+  }
+  if (text !== undefined) n.textContent = text;   // textContent, always
+  return n;
+}
+
+function clear(node) {
+  while (node.firstChild) node.removeChild(node.firstChild);
+}
+// --- render helpers — end ---
+
+// --- metrics poll (/metrics) — begin ---
+// The aggregate half of the page: cards, the outcome distribution, the charts and the
+// gauge all come out of ONE poll of /metrics, whose numbers are computed in SQL
+// server-side. Nothing here re-derives a statistic in the browser — least of all the
+// budget, which has to be the gate's own arithmetic or the page promises money the
+// next request refuses (D-11).
+
+// Zero-filled server-side, so the order is ours and every bucket has a bar from the
+// first run onward: a chart that grows a bar the first time an outcome occurs reads
+// as broken rather than as an honest empty state.
+const OUTCOME_BUCKETS = [
+  "resolved", "escalated", "dry_run", "incomplete",
+  "budget_exceeded", "step_limit", "error",
+];
+
+function renderCards(m) {
+  const cards = [
+    ["runs", String(m.runs)],
+    ["p50 ms", String(m.latency_ms.p50)],
+    ["p95 ms", String(m.latency_ms.p95)],
+    ["total cost", "$" + m.cost_usd.total],
+    ["mean cost", "$" + m.cost_usd.mean_per_run],
+    ["tokens in", String(m.tokens.input)],
+    ["tokens out", String(m.tokens.output)],
+  ];
+  const host = document.getElementById("cards");
+  clear(host);
+  cards.forEach(([label, value]) => {
+    const card = el("div", { class: "card" });
+    card.append(el("b", {}, value), el("span", {}, label));
+    host.append(card);
+  });
+}
+
+function renderDistribution(distribution) {
+  const host = document.getElementById("distribution");
+  clear(host);
+  const counts = OUTCOME_BUCKETS.map(b => distribution[b] || 0);
+  const max = Math.max(1, ...counts);
+  if (counts.every(n => n === 0)) {
+    host.append(el("p", { class: "empty" }, "no runs yet — outcomes appear here"));
+    return;
+  }
+  OUTCOME_BUCKETS.forEach((bucket, i) => {
+    const row = el("div", { class: "row" });
+    const track = el("div", { class: "track" });
+    const fill = el("div", { class: "fill" });
+    // A bar is CSS, not markup: a width set through the style object, never an
+    // interpolated HTML string.
+    fill.style.width = (100 * counts[i] / max) + "%";
+    track.append(fill);
+    row.append(el("span", {}, bucket), track, el("span", { class: "n" },
+                                                 String(counts[i])));
+    host.append(row);
+  });
+}
+
+// The row's first cell: the control that opens that run's drill-down (DASH-03).
+// /metrics publishes run_uid per row (06-02) and it is the only handle GET /runs/{uid}
+// takes. A row written before phase 5 carries a null uid and gets PLAIN TEXT instead of
+// a control — a button that fetches nothing would render "no such run" and read as a
+// broken page rather than as history that predates step recording.
+function runCell(r) {
+  const cell = el("td", {});
+  if (!r.run_uid) {
+    cell.append(el("span", {}, String(r.id)));
+    return cell;
+  }
+  const open = el("button", { class: "drill-open", type: "button" }, String(r.id));
+  open.addEventListener("click", () => openDrill(r.run_uid));
+  cell.append(open);
+  return cell;
+}
+
+function renderRuns(runs) {
+  const body = document.querySelector("#runs tbody");
+  clear(body);
+  if (!runs.length) {
+    const row = el("tr", {});
+    row.append(el("td", { colspan: "8", class: "empty" }, "no runs yet"));
+    body.append(row);
+    return;
+  }
+  runs.forEach(r => {
+    const row = el("tr", {});
+    if (r.run_uid) row.dataset.uid = r.run_uid;
+    row.append(runCell(r));
+    [
+      "#" + r.ticket_id, r.outcome, String(r.steps),
+      r.input_tokens + "/" + r.output_tokens, "$" + r.cost_usd.toFixed(4),
+      String(r.duration_ms), r.created_at,
+    ].forEach(value => row.append(el("td", {}, value)));
+    body.append(row);
+  });
+}
+
+async function refresh() {
+  const m = await (await fetch("/metrics")).json();
+  renderCards(m);
+  renderDistribution(m.outcome_distribution);
+  // One poll feeds the cards, the bars, both charts and the gauge — D-05/D-09 keep
+  // this page on one data route, so no renderer here opens a fetch of its own.
+  renderCharts(m);
+  renderRuns(m.last_runs);
+}
+refresh(); setInterval(refresh, 5000);
+// --- metrics poll (/metrics) — end ---
+
+// --- charts (SVG) — begin ---
+// DASH-04: cost over time, latency over time, and the remaining daily budget — drawn
+// by hand with createElementNS. No chart library, no <script src>, no CDN and no build
+// step: this page is one file the server reads and substitutes a key into, and adding
+// a third-party script to the public landing surface would be a supply chain on the
+// one page whose whole job is credibility.
+const SVGNS = "http://www.w3.org/2000/svg";
+
+function svg(tag, attrs, text) {
+  const n = document.createElementNS(SVGNS, tag);
+  for (const k in attrs) n.setAttribute(k, attrs[k]);
+  if (text !== undefined) n.textContent = text;   // textContent, always
+  return n;
+}
+
+function frame(w, h) {
+  return svg("svg", { viewBox: "0 0 " + w + " " + h, width: "100%", height: String(h) });
+}
+
+const CHART_W = 640, CHART_H = 160, CHART_PAD = 24;
+
+// Daily cost: one bar per entry of m.daily. The server densifies that series, so an
+// idle Tuesday arrives as a zero bar rather than as a missing point, and the x axis is
+// a plain map with no date arithmetic in the browser.
+function renderCostChart(series) {
+  const host = document.getElementById("chart-cost");
+  clear(host);
+  host.append(el("h3", {}, "Cost per day"));
+  if (!series.length || series.every(d => d.runs === 0)) {
+    host.append(el("p", { class: "empty" },
+                   "no runs yet — bars appear as tickets arrive"));
+    return;
+  }
+  const w = CHART_W, h = CHART_H, pad = CHART_PAD;
+  const max = Math.max(1e-9, ...series.map(d => d.cost_usd));
+  const bw = (w - pad * 2) / series.length;
+  const root = frame(w, h);
+  series.forEach((d, i) => {
+    const bh = (h - pad * 2) * (d.cost_usd / max);
+    root.append(svg("rect", {
+      x: pad + i * bw + 1, y: h - pad - bh,
+      width: Math.max(bw - 2, 1), height: Math.max(bh, 0), fill: "#444",
+    }));
+  });
+  root.append(svg("text", { x: pad, y: 12, "font-size": "10", fill: "#666" },
+                  "peak $" + max.toFixed(4) + "/day"));
+  root.append(svg("text", { x: pad, y: h - 6, "font-size": "10", fill: "#666" },
+                  series[0].day));
+  root.append(svg("text", { x: w - pad, y: h - 6, "font-size": "10", fill: "#666",
+                            "text-anchor": "end" }, series[series.length - 1].day));
+  host.append(root);
+}
+
+// Daily p50/p95. Days with no runs carry a null percentile from the server (a zero
+// would draw a spike to the floor and read as "every run was instant"), so they are
+// skipped, and a segment is drawn only between adjacent days that both have a value —
+// a line straight across an idle week would be an invention.
+function renderLatencyChart(series) {
+  const host = document.getElementById("chart-latency");
+  clear(host);
+  host.append(el("h3", {}, "Latency per day (p50 / p95)"));
+  const points = series
+    .map((d, i) => ({ i: i, p50: d.p50_ms, p95: d.p95_ms }))
+    .filter(p => p.p50 !== null && p.p50 !== undefined);
+  if (!points.length) {
+    host.append(el("p", { class: "empty" },
+                   "no runs yet — timings appear after the first ticket"));
+    return;
+  }
+  const w = CHART_W, h = CHART_H, pad = CHART_PAD;
+  const max = Math.max(1, ...points.map(p => p.p95 || p.p50));
+  const step = (w - pad * 2) / Math.max(series.length - 1, 1);
+  const x = i => pad + i * step;
+  const y = v => h - pad - (h - pad * 2) * (v / max);
+  const root = frame(w, h);
+  [["p95", "#999"], ["p50", "#444"]].forEach(([key, colour]) => {
+    points.forEach((p, n) => {
+      const value = key === "p95" ? (p.p95 || p.p50) : p.p50;
+      const prev = points[n - 1];
+      if (prev && p.i - prev.i === 1) {
+        const prevValue = key === "p95" ? (prev.p95 || prev.p50) : prev.p50;
+        root.append(svg("line", {
+          x1: x(prev.i), y1: y(prevValue), x2: x(p.i), y2: y(value),
+          stroke: colour, "stroke-width": 2,
+        }));
+      }
+      root.append(svg("circle", { cx: x(p.i), cy: y(value), r: 2.5, fill: colour }));
+    });
+  });
+  root.append(svg("text", { x: pad, y: 12, "font-size": "10", fill: "#666" },
+                  "peak " + max + " ms"));
+  host.append(root);
+}
+
+// --- budget gauge — begin ---
+// D-11: the fraction is the SERVER's, read straight off /metrics.budget. It is not
+// re-derived from last_runs here and must not be: budget_snapshot includes the spend
+// RESERVED by runs still in flight, because that is what the gate compares before it
+// answers 503. A gauge summing committed rows would read low by up to
+// concurrency x max_run_cost_usd and promise budget the very next request refuses.
+function arcPath(cx, cy, r, fromDeg, toDeg) {
+  const p = deg => [cx + r * Math.cos(Math.PI * deg / 180),
+                    cy + r * Math.sin(Math.PI * deg / 180)];
+  const [x1, y1] = p(fromDeg), [x2, y2] = p(toDeg);
+  return "M " + x1 + " " + y1 + " A " + r + " " + r + " 0 " +
+         ((toDeg - fromDeg) > 180 ? 1 : 0) + " 1 " + x2 + " " + y2;
+}
+
+function renderGauge(budget) {
+  const host = document.getElementById("gauge");
+  clear(host);
+  host.append(el("h3", {}, "Daily budget"));
+  const spent = budget.spent_today_usd;
+  const ceiling = budget.daily_ceiling_usd;
+  const fraction = ceiling > 0 ? Math.min(1, Math.max(0, spent / ceiling)) : 0;
+  const w = 240, h = 130, cx = 120, cy = 110, r = 88;
+  const root = frame(w, h);
+  root.append(svg("path", { d: arcPath(cx, cy, r, 180, 360), fill: "none",
+                            stroke: "#eee", "stroke-width": 14 }));
+  if (fraction > 0) {
+    root.append(svg("path", {
+      d: arcPath(cx, cy, r, 180, 180 + 180 * fraction), fill: "none",
+      stroke: budget.exhausted ? "#a33" : "#444", "stroke-width": 14,
+    }));
+  }
+  host.append(root);
+  const labels = el("div", { class: "gauge-labels" });
+  labels.append(el("b", {}, "$" + spent + " / $" + ceiling));
+  labels.append(el("div", {}, "$" + budget.remaining_usd + " left today"));
+  labels.append(el("div", {}, "resets at " + budget.resets_at));
+  host.append(labels);
+  host.append(el("p", { class: "gauge-note" },
+                 "Includes runs in flight — this is the figure the spend gate compares,"
+                 + " reservations and all, so it can move while a run is working."));
+}
+// --- budget gauge — end ---
+
+function renderCharts(m) {
+  renderCostChart(m.daily);
+  renderLatencyChart(m.daily);
+  renderGauge(m.budget);
+}
+// --- charts (SVG) — end ---
+
+// --- drill-down (/runs/{uid}) — begin ---
+// DASH-03 / D-05: one run's whole trace, rendered into a native <dialog> on this page
+// from the public JSON at GET /runs/{uid}. No route split, no second page, no library —
+// the panel is a client-rendered view of server-redacted JSON, and the redaction is the
+// server's (06-03's allowlist, 06-04's route).
+//
+// THE RENDERING RULE THIS BLOCK INHERITS — stated here on purpose rather than absorbed
+// from the block above it: every value below arrives from a public JSON route and is
+// written with textContent through el(). This is the WIDEST surface model-influenced
+// strings reach on the page. The tool name is clamped to the registry server-side and
+// the argument keys are intersected with each tool's declared schema, but doc ids,
+// `denied_by`, guard names, error reasons and — for a run the visitor submitted — their
+// own words all land here, and this page treats every one of them as untrusted data.
+//
+// It also never asks the server for more than it offered. Which runs are shown in
+// detail is decided server-side from tickets.origin; there is no parameter, header or
+// toggle on this page that could ask otherwise, and adding one would teach the next
+// author that asking works.
+const drillEl = document.getElementById("drill");
+const drillTitle = document.getElementById("drill-title");
+const drillFacts = document.getElementById("drill-envelope");
+const drillSteps = document.getElementById("drill-steps");
+document.getElementById("drill-close").addEventListener("click", () => drillEl.close());
+
+// A missing number renders as a dash. Never 0, and never the word Python prints for an
+// absent value: a row written before the elapsed_ms migration did not take zero
+// milliseconds, and saying it did would be an invention a visitor cannot check.
+function dash(v) { return (v === null || v === undefined) ? "—" : String(v); }
+function ms(v) { return (v === null || v === undefined) ? "—" : String(v) + " ms"; }
+
+function drillNotice(text) {
+  clear(drillFacts);
+  clear(drillSteps);
+  drillFacts.append(el("p", { class: "empty" }, text));
+}
+
+async function openDrill(uid) {
+  if (!uid) return;
+  clear(drillFacts);
+  clear(drillSteps);
+  drillTitle.textContent = "Run " + String(uid).slice(0, 8);
+  drillFacts.append(el("p", { class: "empty" }, "loading the trace…"));
+  if (!drillEl.open) drillEl.showModal();
+  let resp;
+  try {
+    resp = await fetch("/runs/" + encodeURIComponent(uid));
+  } catch (err) {
+    drillNotice("the trace could not be fetched — the connection failed. Try again.");
+    return;
+  }
+  if (!resp.ok) {
+    // The route emits exactly ONE 404 and it means the uid is unknown. That is a
+    // different sentence from "swept", which is a 200 about a run that really happened.
+    drillNotice(resp.status === 404
+      ? "no such run — this service never issued that id"
+      : "the trace is unavailable right now (HTTP " + resp.status + ")");
+    return;
+  }
+  renderDrill(await resp.json());
+}
+
+function renderDrill(d) {
+  clear(drillFacts);
+  clear(drillSteps);
+  drillTitle.textContent = "Ticket #" + d.ticket_id + " · run " +
+                           String(d.run_uid).slice(0, 8);
+  if (d.demo) {
+    drillFacts.append(el("p", { class: "badge" },
+      "You submitted this run, so it is shown in detail — including the text you wrote."));
+  }
+  // `run` is null while a run is in flight (its summary row is written in the stream's
+  // finally), so every fact below asks before it reads.
+  const run = d.run;
+  const facts = [
+    ["outcome", run ? run.outcome : "still working"],
+    ["model", run ? run.model : "—"],
+    ["cost", run ? "$" + run.cost_usd : "—"],
+    ["duration", run ? ms(run.duration_ms) : "—"],
+    ["steps", run ? dash(run.steps) : String(d.steps.length)],
+    ["tokens in/out", run ? run.input_tokens + "/" + run.output_tokens : "—"],
+    ["started", run ? run.created_at : "—"],
+  ];
+  const grid = el("div", { class: "drill-facts" });
+  facts.forEach(([label, value]) => {
+    const cell = el("div", {});
+    cell.append(el("b", {}, value), el("span", {}, label));
+    grid.append(cell);
+  });
+  drillFacts.append(grid);
+  // Sent only for a run the visitor submitted themselves (D-02) — which is exactly why
+  // it can be shown: they wrote it.
+  if (d.ticket) {
+    const box = el("div", { class: "drill-ticket" });
+    box.append(el("h3", {}, "The ticket you submitted"));
+    box.append(el("b", {}, d.ticket.subject));
+    box.append(el("p", {}, d.ticket.body));
+    drillFacts.append(box);
+  }
+  renderDrillBody(d);
+}
+
+// The four states 06-04's absence matrix answers with a 200. Each one says what it
+// knows and what it does not; not one of them is an empty box, because a panel that
+// renders nothing reads as a broken page rather than as retention or a run in flight.
+function renderDrillBody(d) {
+  if (d.status === "in_flight") {
+    drillSteps.append(el("p", { class: "empty" },
+      "This run is still working. The steps below are the ones recorded so far, and the"
+      + " totals appear when it ends."));
+  } else if (d.status === "swept") {
+    // The SERVER's note, which names the retention window. A window length written
+    // here would quietly contradict the setting the sweep actually uses.
+    drillSteps.append(el("p", { class: "empty" }, d.note ||
+      "The step detail for this run has been swept — it is kept for a limited window."));
+  } else if (d.status === "unrecorded") {
+    drillSteps.append(el("p", { class: "empty" },
+      "This run has no stored steps: it ran before step recording existed, or its"
+      + " record was never written. The totals above are what survived."));
+  } else if (d.status === "complete" && !d.steps.length) {
+    drillSteps.append(el("p", { class: "empty" }, "this run recorded no steps"));
+  }
+  renderSteps(d.steps);
+}
+
+// The type names the server sends are terse; these are what a visitor reads. The map
+// is a display concern only — the dispatch below is on the server's own strings.
+const STEP_LABELS = {
+  usage: "usage", text: "reasoning", tool_use: "tool call", tool_result: "tool result",
+  guardrail: "guardrail", notice: "notice", resolution: "resolution", error: "error",
+};
+
+// The ordered trace. `seq` carries the causal order and `elapsed_ms` the offset from
+// the run's start; a gap in seq is expected (the server drops an unreadable row rather
+// than failing a whole run's history), so nothing here indexes by it.
+function renderSteps(steps) {
+  const list = el("ol", { class: "steps" });
+  steps.forEach(s => {
+    const li = el("li", { class: "step" });
+    const head = el("div", { class: "step-head" });
+    head.append(el("span", { class: "seq" }, "#" + dash(s.seq)));
+    head.append(el("span", { class: "kind" }, STEP_LABELS[s.type] || s.type));
+    head.append(el("span", { class: "at" }, ms(s.elapsed_ms)));
+    li.append(head);
+    renderStepBody(s, li);
+    renderRawDetail(s, li);
+    list.append(li);
+  });
+  drillSteps.append(list);
+}
+
+function line(host, text, cls) {
+  host.append(el("div", { class: cls || "line" }, text));
+}
+
+// One branch per published type. All eight are here on purpose: a type with no branch
+// renders as a bare timed row, which looks deliberate and is not — the guardrail step
+// in particular IS the prompt-injection story, and losing it would cost the demo its
+// best moment with nothing failing.
+function renderStepBody(s, host) {
+  if (s.type === "tool_use") {
+    line(host, "-> " + s.tool);
+    // KEYS, never values. This is what the server sent: each key is intersected with
+    // the tool's declared schema server-side, and whatever that excluded arrives as a
+    // count — a number cannot carry a payload.
+    const chips = el("div", { class: "chips" });
+    (s.arg_keys || []).forEach(k => chips.append(el("span", { class: "chip" }, k)));
+    if (s.unknown_arg_count) {
+      chips.append(el("span", { class: "chip other" },
+                     "+" + s.unknown_arg_count + " undeclared"));
+    }
+    host.append(chips);
+  } else if (s.type === "tool_result") {
+    line(host, (s.is_error ? "x " : "<- ") + s.tool +
+               (s.denied_by ? " · denied by " + s.denied_by : "") +
+               " · " + ms(s.duration_ms));
+    if (s.results) renderChunks(s.results, host);
+    if (s.reply_id) line(host, "reply " + s.reply_id + " · " + s.status);
+    if (s.escalation_id) line(host, "escalation " + s.escalation_id + " · " + s.status);
+    if (s.category) line(host, "category " + s.category);
+  } else if (s.type === "guardrail") {
+    line(host, "guard " + s.guard + " -> " + s.action + " on " + s.tool);
+    // The two ids ARE the payoff: a ticket body that named another ticket, and the
+    // guard that refused to act on it.
+    if (s.expected_ticket_id || s.supplied_ticket_id) {
+      line(host, "expected ticket #" + dash(s.expected_ticket_id) +
+                 ", the model supplied #" + dash(s.supplied_ticket_id));
+    }
+    if (s.missing_count) {
+      line(host, s.missing_count + " citation(s) the reply claimed but never retrieved");
+    }
+  } else if (s.type === "notice") {
+    line(host, "notice · " + s.kind + " on " + s.tool + " · " + s.cause);
+    line(host, "retrieval mode " + dash(s.retrieval_mode) +
+               " · " + dash(s.result_count) + " results");
+  } else if (s.type === "usage") {
+    line(host, "step " + dash(s.steps) + " · " + dash(s.input_tokens) + " in / " +
+               dash(s.output_tokens) + " out · $" + dash(s.cost_usd));
+  } else if (s.type === "resolution") {
+    line(host, "resolved via " + s.via + " · " + dash(s.steps) + " steps · $" +
+               dash(s.cost_usd));
+  } else if (s.type === "error") {
+    // `reason` is enumerated and `error_type` is the API's own class name. The error
+    // MESSAGE is not published — it echoes model output and ticket text — so there is
+    // nothing here to show and nothing here to ask for.
+    line(host, "error · " + s.reason +
+               (s.status ? " · HTTP " + s.status : "") +
+               (s.error_type ? " · " + s.error_type : ""));
+  } else if (s.type === "text") {
+    line(host, dash(s.char_count) + " characters of reasoning");
+  }
+}
+
+// The grounding, rendered as the SERVER decided it. `cited` is stamped per result by
+// project_run_detail using the citation guard's own normalisation, so the highlight and
+// the control that enforces it cannot disagree. Nothing here re-derives that comparison
+// — a view that contradicts its control is worse than no view at all.
+function renderChunks(results, host) {
+  if (!results.length) {
+    line(host, "no chunks retrieved", "line empty");
+    return;
+  }
+  const box = el("div", { class: "chunks" });
+  results.forEach(r => {
+    const cited = r.cited === true;
+    const chunk = el("div", { class: cited ? "chunk cited" : "chunk uncited" });
+    chunk.append(el("span", { class: "tag" },
+                    cited ? "cited in the reply" : "retrieved, not cited"));
+    chunk.append(el("span", { class: "doc" }, r.doc + " · " + r.id));
+    chunk.append(el("span", { class: "score" }, dash(r.score)));
+    box.append(chunk);
+  });
+  host.append(box);
+}
+
+// D-02's exception, rendered: for a run the visitor submitted themselves, the server
+// also sends the raw tool input, the raw result, the model's prose and the citations a
+// guard refused. Secondary and collapsed — the trace above is the story, this is the
+// receipt. Every field is optional and asked for by name, so a redacted run renders
+// with no empty holes where these would have been.
+function renderRawDetail(s, host) {
+  const raw = [];
+  if (s.input !== undefined) raw.push(["input", s.input]);
+  if (s.result !== undefined) raw.push(["result", s.result]);
+  if (s.text !== undefined) raw.push(["text", s.text]);
+  if (s.missing_citations !== undefined) raw.push(["invented citations", s.missing_citations]);
+  if (!raw.length) return;
+  const box = el("details", { class: "raw" });
+  box.append(el("summary", {}, "raw — your own run"));
+  raw.forEach(([label, value]) => {
+    box.append(el("div", { class: "line" }, label + ": " +
+      (typeof value === "string" ? value : JSON.stringify(value))));
+  });
+  host.append(box);
+}
+// --- drill-down (/runs/{uid}) — end ---
+
+// --- try it — begin ---
+// DASH-05 / D-06 / D-07: the "and run it themselves" half of this page. Three prefilled
+// examples, editable before sending, submitted with the PUBLISHED demo key — the same
+// two calls scripts/demo.sh makes, against the same perimeter, at the same cost. Not a
+// dry run: the reply or the escalation landing in the drill-down is the payoff, and a
+// demo that only pretends to run is not evidence of anything.
+const DEMO_KEY = "__RELAY_DEMO_KEY__";
+// The page is served to anonymous visitors on a deployment that may have configured no
+// keys at all (two shipped tests do exactly that), and the whole page is one script: a
+// throw during setup here would take the feed, the charts and the drill-down with it.
+const TRY_CONFIGURED = DEMO_KEY !== "(not configured)";
+
+// Lifted verbatim from evals/golden.jsonl (refund-monthly, rate-limits-pro,
+// password-reset) — already grounded in kb/, already covering both terminal actions
+// (one escalation, two replies), and already measured by the eval suite. A paraphrase
+// here would demo something nothing verifies.
+//
+// The address is PINNED per example and there is deliberately no field for it. The
+// seeded customers are the only rows lookup_customer can find, and — because a
+// demo-origin run's drill-down is full fidelity (D-02) and publicly readable for the
+// retention window — a typed address would let one visitor publish another person's
+// identifier into a 30-day world-readable record, with this form as the mechanism
+// (T-06-27).
+const TRY_EXAMPLES = [
+  {
+    label: "billing",
+    expect: "expect an escalation — billing.md says refunds need a human",
+    customer_email: "mia@datalane.ai",
+    subject: "Refund for yesterday's charge",
+    body: "I was charged for my monthly Pro subscription yesterday but meant to cancel. Can I get a refund?",
+  },
+  {
+    label: "technical",
+    expect: "expect a reply citing api.md#rate-limits",
+    customer_email: "liam@brightco.io",
+    subject: "What are my API rate limits?",
+    body: "I'm building an integration and want to know how many requests per minute my plan allows.",
+  },
+  {
+    label: "how-to",
+    expect: "expect a reply citing account.md#password-reset",
+    customer_email: "noah@freetier.dev",
+    subject: "Can't remember my password",
+    body: "I forgot my password and can't log in. Can you reset it for me?",
+  },
+];
+
+const tryExamplesEl = document.getElementById("try-examples");
+const trySubject = document.getElementById("try-subject");
+const tryBody = document.getElementById("try-body");
+const tryWho = document.getElementById("try-who");
+const trySend = document.getElementById("try-send");
+const tryState = document.getElementById("try-state");
+const tryActions = document.getElementById("try-actions");
+const tryStream = document.getElementById("try-stream");
+let tryEmail = TRY_EXAMPLES[0].customer_email;
+
+// Selecting an example FILLS the fields rather than replacing them: D-06 is "prefilled
+// and editable", so what gets sent is whatever the fields hold at submit time, not the
+// example's frozen copy.
+function chooseExample(i) {
+  const ex = TRY_EXAMPLES[i];
+  trySubject.value = ex.subject;
+  tryBody.value = ex.body;
+  tryEmail = ex.customer_email;
+  tryWho.textContent = "Sent as the seeded customer " + ex.customer_email + " · " +
+                       ex.expect;
+  Array.prototype.forEach.call(tryExamplesEl.children, (chip, n) => {
+    chip.className = n === i ? "chip on" : "chip";
+  });
+}
+
+function renderExamples() {
+  clear(tryExamplesEl);
+  TRY_EXAMPLES.forEach((ex, i) => {
+    const chip = el("button", { class: "chip", type: "button" },
+                    ex.label + " · " + ex.subject);
+    chip.addEventListener("click", () => chooseExample(i));
+    tryExamplesEl.append(chip);
+  });
+}
+
+function setupTryIt() {
+  renderExamples();
+  chooseExample(0);
+  if (!TRY_CONFIGURED) {
+    // Disabled WITH copy, and the copy says which of the two it is: a dead button and
+    // silence reads as a broken page, which is the opposite of what this page is for.
+    trySend.disabled = true;
+    trySubject.disabled = true;
+    tryBody.disabled = true;
+    tryState.textContent = "This deployment publishes no demo key, so the form is"
+      + " read-only. Everything else on this page is live.";
+    return;
+  }
+  trySend.addEventListener("click", submitTryIt);
+}
+
+// The two calls scripts/demo.sh makes, in the same order and against the same
+// perimeter: create the ticket, then run it. What is sent is what the FIELDS hold, so
+// an edited example is what the agent actually sees.
+async function submitTryIt() {
+  trySend.disabled = true;
+  clear(tryStream);
+  clear(tryActions);
+  tryState.textContent = "creating the ticket…";
+  let created;
+  try {
+    created = await fetch("/tickets", {
+      method: "POST",
+      headers: { "X-API-Key": DEMO_KEY, "Content-Type": "application/json" },
+      body: JSON.stringify({
+        customer_email: tryEmail,
+        subject: trySubject.value,
+        body: tryBody.value,
+      }),
+    });
+  } catch (err) {
+    tryFailed("the ticket could not be sent — the connection failed. Try again.");
+    return;
+  }
+  // /tickets has its own allowance (demo_create_limit), so a refusal can land here and
+  // not only on the run itself.
+  if (!created.ok) { await refuse(created); return; }
+  const ticket = await created.json();
+  tryState.textContent = "ticket #" + ticket.id + " — working…";
+  await streamRun(ticket.id);
+  trySend.disabled = false;
+}
+
+// The run, streamed. `fetch` and not EventSource, and the reason is a hard limit rather
+// than a preference: EventSource takes only (url, {withCredentials}) — it cannot POST
+// and it cannot set a header, so it can neither start a run nor present the key. The
+// ambient feed below still uses it, because that IS a keyless GET.
+async function streamRun(ticketId) {
+  let res;
+  try {
+    res = await fetch("/tickets/" + ticketId + "/process", {
+      method: "POST",
+      headers: { "X-API-Key": DEMO_KEY },
+    });
+  } catch (err) {
+    tryFailed("the run could not be started — the connection failed. Try again.");
+    return;
+  }
+  if (!res.ok) { await refuse(res); return; }
+  // The only way this page learns which run is its own. Same-origin, so the header
+  // needs no CORS allowlist; minted server-side and returned to THIS submitter, so the
+  // badge below cannot be claimed by anyone else (T-06-30).
+  const uid = res.headers.get("X-Relay-Run-Uid");
+  if (uid) offerTheTrace(uid);
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let cut;
+    // Frames are "\n\n"-delimited and arrive split across chunk boundaries, so the tail
+    // stays in the buffer until its terminator turns up. A regex over the whole body
+    // would only produce anything once the stream ended — which is the opposite of the
+    // thing being demonstrated.
+    while ((cut = buffer.indexOf("\n\n")) !== -1) {
+      const frame = buffer.slice(0, cut);
+      buffer = buffer.slice(cut + 2);
+      let name = "message", data = "";
+      for (const part of frame.split("\n")) {
+        if (part.startsWith("event: ")) name = part.slice(7);
+        else if (part.startsWith("data: ")) data += part.slice(6);
+      }
+      if (data) onTryFrame(name, JSON.parse(data), uid);
+    }
+  }
+  tryState.textContent = uid ? "run finished" : "run finished (no run id returned)";
+}
+
+// This stream is FULL FIDELITY — it belongs to the caller who created the ticket — so
+// everything here is model-influenced text and every value is written with textContent.
+function onTryFrame(name, data, uid) {
+  if (uid) badgeOwnRun(uid);
+  if (name === "done") return;
+  const text = describeOwn(name, data);
+  if (text === null) return;
+  tryStream.append(el("div", { class: "step" }, text));
+  tryStream.scrollTop = tryStream.scrollHeight;
+}
+
+function describeOwn(name, d) {
+  if (name === "tool_use") return "-> " + d.tool;
+  if (name === "tool_result") return (d.is_error ? "x " : "<- ") + d.tool;
+  if (name === "guardrail") return "guardrail " + d.guard + " -> " + d.action +
+                                   " on " + d.tool;
+  if (name === "notice") return "notice · " + d.kind + " · " + d.tool;
+  if (name === "text") return "thinking: " + d.text;
+  if (name === "usage") return "step " + d.steps + " · $" + d.cost_usd;
+  if (name === "resolution") return "resolved via " + d.via + " · $" + d.cost_usd;
+  // An in-stream refusal: a drain landed mid-request, or a step could not be recorded.
+  // The server writes the copy for both, and it is a state, not a stack trace.
+  if (name === "error") {
+    tryStream.append(el("p", { class: "refusal" },
+                        d.note || "the run stopped: " + d.reason));
+    return null;
+  }
+  return name;
+}
+
+// The visitor's own run, badged where the PUBLIC feed shows it — and left in that feed
+// rather than hidden from it. The same run is on this page twice at once: in full above
+// and redacted below. Seeing both is the security story rendered as an interface, and
+// suppressing one of them would throw that away to avoid a duplicate.
+function badgeOwnRun(uid) {
+  const node = runNodes.get(uid);
+  if (!node || node.dataset.mine === "yes") return;
+  node.dataset.mine = "yes";
+  node.className = "mine";
+  node.append(el("div", { class: "mine-tag" },
+                 "your run — redacted here, in full above"));
+}
+
+// Full fidelity when it opens, because the ticket was CREATED with the demo key (D-02).
+// The page does not ask for that and could not: the decision is the ticket's origin,
+// read server-side.
+function offerTheTrace(uid) {
+  clear(tryActions);
+  const open = el("button", { class: "drill-open", type: "button" },
+                  "see the full trace");
+  open.addEventListener("click", () => openDrill(uid));
+  tryActions.append(open);
+}
+
+function tryFailed(text) {
+  clear(tryStream);
+  tryState.textContent = "";
+  tryStream.append(el("p", { class: "refusal" }, text));
+  trySend.disabled = false;
+}
+
+// D-08: a refusal is a designed STATE, not an error. The rate limiter and the budget
+// ceiling both author their own copy, and the budget one computes its own reset instant
+// — this reads both back out and renders them, so what a visitor is told is exactly
+// what the control decided. Rate-limit and budget details are objects; an auth refusal
+// on an unconfigured deployment is a plain string, and both shapes land here.
+async function refuse(res) {
+  let detail = null;
+  try {
+    const body = await res.json();
+    detail = (body && body.detail !== undefined) ? body.detail : body;
+  } catch (err) {
+    detail = null;
+  }
+  renderRefusal(res.status, detail);
+  trySend.disabled = false;
+}
+
+function renderRefusal(status, detail) {
+  clear(tryStream);
+  clear(tryActions);
+  tryState.textContent = "";
+  const box = el("div", { class: "refusal" });
+  box.append(el("b", {}, status === 503
+    ? "the demo has spent its budget for today"
+    : status === 429
+      ? "the demo's rate limit stopped this run"
+      : "this run was refused"));
+  const note = (typeof detail === "string") ? detail : (detail && detail.note);
+  box.append(el("p", {}, note ||
+                 "the service refused this request (HTTP " + status + ")"));
+  // The SERVER's instant, printed as it sent it. Recomputing midnight here would put a
+  // second, disagreeing answer on the page — in the visitor's local timezone, against a
+  // ceiling that resets at 00:00 UTC.
+  if (detail && detail.resets_at) {
+    box.append(el("p", { class: "resets" }, "resets at " + detail.resets_at));
+  }
+  if (detail && detail.retry_after_seconds) {
+    box.append(el("p", { class: "resets" },
+                   "try again in " + detail.retry_after_seconds + "s"));
+  }
+  box.append(el("p", { class: "resets" },
+                 "This is the cost control working: the cap is what keeps the demo"
+                 + " open to everyone, and it is the same one the metrics above show."));
+  tryStream.append(box);
+}
+
+setupTryIt();
+// --- try it — end ---
+
+// --- live feed (/events) — begin ---
+// The aggregate numbers above still poll; this ADDS the live half DASH-01 names.
+// Everything below renders frames off the PUBLIC feed. They are allowlisted by
+// project(), but `tool` is a model-chosen string that reaches this page verbatim,
+// so every value from a frame is written with textContent and never as markup.
+// That is the one rule this block may not break — a test greps this block for the
+// markup sinks and fails if one appears.
+const FEED_TYPES = ["usage", "resolution", "error", "tool_use", "tool_result",
+                    "guardrail", "notice", "text"];
+const feedEl = document.getElementById("feed-list");
+const feedStatus = document.getElementById("feed-status");
+const runNodes = new Map();
+
+function describe(f) {
+  if (f.type === "tool_use") return "-> " + f.tool;
+  if (f.type === "tool_result") return (f.is_error ? "x " : "<- ") + f.tool +
+    (f.denied_by ? " denied by " + f.denied_by : "");
+  if (f.type === "guardrail") return "guardrail " + f.guard + " -> " + f.action;
+  if (f.type === "usage") return "step " + f.steps + " · $" + f.cost_usd;
+  if (f.type === "resolution") return "resolved via " + f.via + " · $" + f.cost_usd;
+  if (f.type === "error") return "error · " + f.reason;
+  if (f.type === "notice") return "notice · " + f.kind + " · " + f.tool;
+  return f.type;
+}
+
+// Grouped by run_uid, which is why CR-03 stamps it: several runs are in flight at
+// once on a live demo, and a flat list interleaves them into nonsense.
+function runNode(f) {
+  let node = runNodes.get(f.run_uid);
+  if (!node) {
+    node = document.createElement("li");
+    node.dataset.uid = f.run_uid;
+    const head = document.createElement("b");
+    head.textContent = "ticket #" + f.ticket_id + " · run " +
+                       String(f.run_uid).slice(0, 8);
+    node.append(head);
+    // The frames already carry the uid — which is why CR-03 stamps it — and
+    // GET /runs/{uid} answers status "in_flight" for a run whose summary row does not
+    // exist yet. So a run is drillable WHILE it works, not only once it lands in the
+    // table below. An addition to this block and nothing else: everything else in here
+    // is asserted by a shipped Phase-5 test.
+    const open = el("button", { class: "drill-open", type: "button" }, "open trace");
+    open.addEventListener("click", () => openDrill(f.run_uid));
+    node.append(open);
+    runNodes.set(f.run_uid, node);
+    feedEl.prepend(node);
+    while (feedEl.children.length > 6) {
+      const gone = feedEl.lastElementChild;
+      runNodes.delete(gone.dataset.uid);
+      gone.remove();
+    }
+  }
+  return node;
+}
+
+function onFrame(ev) {
+  const f = JSON.parse(ev.data);
+  const line = document.createElement("div");
+  line.className = "step";
+  line.textContent = describe(f);
+  runNode(f).append(line);
+}
+
+const es = new EventSource("/events");
+es.addEventListener("open", () => { feedStatus.textContent = "live"; });
+// D-14: the runs already in flight when this tab connects, so a viewer joining a
+// quiet moment mid-run sees them rather than a blank list until the next step.
+es.addEventListener("snapshot", ev => {
+  const runs = JSON.parse(ev.data).runs || [];
+  feedStatus.textContent = runs.length
+    ? "live · in flight: " + runs.map(r => "#" + r.ticket_id).join(", ")
+    : "live · nothing running";
+});
+// Every frame carries an `event:` name, so a page listening only for the default
+// `message` event would receive nothing at all.
+FEED_TYPES.forEach(t => es.addEventListener(t, onFrame));
+// D-09 closes an idle stream on purpose and EventSource reconnects on its own, so a
+// disconnect is this page's normal resting state, not a fault. No console noise and
+// no error styling unless the browser has genuinely given up (readyState CLOSED).
+es.onerror = () => {
+  feedStatus.textContent = es.readyState === EventSource.CLOSED
+    ? "feed closed — reload to watch again"
+    : "live · reconnecting";
+};
+// --- live feed (/events) — end ---
+</script></body></html>

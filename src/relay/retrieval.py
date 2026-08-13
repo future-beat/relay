@@ -125,6 +125,29 @@ def slug(heading: str) -> str:
     return "-".join(_WORD_RE.findall(heading.lower()))
 
 
+def normalise_citation(value: str) -> str:
+    """The one normalisation a citation is compared under. Case- and space-insensitive.
+
+    Every id this module mints is already lowercase — a filename plus a `slug()` — so
+    drift in how the model retypes one it was shown is a formatting difference, not a
+    fabricated source. Stripping and lowering is therefore the whole of it.
+
+    It lives here, beside `slug` and the `{doc}#{heading}` id shape those two build,
+    because it has exactly TWO callers and they must never disagree:
+
+    - `agent._execute_guarded`'s citation guard (the CONTROL): the accept-set it
+      builds from this run's `search_docs` hits, and each citation it checks against it.
+    - `events.project_run_detail`'s cited-vs-not (the VIEW OF THE CONTROL): which
+      retrieved chunk the drill-down highlights as actually cited.
+
+    Two open-coded copies would pass every test either half owns, and diverge silently
+    the first time one is widened. An audit view that contradicts the control it audits
+    is worse than no audit view: it says "this reply cited nothing" about a citation the
+    guard accepted, and a reader has no way to tell which of the two is lying.
+    """
+    return value.strip().lower()
+
+
 @dataclass(frozen=True)
 class Doc:
     doc: str

@@ -265,17 +265,43 @@ def purge_expired_run_events(conn: Database, *, retention_days: int) -> int:
     return max(deleted, 0)
 
 
+def _add_column_if_missing(conn: Database, table: str, column: str, decl: str) -> None:
+    """Idempotent ALTER for a table that already exists on the live volume (D-13).
+
+    The table already exists on the live Fly volume, and CREATE TABLE IF NOT EXISTS does
+    not add columns to a table it declines to create — adding the column to the DDL above
+    would be a silent no-op in production only: no error, no signal, and every read of it
+    returning NULL. So the column is added explicitly here instead. An ALTER is not
+    idempotent (a second one raises "duplicate column name"), and init_db runs on every
+    boot, so the PRAGMA guard is what makes the re-run safe. Legacy rows keep NULL.
+
+    Deliberately the ONLY such statement in this module: three columns now take this
+    path, and an open-coded fourth is how one of them ends up unguarded.
+
+    (WR-08's check-then-act race between the PRAGMA and the ALTER is deliberately
+    deferred: single machine, single writer, and init_db runs before the app serves.)
+    """
+    # `table`, `column` and `decl` are module-local literals from init_db below — never
+    # request-derived, never user-supplied — so these f-strings are not an injection
+    # site. Bound parameters are not accepted for identifiers in DDL anyway.
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+
+
 def init_db(conn: Database) -> None:
     conn.executescript(SCHEMA)
-    # `runs` already exists on the live Fly volume, and CREATE TABLE IF NOT EXISTS does
-    # not add columns to a table it declines to create — adding run_uid to the DDL above
-    # would be a silent no-op in production only: no error, no signal, and every event
-    # join returning NULL. So the column is added explicitly. ALTER TABLE is not
-    # idempotent (a second one raises "duplicate column name"), and init_db runs on every
-    # boot, so the PRAGMA guard is what makes the re-run safe. Legacy rows keep NULL.
-    cols = {r["name"] for r in conn.execute("PRAGMA table_info(runs)").fetchall()}
-    if "run_uid" not in cols:
-        conn.execute("ALTER TABLE runs ADD COLUMN run_uid TEXT")
+    # Columns added by migration, not by the DDL above — see _add_column_if_missing for
+    # why, and keep them out of SCHEMA so a fresh DB and the live volume take one path.
+    _add_column_if_missing(conn, "runs", "run_uid", "TEXT")
+    # Per-step millisecond offset from the run's start, stamped by RunRecorder. created_at
+    # is datetime('now') — whole seconds — so it cannot carry a step timing (phase 6).
+    _add_column_if_missing(conn, "run_events", "elapsed_ms", "INTEGER")
+    # 'demo' | 'owner' | NULL. Which tier created the ticket, decided server-side, and the
+    # only input to the drill-down's full-fidelity exception (D-02). NULL is a legacy row
+    # and reads as NOT demo — redacted. Fail-closed: the default of an absent marker must
+    # be the safe one, so a row nobody classified can never disclose raw tool payloads.
+    _add_column_if_missing(conn, "tickets", "origin", "TEXT")
     existing = conn.execute("SELECT COUNT(*) FROM customers").fetchone()[0]
     if existing == 0:
         conn.executemany(

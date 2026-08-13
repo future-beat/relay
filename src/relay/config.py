@@ -149,5 +149,24 @@ class Settings(BaseSettings):
     # it carries no message content and /metrics is built from it.
     events_retention_days: int = 30
 
+    # Dashboard experience (phase 6). All defaulted, same posture as phase 5: the routes
+    # these feed are public reads, so nothing here has to be configured to deploy.
+    #
+    # The per-run drill-down's own per-IP bucket. A page opens it once per click, so
+    # 120/minute is generous against any real reader and still bounded against a script
+    # walking the 30-day back catalogue. Its own bucket rather than the feed's: see the
+    # ("run_detail", "anon") entry in ratelimit._LIMIT_SETTINGS for why.
+    anon_run_detail_limit: str = "120/minute"
+    # LIMIT on the per-run event read behind the drill-down. A run writes ~10 rows today
+    # and max_agent_steps bounds how many it can ever write, so this is headroom against
+    # a pathological run rather than a truncation any real one meets — but the route
+    # reads a table that grows for the life of the volume, so it reads with a bound.
+    run_detail_max_events: int = 400
+    # How far back /metrics' daily cost and latency buckets reach. Bounded because
+    # /metrics is ungated and polled every 5s per open tab (D-07 keeps it public beside
+    # /health): an unwindowed aggregation would grow with the life of the Fly volume and
+    # charge that growth to every tab. Two weeks is enough to show a trend on a demo.
+    metrics_window_days: int = 14
+
 
 settings = Settings()

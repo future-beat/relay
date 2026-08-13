@@ -68,6 +68,12 @@ _LIMIT_SETTINGS: dict[tuple[str, str], str] = {
     # — the bucket exists so a reconnect loop against /events is bounded per IP without
     # spending (or being hidden inside) the shared auth window above.
     ("events", "anon"): "anon_events_limit",
+    # The per-run drill-down (phase 6): public, credential-free, and therefore anon-only
+    # like the feed. Deliberately NOT the events bucket — a visitor clicking through the
+    # back catalogue would otherwise spend the live feed's reconnect allowance and
+    # silently break their own feed, and a drill-down flood must be visible in the logs
+    # as itself rather than hidden inside /events' numbers.
+    ("run_detail", "anon"): "anon_run_detail_limit",
 }
 
 _items: dict[tuple[str, str], RateLimitItem] = {}
@@ -201,25 +207,65 @@ def release_run(token: int | None) -> None:
         _reservations.pop(token, None)
 
 
+def budget_snapshot(conn: Database, *, now: float | None = None) -> dict:
+    """Today's ceiling as the GATE sees it — and the dashboard gauge's only source (D-11).
+
+    One arithmetic, two consumers. The gauge renders the number that refuses the
+    visitor's next run, so it must not be a second derivation of it: a page that shows
+    budget remaining while /process is already answering 503 is a credibility failure on
+    the one page whose whole purpose is credibility.
+
+    Includes `reserved_usd` — via spent_today, deliberately, rather than a SUM of its
+    own — because that is what enforce_daily_budget compares. A gauge summing only
+    committed `runs` rows would read up to concurrency x max_run_cost_usd low.
+
+    `resets_at` is an ISO string because this dict is serialised straight onto a JSON
+    route. The gate below parses it back rather than calling next_utc_midnight() a
+    second time: two calls straddling midnight would put one instant in the body and
+    another in Retry-After.
+    """
+    spent = spent_today(conn, now=now)
+    ceiling = settings.max_daily_cost_usd
+    return {
+        "spent_today_usd": round(spent, 4),
+        "daily_ceiling_usd": ceiling,
+        "remaining_usd": round(max(ceiling - spent, 0.0), 4),
+        "exhausted": spent >= ceiling,
+        "resets_at": next_utc_midnight().isoformat(),
+    }
+
+
 def enforce_daily_budget(conn: Database) -> None:
-    """Raise 503 once today's spend reaches the configured ceiling."""
-    spent = spent_today(conn)
-    if spent < settings.max_daily_cost_usd:
+    """Raise 503 once today's spend reaches the configured ceiling.
+
+    Refuses from budget_snapshot and nothing else, so the gauge and the gate are
+    structurally incapable of disagreeing (D-11). `snap["exhausted"]` is
+    `spent >= max_daily_cost_usd` — byte-identical semantics to the comparison this
+    used to make inline — and the 503 detail keys are unchanged, which
+    tests/test_ratelimit.py asserts by name.
+    """
+    snap = budget_snapshot(conn)
+    if not snap["exhausted"]:
         return
 
-    resets_at = next_utc_midnight()
+    resets_at = datetime.fromisoformat(snap["resets_at"])
     retry_after = max(1, math.ceil((resets_at - datetime.now(UTC)).total_seconds()))
     logger.info(
         "budget.daily_exceeded",
-        extra={"ctx": {"spent_usd": round(spent, 4), "limit_usd": settings.max_daily_cost_usd}},
+        extra={
+            "ctx": {
+                "spent_usd": snap["spent_today_usd"],
+                "limit_usd": snap["daily_ceiling_usd"],
+            }
+        },
     )
     raise HTTPException(
         503,
         detail={
             "error": "daily_budget_exhausted",
-            "spent_usd": round(spent, 4),
-            "limit_usd": settings.max_daily_cost_usd,
-            "resets_at": resets_at.isoformat(),
+            "spent_usd": snap["spent_today_usd"],
+            "limit_usd": snap["daily_ceiling_usd"],
+            "resets_at": snap["resets_at"],
             "note": (
                 "This demo caps its Claude spend at"
                 f" ${settings.max_daily_cost_usd:.2f}/day and resets at 00:00 UTC."
