@@ -182,3 +182,25 @@ Then open <http://127.0.0.1:8000/dashboard>. `RELAY_DEMO_KEY` and `ANTHROPIC_API
 - `tests/test_dashboard.py` — FOUND
 - `.planning/phases/06-dashboard-experience/06-07-SUMMARY.md` — FOUND
 - Commits `9ce8126`, `c5367c3`, `02f7657`, `17f45c4` — all FOUND in `git log`
+
+---
+
+## Checkpoint result (recorded 2026-08-13)
+
+**Partially confirmed by the user.** First pass was run without `RELAY_DEMO_KEY` set, so the
+form rendered read-only and steps 3-6 did not execute; the static render (exported to PDF) did
+confirm layout, copy, the cards, the outcome distribution, the cost chart, the server-read gauge
+and the absence of any stringified missing value in the document.
+
+That pass also surfaced the sparse-data finding closed by the `dashboard-sparse-states` quick
+task: the latency chart and the gauge were rendering correctly but read as broken whenever the
+data was sparse — which on a scale-to-zero demo is the common case.
+
+The user then set the key, ran the agent, and reported it "working properly."
+
+**Still not independently evidenced in this repo:** step 5 (the `X-Relay-Run-Uid` deep link
+opening the submitter's own run at full fidelity) and step 6 (the demo-vs-owner fidelity
+contrast). Step 6 is the phase's central disclosure control. It is pinned server-side by
+`test_run_detail_never_leaks_a_non_demo_runs_content`, its demo inverse, and the NULL-origin
+route test — so the control itself is proven; what remains unwitnessed is only that the browser
+presents the difference as intended.
