@@ -1452,6 +1452,53 @@ def test_run_detail_is_rate_limited_per_ip(client, monkeypatch):
     assert second.headers["Retry-After"]
 
 
+def test_a_drill_down_flood_leaves_the_live_feed_connectable(client, monkeypatch):
+    """WR-02: the drill-down's own bucket governs the drill-down, and NOTHING else does.
+
+    This is the property `anon_run_detail_limit` was added for, stated in three places
+    (main.py, ratelimit.py, config.py) and untested until now: "a visitor clicking
+    through the back catalogue would otherwise spend the live feed's reconnect allowance
+    and silently break their own feed." `_gate` charged the shared `auth` bucket first on
+    every public route, and with the shipped defaults that bucket (60/minute) is SMALLER
+    than the drill-down's own (120/minute) — so the drill-down's bucket could never bind,
+    and a 60-open flood took /events down with it. EventSource treats a non-200 as
+    terminal, so that is a dead feed and a "reload to watch again" page.
+
+    MUTATION that must turn this red (it is the shipped code): put
+    `await enforce("auth", "anon", request)` back above the `if public:` branch in
+    `_gate._dependency`. The third GET below then 429s from the `auth` bucket — not the
+    route's — and the /events connect that follows is refused too.
+
+    The limits are inverted from production on purpose: `auth` is made TINY and the
+    drill-down's own bucket huge, so anything the flood spends other than its own bucket
+    is what fails. `test_run_detail_is_rate_limited_per_ip` is the complement — it proves
+    the route's own bucket still meters it.
+    """
+    monkeypatch.setattr(settings, "anon_auth_limit", "2/minute")
+    monkeypatch.setattr(settings, "anon_run_detail_limit", "1000/minute")
+    # So the admitted stream closes on its own instead of holding the TestClient open
+    # for the idle ceiling — this test is about the connect, not the stream.
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.01)
+    monkeypatch.setattr(settings, "events_idle_seconds", 0.02)
+
+    uid = "e" * 32
+    with _anon(client) as anon:
+        codes = [anon.get(f"/runs/{uid}").status_code for _ in range(5)]
+        feed = anon.get("/events")
+
+    # The feed FIRST: it is the property this test is named for, and asserting it ahead
+    # of the flood's own status codes means a regression reports the broken feed rather
+    # than the 429 that preceded it.
+    assert feed.status_code == 200, (
+        "the live feed was refused after a drill-down flood — the isolation Phase 5's"
+        f" CR-01 established (drill-down codes were {codes})"
+    )
+    assert feed.headers["content-type"].startswith("text/event-stream")
+    # And every open answered from the route's own generous bucket. A 429 anywhere in
+    # here is another route's bucket binding, which is the same bug seen from its cause.
+    assert codes == [404] * 5, f"a drill-down open was refused by another route's bucket: {codes}"
+
+
 def test_run_detail_read_is_bounded(client, monkeypatch):
     """The per-run read carries a LIMIT — one run cannot be an unbounded response.
 

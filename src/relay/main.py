@@ -139,20 +139,32 @@ def _gate(bucket: str, *, meter_spend: bool = False, public: bool = False):
     precisely when the service was least able to defend itself. The refusal now
     charges its own bucket on the way out, which keeps both properties.
 
-    `public=True` builds the same perimeter minus the credential: the anon meter and
-    then the route's own bucket keyed on "anon". It is for surfaces D-11 keeps open on
-    purpose (the live feed), whose safety is content control rather than access
-    control — an unmetered public surface is still a free-work surface, and on a
-    connection-holding route it is the thing that defeats min_machines_running=0.
+    `public=True` builds the route's OWN bucket keyed on "anon", and nothing else. It is
+    for surfaces D-11 keeps open on purpose (the live feed, the drill-down), whose safety
+    is content control rather than access control — an unmetered public surface is still
+    a free-work surface, and on a connection-holding route it is the thing that defeats
+    min_machines_running=0.
+
+    A public route is deliberately NOT charged the shared `auth` bucket (WR-02). That
+    bucket exists to meter online KEY GUESSING, and a public gate resolves no credential
+    for anyone to guess — while charging it made every public route's own bucket
+    unreachable, because `anon_auth_limit` (60/minute) is smaller than the buckets it
+    preceded (`anon_run_detail_limit`, 120/minute). The consequence was the exact
+    coupling the drill-down's separate bucket was created to prevent: 60 drill-down opens
+    spent the live feed's reconnect allowance, /events answered 429, and EventSource
+    treats a non-200 as terminal — so clicking through the back catalogue silently killed
+    the visitor's own feed. Each public route now meters itself and only itself; this
+    also matches `test_public_routes_are_not_charged_the_anon_meter`, which already
+    states the property for /health and /metrics.
     """
 
     async def _dependency(request: Request, presented: str | None = _API_KEY) -> Tier | None:
-        await enforce("auth", "anon", request)
         if public:
             # No tier to resolve and none to return: the caller presented nothing, and
-            # metering an anonymous bucket is the whole of this gate.
+            # metering this route's own anonymous bucket is the whole of this gate.
             await enforce(bucket, "anon", request)
             return None
+        await enforce("auth", "anon", request)
         tier = _ANY_TIER(presented)
         if meter_spend:
             # Offloaded, because the cost here is acquiring Database's lock, not
