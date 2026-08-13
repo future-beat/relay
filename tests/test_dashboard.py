@@ -1579,12 +1579,18 @@ DRILL_EMAIL = "drill-sentinel-4e81c7@example.com"     # -> lookup_customer input
 DRILL_BODY = "SENTINEL-DRILL-BODY-92fa10"             # -> create_escalation.reason
 DRILL_KEY = "sk-ant-SENTINEL-DRILL-KEY-6d0b3e"        # -> search_docs.query
 DRILL_CITE = "sentinel-fabricated-doc-7b4c92.md"      # -> guardrail.missing_citations
+# An EARLIER ticket's subject, filed against the same address by someone else (CR-02).
+# It rides lookup_customer's `recent_tickets` and nothing else, so it is the only
+# sentinel that can see that vector: a fix which redacts the `customer` object and
+# leaves the ten subjects beside it passes every other assertion in this file.
+DRILL_SUBJECT = "SENTINEL-EARLIER-TICKET-SUBJECT-5a3d81"
 
 DRILL_SENTINELS = (
     ("customer email", DRILL_EMAIL),
     ("ticket body", DRILL_BODY),
     ("api key", DRILL_KEY),
     ("fabricated citation", DRILL_CITE),
+    ("earlier ticket subject", DRILL_SUBJECT),
 )
 
 
@@ -1608,9 +1614,12 @@ def _script_the_four_vector_run(ticket_id: int) -> None:
             "citations": [DRILL_CITE],
         })]),
         # (4) ticket body -> create_escalation.reason, an OBSERVED field, plus the same
-        # string in model prose so the text branch is exercised on the way past.
+        # string in model prose so the text branch is exercised on the way past. The
+        # prose also NAMES THE ADDRESS the model just looked up, because that is what a
+        # real reply does — and on the demo branch prose is published raw, so this is
+        # the vector no field-level allowlist can close (CR-01's value mask closes it).
         response([
-            text_block(f"The customer wrote: {DRILL_BODY}"),
+            text_block(f"The customer {DRILL_EMAIL} wrote: {DRILL_BODY}"),
             tool_use_block("create_escalation", {
                 "ticket_id": ticket_id,
                 "reason": f"customer reported: {DRILL_BODY} — needs a human review",
@@ -1622,11 +1631,22 @@ def _script_the_four_vector_run(ticket_id: int) -> None:
 
 
 def _seed_the_looked_up_customer() -> None:
-    """A real customers row, so lookup_customer returns a whole record — email, name,
-    plan — and the drill-down has something genuine it has to drop."""
+    """A real customers row AND an earlier ticket of theirs, so lookup_customer returns
+    what it returns in production: a whole record — email, name, plan — plus up to ten
+    of that address's ticket subjects.
+
+    The earlier ticket is the CR-02 half. Those subjects belong to whoever else has been
+    filing against this address (on the deployed service, the owner key), so they are
+    third-party content that no visitor authored, and until this row existed no test in
+    this suite could see that vector at all.
+    """
     app.state.conn.execute(
         "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
         (DRILL_EMAIL, "Drill Sentinel", "enterprise", "2025-01-01"),
+    )
+    app.state.conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body, origin) VALUES (?, ?, ?, ?)",
+        (DRILL_EMAIL, DRILL_SUBJECT, "filed by someone else, long before this run", None),
     )
     app.state.conn.commit()
 
@@ -1779,26 +1799,47 @@ def test_full_fidelity_is_server_decided(client, monkeypatch):
 
 
 def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
-    """D-02's INVERSE: the Try-it visitor gets the raw trace of their OWN run.
+    """D-02's INVERSE: the Try-it visitor gets the raw trace of their OWN run — and
+    only of their OWN (CR-01, CR-02).
 
-    Without this, "full fidelity for demo runs" is untested and can silently regress to
-    redacted-for-everyone — the drill-down would still pass every leak test above, and
-    the whole payoff of the Try-it flow would be gone with nothing noticing.
+    Without the first half, "full fidelity for demo runs" is untested and can silently
+    regress to redacted-for-everyone: the drill-down would still pass every leak test
+    above, and the whole payoff of the Try-it flow would be gone with nothing noticing.
 
-    The visitor authored this content, so the raw tool inputs and outputs are the point.
-    `customer_email` is still withheld (Q3): /tickets accepts an arbitrary address from
-    anyone holding the published key, so it is the one field a visitor could use to
-    publish a third party's identifier. The ticket's own address below is a separate
-    sentinel that no tool ever sees, so its absence is a claim about the ENVELOPE and
-    not an accident of the run's script.
+    THE PRODUCTION SHAPE, and the reason this test was rewritten. The ticket's own
+    address IS the address the model looks up, because that is what the Try-it form
+    produces — it pins each example to a seeded customer and the system prompt has the
+    agent call lookup_customer first. The previous version gave the ticket a DIFFERENT
+    address from the one the run looked up, so its `assert ticket_address not in ...`
+    was true of a string that appeared nowhere in the run at all: a fixture artifact,
+    not a property. It also asserted `lookup_result["result"]["customer"]["email"] ==
+    DRILL_EMAIL`, which CERTIFIED the disclosure and would have gone red on the fix.
+
+    What the visitor authored stays full fidelity — their ticket text, the model's
+    prose, its tool arguments, its citations — and that half is asserted first, because
+    a projector that published nothing would satisfy every absence assertion below.
+
+    What the SERVICE looked up about someone else does not, by VALUE and not by column
+    name: `assert "customer_email" not in json.dumps(detail)` greps for a key the
+    address is not published under (`lookup_customer` names it `email`), so it could
+    never have seen this.
+
+    MUTATION 1 (the shipped code, before CR-01): drop `and raw_tool in _DEMO_RAW_TOOLS`
+    / `and payload.get("tool") in _DEMO_RAW_TOOLS` from project_run_detail — the raw
+    customer row and its ten ticket subjects come back and the address/subject
+    assertions fire.
+    MUTATION 2 (the prose vector): pass `withheld=()` from run_detail — the model's own
+    sentence, which names the address it just read, republishes it and the same
+    assertion fires from a different field.
     """
     monkeypatch.setattr(settings, "voyage_api_key", None)
     _seed_the_looked_up_customer()
-    ticket_address = "demo-ticket-address-1c9e55@example.com"
     # The DEMO key, so tickets.origin is 'demo' — the whole difference from the leak
-    # test above is which credential posted /tickets.
+    # test above is which credential posted /tickets. The address is DRILL_EMAIL: the
+    # ticket's own customer and the one the agent looks up are THE SAME ADDRESS, which
+    # is the shape the Try-it form actually produces.
     ticket_id = _demo_ticket(
-        client, ticket_address, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
+        client, DRILL_EMAIL, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
     )
     assert _origin_of(ticket_id) == "demo"
     _script_the_four_vector_run(ticket_id)
@@ -1811,14 +1852,8 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
 
     assert detail["demo"] is True
     steps = detail["steps"]
-    lookup = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "lookup_customer")
-    # CR-01: lookup_customer is off the demo branch's raw allowlist, so its input and
-    # its result are redacted here exactly as they are for everyone else.
-    assert "input" not in lookup and lookup["arg_keys"] == ["email"]
-    lookup_result = next(
-        s for s in steps if s["type"] == "tool_result" and s["tool"] == "lookup_customer"
-    )
-    assert "result" not in lookup_result
+
+    # --- the visitor's OWN content, in full: this half is D-02's payoff --------------
     search = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "search_docs")
     assert DRILL_KEY in search["input"]["query"]
     escalation = next(
@@ -1829,15 +1864,44 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
     assert guard["missing_citations"] == [DRILL_CITE]
     # Model prose is returned too, not just its length.
     assert any(DRILL_BODY in (s.get("text") or "") for s in steps if s["type"] == "text")
-
     # The visitor's own words back — named fields, not a spread of the ticket row.
     assert detail["ticket"] == {
         "subject": "API limits",
         "body": f"my key {DRILL_KEY} stopped working. {DRILL_BODY}",
     }
-    # ...and the email is withheld even here, by key AND by value.
-    assert "customer_email" not in json.dumps(detail)
-    assert ticket_address not in json.dumps(detail)
+
+    # --- and NOTHING the service looked up about anyone else (CR-01, CR-02) ---------
+    whole = json.dumps(detail)
+    # By VALUE, and asserted BEFORE the shape assertions below so a regression reports
+    # the disclosure itself rather than the mechanism that was supposed to prevent it.
+    # This address is the ticket's own AND the one the model looked up AND the one the
+    # model's prose names, so it is reachable through three different fields; the
+    # assertion is about the response, not about any one of them.
+    assert DRILL_EMAIL not in whole, (
+        "a third party's address is on the keyless public route"
+    )
+    # The subjects beside the customer row are an independent vector: a fix that
+    # redacted `customer` and left `recent_tickets` would pass the line above.
+    assert DRILL_SUBJECT not in whole, (
+        "another person's ticket subject is on the keyless public route"
+    )
+    # The key name too, kept from the old version — it is a real (if narrower) guard on
+    # the `tickets` column, and it is NOT what the two assertions above check.
+    assert "customer_email" not in whole
+
+    lookup = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "lookup_customer")
+    # lookup_customer is off the demo branch's raw allowlist, so its input and its
+    # result are redacted here exactly as they are for everyone else — while the
+    # redacted SHAPE stays, so this is redaction and not omission.
+    assert "input" not in lookup and lookup["arg_keys"] == ["email"]
+    lookup_result = next(
+        s for s in steps if s["type"] == "tool_result" and s["tool"] == "lookup_customer"
+    )
+    assert "result" not in lookup_result and lookup_result["is_error"] is False
+    # Anti-vacuity for the absence half: the address was genuinely in this run's prose,
+    # and what replaced it is the mask rather than a step that vanished.
+    prose = next(s["text"] for s in steps if s["type"] == "text" and s.get("text"))
+    assert "[withheld]" in prose, "the prose step lost its content instead of its secret"
 
 
 # --- Wave 4: the packaged template (D-04) --------------------------------------------
