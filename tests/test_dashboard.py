@@ -528,6 +528,16 @@ def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
     `text` and `missing_citations`, and NOTHING outside that named list: the exact key
     set of a tool_use step is asserted in BOTH branches, so a demo branch built as a
     raw spread fails here rather than being caught only by review.
+
+    The demo branch is an allowlist on a SECOND axis too (CR-01): raw payloads are
+    published per tool, from `_DEMO_RAW_TOOLS`, and `lookup_customer` is on neither
+    side of it — its result is a stored record about a third party, not the visitor's
+    own content. So `DETAIL_EMAIL`, which rides only that tool's input and result, must
+    be ABSENT from both branches while every visitor-authored sentinel stays present.
+
+    MUTATION that must turn this red: drop the `and raw_tool in _DEMO_RAW_TOOLS` /
+    `and payload.get("tool") in _DEMO_RAW_TOOLS` conditions in project_run_detail — the
+    demo branch republishes the customer row and the first assertion below fires.
     """
     rows = _store(conn, _leaky_run_events())
     known = _known_tools(registry)
@@ -536,8 +546,24 @@ def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
     demo = project_run_detail(rows, full_fidelity=True, known_tools=known)
 
     demo_json = json.dumps(demo, default=str)
+    # The third party's address rides lookup_customer's input AND its result, and
+    # nothing else in this run — so its absence is a claim about that tool being off
+    # the raw allowlist, on the branch that is supposed to be the fullest.
+    assert DETAIL_EMAIL not in demo_json, (
+        "the demo branch republished the looked-up customer's address (CR-01)"
+    )
+    lookup_use = next(
+        s for s in demo if s["type"] == "tool_use" and s.get("tool") == "lookup_customer"
+    )
+    lookup_result = next(
+        s for s in demo if s["type"] == "tool_result" and s.get("tool") == "lookup_customer"
+    )
+    assert "input" not in lookup_use, "lookup_customer's raw input is on the demo branch"
+    assert "result" not in lookup_result, "lookup_customer's raw result is on the demo branch"
+    # ...and the redacted shape is still there, so this is redaction and not omission.
+    assert lookup_use["arg_keys"] == ["email"]
+
     for name, sentinel in (
-        ("customer email", DETAIL_EMAIL),        # tool_use.input + tool_result.result
         ("search query", DETAIL_QUERY),
         ("retrieved prose", DETAIL_PROSE),
         ("escalation reason", DETAIL_REASON),
@@ -1786,12 +1812,13 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
     assert detail["demo"] is True
     steps = detail["steps"]
     lookup = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "lookup_customer")
-    # The raw input DICT, not just its key names — asserted as the value it carried.
-    assert lookup["input"] == {"email": DRILL_EMAIL}
+    # CR-01: lookup_customer is off the demo branch's raw allowlist, so its input and
+    # its result are redacted here exactly as they are for everyone else.
+    assert "input" not in lookup and lookup["arg_keys"] == ["email"]
     lookup_result = next(
         s for s in steps if s["type"] == "tool_result" and s["tool"] == "lookup_customer"
     )
-    assert lookup_result["result"]["customer"]["email"] == DRILL_EMAIL
+    assert "result" not in lookup_result
     search = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "search_docs")
     assert DRILL_KEY in search["input"]["query"]
     escalation = next(

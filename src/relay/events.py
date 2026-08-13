@@ -266,6 +266,50 @@ def _project_tool_result(d: dict) -> dict:
     return {"type": "tool_result", "tool": tool, "is_error": False}
 
 
+# The demo branch's OWN allowlist (CR-01). See project_run_detail's docstring for the
+# rule; the short form is that these are the tools whose raw input and raw result are
+# either the run's own words about the visitor's ticket or Relay's own published docs.
+# `lookup_customer` is on neither side of it: its argument is a PERSON'S IDENTIFIER the
+# visitor typed rather than prose they wrote, and its result is a stored record about
+# that person plus ten of their ticket subjects — the payload _project_tool_result's
+# fallthrough exists to destroy. A tool added later is absent from this set and is
+# therefore redacted on both branches until someone adds it here on purpose.
+_DEMO_RAW_TOOLS = frozenset({"search_docs", "send_reply", "create_escalation", "set_category"})
+
+# Not "None": tests/test_auth.py asserts the served document never contains that string,
+# and a placeholder that reads as a missing value is worse than one that reads as a
+# decision.
+_WITHHELD = "[withheld]"
+
+
+def mask_withheld(value: Any, withheld: tuple[str, ...]) -> Any:
+    """Replace every occurrence of a withheld literal, at any depth of a JSON value.
+
+    The demo branch publishes model prose (`text`, `send_reply.body`,
+    `create_escalation.reason`), and prose restates whatever the model just read — so a
+    per-field allowlist alone cannot keep a value out of the response, only a field.
+    This is the value-level half: the route hands it the ticket's own `customer_email`,
+    which `run_detail`'s docstring has always claimed is withheld "even on the demo
+    branch" and which was until now withheld only as a COLUMN.
+
+    Keys are masked as well as values: on the demo branch the raw `input` dict's keys
+    are model-chosen strings, so a secret can arrive as one.
+    """
+    if not withheld:
+        return value
+    if isinstance(value, str):
+        for secret in withheld:
+            value = value.replace(secret, _WITHHELD)
+        return value
+    if isinstance(value, list):
+        return [mask_withheld(v, withheld) for v in value]
+    if isinstance(value, dict):
+        return {
+            mask_withheld(k, withheld): mask_withheld(v, withheld) for k, v in value.items()
+        }
+    return value
+
+
 def project(event: AgentEvent) -> dict | None:
     """Redact one run event into a public feed frame, or None to drop it (D-07, SC-3).
 
@@ -336,7 +380,11 @@ def _as_int(value: Any) -> int | None:
 
 
 def project_run_detail(
-    rows: list, *, full_fidelity: bool, known_tools: dict[str, frozenset[str]]
+    rows: list,
+    *,
+    full_fidelity: bool,
+    known_tools: dict[str, frozenset[str]],
+    withheld: tuple[str, ...] = (),
 ) -> list[dict]:
     """Redact one run's persisted events into a public drill-down (D-01, DASH-03).
 
@@ -354,6 +402,28 @@ def project_run_detail(
     nobody wrote down, and default-deny survives the exception. `customer_email` is on
     neither side (Q3) — it is the one field a visitor could use to publish a third
     party's identifier — and neither is the ticket text, which is the route's to add.
+
+    THE RULE THE DEMO BRANCH FOLLOWS (CR-01), stated here so the next person widening it
+    inherits it: full fidelity covers what the VISITOR'S OWN SUBMISSION brought in and
+    what this run said about it — their ticket text, the model's prose, the model's tool
+    ARGUMENTS, and the results of tools that return Relay's own published material or an
+    id/status for the visitor's own ticket. It does NOT cover a tool's output about
+    ANYONE ELSE. "The visitor authored this content" is a claim about what they SENT; it
+    was never a claim about what the service went and looked up in response, and
+    `lookup_customer` returns a whole stored customer row plus ten of that person's
+    ticket subjects — filed by whoever else has been using this service, on a route that
+    is keyless and 30 days deep. So the raw `input` and raw `result` are published PER
+    TOOL, from `_DEMO_RAW_TOOLS`, and a tool absent from that set gets the same redacted
+    projection the public branch gets. Default-deny survives the exception on this axis
+    too: a tool added later discloses nothing raw until someone names it there.
+
+    `withheld` is the value-level half of the same rule, and it exists because prose
+    cannot be allowlisted by field: `text`, `send_reply.body` and
+    `create_escalation.reason` are the model restating what it just read. The route
+    passes the ticket's own `customer_email`, so that address is absent from a demo
+    drill-down BY VALUE and not merely as a column. Its default is "nothing extra to
+    withhold", which is the posture every non-demo caller wants — the field allowlist
+    above is what carries the property, and this narrows what survives it.
 
     `known_tools` maps each REGISTERED tool name to the frozenset of its declared
     `input_schema.properties` keys; the caller builds it from `app.state.registry`.
@@ -468,7 +538,9 @@ def project_run_detail(
             raw_text = payload.get("text")
             step["char_count"] = len(raw_text) if isinstance(raw_text, str) else None
             if full_fidelity:
-                step["text"] = raw_text
+                # Counted before masking and published after: the count is a fact about
+                # what the model wrote, and a shorter one would misdescribe the run.
+                step["text"] = mask_withheld(raw_text, withheld)
         elif t == "tool_use":
             raw_tool = payload.get("tool")
             raw_input = payload.get("input")
@@ -478,8 +550,11 @@ def project_run_detail(
             step["tool"] = raw_tool if raw_tool in known_tools else "unknown"
             step["arg_keys"] = arg_keys
             step["unknown_arg_count"] = len(raw_input) - len(arg_keys)
-            if full_fidelity:
-                step["input"] = raw_input
+            if full_fidelity and raw_tool in _DEMO_RAW_TOOLS:
+                # Per tool, not per branch: lookup_customer's one argument is a person's
+                # address the visitor typed into a form — the identifier this route has
+                # always claimed to withhold — and not words they wrote.
+                step["input"] = mask_withheld(raw_input, withheld)
         elif t == "tool_result":
             detail = _project_tool_result(payload)
             # Its own "type" is the same string as the row's; dropped so the envelope
@@ -511,8 +586,14 @@ def project_run_detail(
                         isinstance(lic, str) and normalise_citation(lic) in cited
                         for lic in licensed
                     )
-            if full_fidelity:
-                step["result"] = payload.get("result")
+            if full_fidelity and payload.get("tool") in _DEMO_RAW_TOOLS:
+                # The line CR-01 was: this assignment lands AFTER step.update(detail), so
+                # it bypasses _project_tool_result entirely and the "the drill-down can
+                # never show more of a tool result than /events does" property held on
+                # the public branch only. Allowlisted per tool, the demo branch now
+                # widens the same five tools the redacted one names and adds no sixth —
+                # and lookup_customer's stored customer row is not one of them.
+                step["result"] = mask_withheld(payload.get("result"), withheld)
         elif t == "guardrail":
             # The prompt-injection story IS "a ticket body named ticket 999 and the
             # guard denied it", so the two ids are the payoff — and they are ints by
@@ -528,7 +609,7 @@ def project_run_detail(
             if full_fidelity:
                 # Model-authored text, so it is named here and nowhere near the public
                 # branch. `retrieved_ids` is on NEITHER: it is not in the allowlist.
-                step["missing_citations"] = missing
+                step["missing_citations"] = mask_withheld(missing, withheld)
         elif t == "notice":
             # `result_count`, not `results`, and coerced — project()'s WR-02 coercion
             # copied rather than merely its field name, because the same future edit

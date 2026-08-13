@@ -24,6 +24,7 @@ from .events import (
     RunEventBroker,
     RunRecorder,
     attribute_to_run,
+    mask_withheld,
     project,
     project_run_detail,
     snapshot_frame,
@@ -516,7 +517,13 @@ async def run_detail(run_uid: str) -> dict:
     `origin == "demo"` by equality — NULL (a legacy row) and anything else fail closed
     (T-06-14). `customer_email` is withheld even on the demo branch: /tickets accepts an
     arbitrary address from anyone holding the published key, so it is the one field a
-    visitor could use to publish a third party's identifier.
+    visitor could use to publish a third party's identifier. Withheld BY VALUE and not
+    merely as a column (CR-01) — it used to be dropped from this envelope while
+    `lookup_customer`'s raw input and raw result republished it, along with the rest of
+    that person's row and ten of their ticket subjects. The demo branch now publishes
+    raw tool payloads per tool (`_DEMO_RAW_TOOLS`), and the address the ticket names is
+    passed to the projector as a `withheld` literal so the model's prose cannot carry it
+    out either.
 
     A run whose steps the 30-day retention swept is NOT a 404. `purge_expired_run_events`
     deliberately spares the `runs` row, so "no steps" is the normal end state of the back
@@ -569,8 +576,13 @@ async def run_detail(run_uid: str) -> dict:
                 # naming subject/body unconditionally would work identically today and
                 # leave the redacted path holding the text in a local, one edit away
                 # from disclosing it.
+                #
+                # `customer_email` is read here to be WITHHELD, never to be published:
+                # it is the one value the projector needs in order to keep it out of the
+                # model's prose (CR-01), and it appears nowhere in the response.
                 ticket = dict(conn.execute(
-                    "SELECT subject, body FROM tickets WHERE id = ?", (ticket_id,)
+                    "SELECT subject, body, customer_email FROM tickets WHERE id = ?",
+                    (ticket_id,),
                 ).fetchone())
         # fetchall()/fetchone() all happen in here, never after: Database materialises
         # rows while its lock is held.
@@ -581,6 +593,14 @@ async def run_detail(run_uid: str) -> dict:
         raise HTTPException(404, "unknown run")
 
     demo = origin == "demo"
+    # The literals the demo branch must not republish at any depth, whatever field they
+    # arrive in. Exactly one today: the address the ticket names, which /tickets accepts
+    # from anyone holding the published key and which the model's own prose restates
+    # once lookup_customer has read it back. Empty off the demo branch, where nothing
+    # raw is published for it to hide in.
+    withheld = ()
+    if demo and ticket is not None and ticket["customer_email"]:
+        withheld = (ticket["customer_email"],)
     note = None
     if rows and run is not None:
         status = "complete"
@@ -620,13 +640,19 @@ async def run_detail(run_uid: str) -> dict:
                 name: frozenset(spec.schema["input_schema"]["properties"])
                 for name, spec in app.state.registry.items()
             },
+            withheld=withheld,
         ),
     }
     if note is not None:
         detail["note"] = note
     if demo and ticket is not None:
-        # The visitor's own words back, and only these two fields by name (Q3).
-        detail["ticket"] = {"subject": ticket["subject"], "body": ticket["body"]}
+        # The visitor's own words back, and only these two fields by name (Q3) — through
+        # the same value mask as the steps, because a visitor who typed a third party's
+        # address into the body would otherwise publish it here instead.
+        detail["ticket"] = {
+            "subject": mask_withheld(ticket["subject"], withheld),
+            "body": mask_withheld(ticket["body"], withheld),
+        }
     return detail
 
 
