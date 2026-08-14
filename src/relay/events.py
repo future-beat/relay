@@ -263,8 +263,10 @@ def _project_tool_result(d: dict) -> dict:
             "type": "tool_result", "tool": tool, "is_error": False,
             "category": result.get("category"),
         }
-    # lookup_customer lands here with the rest: its result is a whole customer row plus
-    # ten ticket subjects, and there is no safe subset of that to show.
+    # lookup_customer lands here with the rest: its result is a whole customer row —
+    # someone's name, plan and signup date — and there is no safe subset of that to show.
+    # (It no longer carries anyone's ticket subjects; that was dropped at the source, in
+    # tools.py, because a mask over the prose is a floor and not a closure.)
     return {"type": "tool_result", "tool": tool, "is_error": False}
 
 
@@ -273,9 +275,9 @@ def _project_tool_result(d: dict) -> dict:
 # either the run's own words about the visitor's ticket or Relay's own published docs.
 # `lookup_customer` is on neither side of it: its argument is a PERSON'S IDENTIFIER the
 # visitor typed rather than prose they wrote, and its result is a stored record about
-# that person plus ten of their ticket subjects — the payload _project_tool_result's
-# fallthrough exists to destroy. A tool added later is absent from this set and is
-# therefore redacted on both branches until someone adds it here on purpose.
+# that person — the payload _project_tool_result's fallthrough exists to destroy. A tool
+# added later is absent from this set and is therefore redacted on both branches until
+# someone adds it here on purpose.
 _DEMO_RAW_TOOLS = frozenset({"search_docs", "send_reply", "create_escalation", "set_category"})
 
 # Not "None": tests/test_auth.py asserts the served document never contains that string,
@@ -424,26 +426,39 @@ def withheld_from_run(
     Derived from the run's own rows, not from the ticket the route happened to load. The
     previous version withheld one literal — the address in `tickets.customer_email` —
     which covered the vector that had been demonstrated and nothing else: the same
-    `lookup_customer` result also carried the customer's NAME, their PLAN and up to ten
-    of that address's ticket SUBJECTS, filed by whoever else has used this service, and
-    the system prompt tells the model to read exactly those ("so you know their plan and
+    `lookup_customer` result also carried the customer's NAME and their PLAN, and the
+    system prompt tells the model to read exactly those ("so you know their plan and
     history", "Address the customer by name"). Reading the mask off the run's own tool
     results covers what the model could actually have restated, whatever that turns out
     to be, and a tool added later joins both halves of the rule on the day it is added.
+
+    WHAT IS NO LONGER IN HERE, because this is the difference between a floor and a
+    closure: that result USED to carry up to ten of the address's ticket SUBJECTS, filed
+    by whoever else has used this service. Those are gone at the source (tools.py) rather
+    than masked here. The distinction matters and is not a detail — a mask covers the
+    literal and never the gist, so third-party free text in the context was always a
+    disclosure this function could only reduce. What remains is a fictional persona's
+    name, plan and signup date from a public repo, and reducing THAT is what a floor is
+    for.
 
     Default-deny survives: membership is tested against the allowlist, so an unrecognised
     or model-invented tool name is outside it and its output is harvested.
 
     `authored` is what the VISITOR wrote, and it comes back out unmasked, because the
     rule is about third-party content and the visitor's own submission is definitionally
-    not that. It is load-bearing rather than a nicety: `lookup_customer` selects the last
-    ten tickets for the address, which INCLUDES the one this run is working, and every
-    visitor who picks the same Try-it chip files the same subject — so without this the
-    demo's payoff reply reads "Regarding your [withheld]" about the visitor's own words.
+    not that. It was load-bearing while `lookup_customer` returned the last ten SUBJECTS
+    for the address — which included the one this run is working, so without it the
+    demo's payoff reply read "Regarding your [withheld]" about the visitor's own words.
+    With the subjects gone from the payload nothing harvested reaches this exemption
+    today, and no test exercises it; it is kept for the tool that returns visitor-authored
+    text next, and it should be re-argued rather than assumed when that happens.
     Matched whole and case-insensitively, never as a substring: `authored` is
     visitor-controlled, and "drop any harvested value that appears anywhere in the text
     I submitted" would let a visitor unmask a third party's value by pasting it. Whole-
-    match cannot, because producing the match requires already holding the value.
+    match blocks BULK unmasking, and — stated plainly, because this docstring used to
+    claim more — it does not block CONFIRMATION: submitting a subject equal to a harvested
+    value republishes that value, one guess per ticket (NF-2, open, and now reaching only
+    the fictional seeded personas' constants).
 
     LIMITS, since a mask that is trusted for more than it does is worse than none:
     - It masks literals, not meanings. A paraphrase survives (see `mask_withheld`).
@@ -567,9 +582,11 @@ def project_run_detail(
     id/status for the visitor's own ticket. It does NOT cover a tool's output about
     ANYONE ELSE. "The visitor authored this content" is a claim about what they SENT; it
     was never a claim about what the service went and looked up in response, and
-    `lookup_customer` returns a whole stored customer row plus ten of that person's
-    ticket subjects — filed by whoever else has been using this service, on a route that
-    is keyless and 30 days deep. So the raw `input` and raw `result` are published PER
+    `lookup_customer` returns a whole stored customer row — someone's name, plan and
+    signup date — on a route that is keyless and 30 days deep. (It also used to return
+    ten of that person's ticket subjects, filed by whoever else has been using this
+    service; those were dropped at the source, in tools.py.) So the raw `input` and raw
+    `result` are published PER
     TOOL, from `_DEMO_RAW_TOOLS`, and a tool absent from that set gets the same redacted
     projection the public branch gets. Default-deny survives the exception on this axis
     too: a tool added later discloses nothing raw until someone names it there.
@@ -595,18 +612,22 @@ def project_run_detail(
     corrupt the demo's payoff to protect nothing.
 
     AND IT IS A FLOOR, NOT A PROOF. The mask replaces literals; a genuine paraphrase of
-    a name, a plan or someone else's ticket subject shares no substring with the value
-    and survives it. `lookup_customer` still hands the model ten of that address's
-    ticket subjects, and the only structural closure for the paraphrase vector is to
-    stop putting other people's words into the context — a change to the tool's payload,
-    which the eval judge also consumes. Anyone widening this branch should assume prose
-    discloses the GIST of everything the run looked up, and decide whether that is
-    acceptable rather than assume the mask made it safe.
+    a name or a plan shares no substring with the value and survives it. That argument
+    used to end "…and `lookup_customer` still hands the model ten of that address's
+    ticket subjects", naming the structural closure — stop putting other people's words
+    in the context — as the thing this file could not do. THAT CLOSURE WAS TAKEN: the
+    tool no longer returns any ticket subject, so what a paraphrase can still reach is a
+    fictional persona's name, plan and signup date, hardcoded in a public repo. Anyone
+    widening this branch should still assume prose discloses the GIST of everything the
+    run looked up, and decide whether that is acceptable rather than assume the mask made
+    it safe — the right lever for a new disclosure is the tool's payload, not this mask.
 
     `authored` names the strings the VISITOR submitted, so the mask does not withhold a
-    visitor's own words from them: the lookup returns the ticket this run is working
-    among the address's last ten, and it is the same subject every visitor who picked
-    that Try-it chip filed. See `withheld_from_run` for why it matches whole strings only.
+    visitor's own words from them. It has nothing to exempt today — the lookup no longer
+    returns any subject, so the visitor's own words are not harvested in the first place
+    — and it is kept for the tool that returns visitor-authored text next. See
+    `withheld_from_run` for why it matches whole strings only, and for the confirmation
+    oracle that matching leaves open.
 
     `known_tools` maps each REGISTERED tool name to the frozenset of its declared
     `input_schema.properties` keys; the caller builds it from `app.state.registry`.
