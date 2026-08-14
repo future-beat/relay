@@ -722,7 +722,11 @@ function renderRawDetail(s, host) {
 // two calls scripts/demo.sh makes, against the same perimeter, at the same cost. Not a
 // dry run: the reply or the escalation landing in the drill-down is the payoff, and a
 // demo that only pretends to run is not evidence of anything.
-const DEMO_KEY = "__RELAY_DEMO_KEY__";
+// A DIFFERENT placeholder from the one in the <code> block above, and the quotes are
+// part of it: `<script>` is raw text, so HTML entities are NOT decoded here. The server
+// replaces the whole quoted token with a complete JS string literal (json.dumps), which
+// is the only escaping that is correct in this context — WR-05.
+const DEMO_KEY = "__RELAY_DEMO_KEY_JS__";
 // The page is served to anonymous visitors on a deployment that may have configured no
 // keys at all (two shipped tests do exactly that), and the whole page is one script: a
 // throw during setup here would take the feed, the charts and the drill-down with it.

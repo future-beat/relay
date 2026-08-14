@@ -12,6 +12,7 @@ import json
 import re
 from contextlib import contextmanager
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 
 import pytest
@@ -1989,10 +1990,18 @@ def test_dashboard_is_served_from_the_packaged_template(client):
 
     raw = path.read_text(encoding="utf-8")
     assert "__RELAY_DEMO_KEY__" in raw, "the placeholder is gone from the file on disk"
+    assert '"__RELAY_DEMO_KEY_JS__"' in raw, "the script placeholder is gone from disk"
 
     resp = client.get("/dashboard")
     assert resp.status_code == 200
-    assert resp.text == raw.replace("__RELAY_DEMO_KEY__", "test-demo-key")
+    # Two placeholders because there are two parsing contexts (WR-05); for a key with
+    # no metacharacters both substitutions produce the same text, which is why this
+    # test is not the one that proves they are escaped differently.
+    assert resp.text == (
+        raw
+        .replace('"__RELAY_DEMO_KEY_JS__"', '"test-demo-key"')
+        .replace("__RELAY_DEMO_KEY__", "test-demo-key")
+    )
 
 
 def test_dashboard_substitutes_the_key_per_request(client, monkeypatch):
@@ -2014,6 +2023,56 @@ def test_dashboard_substitutes_the_key_per_request(client, monkeypatch):
 
     # ...and the file on disk was never rewritten to do it.
     assert "__RELAY_DEMO_KEY__" in _packaged_template().read_text(encoding="utf-8")
+
+
+# Every character that one escaper gets wrong in the other context: `&"'<>` are what
+# html.escape() encodes (correct in the <code> block, fatal in the script), and the
+# trailing backslash is what it does NOT encode (harmless in the <code> block, and the
+# character that escapes the closing quote of a JS string literal and kills the page).
+_METACHAR_DEMO_KEY = "k&y\"'<s>\\"
+
+
+def test_the_demo_key_is_escaped_for_the_context_it_lands_in(client, monkeypatch):
+    """WR-05. One key, two parsing contexts, two escapers — decoded, not grepped.
+
+    The failure this pins is silent by construction: with a single html.escape() the
+    page DISPLAYS the right key while the script holds `k&amp;y`, so every Try-it
+    submission 401s and nothing on the server or the page says why. So neither
+    assertion below greps for a rendered form; each one runs the decoder the browser
+    would run for that context and compares against the configured key.
+
+    MUTATION (executed): restore the single-escaper substitution in `dashboard()` —
+    `published = escape(settings.demo_key)` into both placeholders. The HTML
+    assertion stays green; the JS assertion reds with the entity-encoded key.
+    """
+    monkeypatch.setattr(settings, "demo_key", _METACHAR_DEMO_KEY)
+    page = client.get("/dashboard").text
+
+    # HTML text-node context: the browser decodes entity references here.
+    shown = re.search(r"<code>X-API-Key: (.*?)</code>", page)
+    assert shown is not None, "the published-key <code> block is gone"
+    assert unescape(shown.group(1)) == _METACHAR_DEMO_KEY
+
+    # Script context: `<script>` is raw text, so the browser decodes NOTHING before the
+    # JS parser sees it. json.loads is the same string-literal grammar the JS parser
+    # applies (\\uXXXX included), so a literal that survives this is one the browser
+    # reads back as the key — and one that does not parse at all reds here too, which
+    # is the backslash half of the finding.
+    literal = re.search(r"const DEMO_KEY = (.*);", page)
+    assert literal is not None, "the DEMO_KEY assignment is gone"
+    assert json.loads(literal.group(1)) == _METACHAR_DEMO_KEY
+
+    # Anti-vacuity: the two contexts must actually have been given DIFFERENT text. If
+    # this ever holds, one escaper is feeding both again and the assertions above are
+    # agreeing by accident.
+    assert shown.group(1) != json.loads(literal.group(1))
+
+    # `</script>` cannot be written from inside the literal, whatever the key is.
+    monkeypatch.setattr(settings, "demo_key", "a</script><b>x")
+    scripted = client.get("/dashboard").text
+    js = re.search(r"const DEMO_KEY = (.*);", scripted)
+    assert "</script>" not in js.group(1)
+    assert json.loads(js.group(1)) == "a</script><b>x"
 
 
 # --- Wave 4: the page shell (DASH-02) ------------------------------------------------

@@ -793,9 +793,31 @@ async def dashboard() -> str:
 
     An unconfigured deployment renders a neutral placeholder — /dashboard is the
     public landing surface and must not print "None" as if it were a credential.
+
+    The key lands in TWO parsing contexts and therefore takes TWO escapers (WR-05).
+    `<code>X-API-Key: …</code>` is HTML text, where html.escape() is right. `const
+    DEMO_KEY = "…"` is inside `<script>`, which is RAW TEXT: entity references are not
+    decoded there, so an HTML-escaped `k&amp;y` would be the key the page actually
+    sends and every Try-it submission would 401 while the block above displayed the
+    correct key. json.dumps() emits a complete JS string literal — quotes, backslashes
+    and control characters all handled — which is why the placeholder it replaces
+    includes its own quotes. `<`, `>` and `&` are then re-encoded as \\uXXXX escapes:
+    JSON leaves them bare, and a key containing `</script>` would otherwise close the
+    element from inside a string literal. JS decodes \\u003c back to `<`, so the value
+    the page presents is still the key byte-for-byte.
     """
-    published = escape(settings.demo_key) if settings.demo_key else "(not configured)"
-    return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
+    published = settings.demo_key or "(not configured)"
+    js_key = (
+        json.dumps(published)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    return (
+        DASHBOARD_HTML
+        .replace('"__RELAY_DEMO_KEY_JS__"', js_key)
+        .replace("__RELAY_DEMO_KEY__", escape(published))
+    )
 
 
 # Exactly the fields the Ticket model declares, named for the same reason
