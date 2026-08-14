@@ -8,7 +8,7 @@ last_updated: "2026-08-12T06:54:38.104Z"
 last_activity: 2026-08-14 -- Phase 06 re-verified 12/12; DASH-02..05 complete; 4 mask findings open
 progress:
   total_phases: 6
-  completed_phases: 5
+  completed_phases: 6
   total_plans: 30
   completed_plans: 23
   percent: 77

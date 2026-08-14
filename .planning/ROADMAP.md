@@ -18,7 +18,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 - [ ] **Phase 3: Semantic Retrieval** - Committed Voyage embeddings index, cited replies, keyword fallback
 - [ ] **Phase 4: Evaluation Coverage** - Retrieval recall@k, prompt-injection guard case, citation-faithfulness check, no regression
 - [ ] **Phase 5: Run Event Persistence & Live Feed** - run_events table plus a public, redacted SSE feed rendering live on the dashboard
-- [ ] **Phase 6: Dashboard Experience** - Metric cards, outcome distribution, per-run drill-down, SVG charts, budget gauge, "Try it" form
+- [x] **Phase 6: Dashboard Experience** - Metric cards, outcome distribution, per-run drill-down, SVG charts, budget gauge, "Try it" form
 
 ## Phase Details
 
