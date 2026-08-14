@@ -17,12 +17,13 @@ from pathlib import Path
 
 import pytest
 from fastapi import HTTPException
+from pydantic import BaseModel
 
 from helpers import FakeClient, response, text_block, tool_use_block
 from relay import db as db_module
 from relay.agent import _execute_guarded
 from relay.config import settings
-from relay.db import connect, init_db
+from relay.db import SEED_CUSTOMERS, connect, init_db
 from relay.events import mask_withheld, project_run_detail, withheld_from_run
 from relay.guardrails import ToolPolicy
 from relay.main import app
@@ -37,6 +38,7 @@ from relay.ratelimit import (
 )
 from relay.retrieval import normalise_citation
 from relay.telemetry import record_run
+from relay.tools import ToolSpec
 
 
 def _create_table_block(table: str) -> str:
@@ -360,8 +362,19 @@ DETAIL_ERROR = "DRILLDOWN-ERROR-MESSAGE-8f74"         # tool_result error string
 # able to tell "the demo branch keeps what the visitor wrote" apart from "the demo branch
 # keeps what the service looked up". They are opposite requirements.
 DETAIL_PRIOR_SUBJECT = "DRILLDOWN-SOMEONE-ELSES-SUBJECT-2b7c"
-# lookup_customer result -> customer.name, and restated in model prose.
+# lookup_customer result -> customer.signed_up. A NON-exempt field of the customer record,
+# restated in model prose: it is what tells "the harvest is running over that record" apart
+# from "the whole record is exempt" (see the two sentinels below).
+DETAIL_SIGNED_UP = "DRILLDOWN-SIGNUP-DATE-0c19"
+# lookup_customer result -> customer.name and customer.plan, restated in model prose. These
+# two are EXEMPT from the harvest (`events._PERSONA_EXEMPT_FIELDS`) because this service's
+# customers are four fictional personas hardcoded in a public repo, so the demo's payoff
+# reply reads "Hi Mia, as a pro plan customer" instead of as a redacted document. They are
+# still absent from the PUBLIC branch — which publishes no prose and no lookup result at
+# all — so they stay in DETAIL_SENTINELS below, and the demo branch asserts their PRESENCE
+# separately.
 DETAIL_CUSTOMER_NAME = "DRILLDOWN-CUSTOMER-NAME-5f3a"
+DETAIL_CUSTOMER_PLAN = "DRILLDOWN-CUSTOMER-PLAN-9e44"
 
 DETAIL_SENTINELS = (
     ("customer email", DETAIL_EMAIL),
@@ -372,7 +385,9 @@ DETAIL_SENTINELS = (
     ("missing citation", DETAIL_CITE),
     ("tool error message", DETAIL_ERROR),
     ("another visitor's earlier subject", DETAIL_PRIOR_SUBJECT),
+    ("the looked-up customer's signup date", DETAIL_SIGNED_UP),
     ("the looked-up customer's name", DETAIL_CUSTOMER_NAME),
+    ("the looked-up customer's plan", DETAIL_CUSTOMER_PLAN),
 )
 
 DETAIL_UID = "drilldown-uid"
@@ -428,7 +443,10 @@ def _leaky_run_events() -> list:
         ("tool_result", {"tool": "lookup_customer", "is_error": False, "result": {
             "found": True,
             "customer": {
-                "email": DETAIL_EMAIL, "name": DETAIL_CUSTOMER_NAME, "plan": "enterprise",
+                "email": DETAIL_EMAIL,
+                "name": DETAIL_CUSTOMER_NAME,      # exempt by field
+                "plan": DETAIL_CUSTOMER_PLAN,      # exempt by field
+                "signed_up": DETAIL_SIGNED_UP,     # NOT exempt — same record, still masked
             },
             # `subject` here is deliberately a payload shape `lookup_customer` no
             # longer produces — it stopped returning anyone's ticket text. These rows
@@ -447,8 +465,9 @@ def _leaky_run_events() -> list:
         # history", "Address the customer by name"). This is prose, so no field allowlist
         # can reach it — the demo branch publishes `text` whole.
         ("text", {"text": (
-            f"{DETAIL_CUSTOMER_NAME} is on the enterprise plan. Their recent tickets"
-            f" include '{DETAIL_PRIOR_SUBJECT}'."
+            f"{DETAIL_CUSTOMER_NAME} is on the {DETAIL_CUSTOMER_PLAN} plan and signed up"
+            f" on {DETAIL_SIGNED_UP}. Their recent tickets include"
+            f" '{DETAIL_PRIOR_SUBJECT}'."
         )}, 56),
         ("tool_use", {"tool": "search_docs", "input": {"query": DETAIL_QUERY}}, 60),
         ("tool_result", {"tool": "search_docs", "is_error": False, "result": {
@@ -568,11 +587,16 @@ def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
 
     And on a THIRD axis, which is the one the phase-6 verification found open: the model
     READS that redacted result and restates it in prose, and the demo branch publishes
-    prose whole. `DETAIL_CUSTOMER_NAME` and `DETAIL_PRIOR_SUBJECT` ride the lookup's
-    result AND a `text` step that names them both, so they can only be absent below if
-    the value mask is derived from what this run's non-allowlisted tools RETURNED. A
-    per-field allowlist cannot reach them and neither can the route's one address
-    literal.
+    prose whole. `DETAIL_SIGNED_UP` and `DETAIL_PRIOR_SUBJECT` ride the lookup's result
+    AND a `text` step that names them both, so they can only be absent below if the value
+    mask is derived from what this run's non-allowlisted tools RETURNED. A per-field
+    allowlist cannot reach them and neither can the route's one address literal.
+
+    AND THE EXEMPTION, on the same axis and in the same document: `DETAIL_CUSTOMER_NAME`
+    and `DETAIL_CUSTOMER_PLAN` ride that same result and that same sentence, and they must
+    be published IN THE CLEAR (`events._PERSONA_EXEMPT_FIELDS`). Asserting both directions
+    off one fixture is the point — an exemption that widened to the whole customer record
+    would take `DETAIL_SIGNED_UP` with it, and the assertion below is what says so.
 
     MUTATION that must turn this red: drop the `and raw_tool in _DEMO_RAW_TOOLS` /
     `and payload.get("tool") in _DEMO_RAW_TOOLS` conditions in project_run_detail — the
@@ -580,8 +604,17 @@ def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
 
     SECOND MUTATION (the prose vector): make `prose_withheld` just `withheld` — i.e.
     delete the `withheld_from_run(parsed, ...)` term. The raw payloads stay redacted,
-    every other assertion here stays green, and the name and the earlier subject come
-    back out through the `text` step.
+    every other assertion here stays green, and the signup date and the earlier subject
+    come back out through the `text` step.
+
+    THIRD MUTATION (the exemption widening): change `_PERSONA_EXEMPT_FIELDS` to skip the
+    whole `customer` record — `if owner == "customer": continue` in `_collect_strings`.
+    The two presence assertions stay green and the signup-date absence reds, which is
+    exactly the failure an over-broad exemption would produce.
+
+    FOURTH MUTATION (the exemption deleted): empty `_PERSONA_EXEMPT_FIELDS`. The two
+    presence assertions red — the demo's payoff prose goes back to reading as a redacted
+    document, which is the bug this exemption exists to fix.
     """
     rows = _store(conn, _leaky_run_events())
     known = _known_tools(registry)
@@ -590,11 +623,14 @@ def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
     demo = project_run_detail(rows, full_fidelity=True, known_tools=known)
 
     demo_json = json.dumps(demo, default=str)
-    # Anti-vacuity for the two prose sentinels: they really are in this run's rows, and
-    # really do reach a field the demo branch publishes.
+    # Anti-vacuity for the prose sentinels: they really are in this run's rows, and really
+    # do reach a field the demo branch publishes. Four of them, riding one customer record
+    # and one sentence, so "masked" and "published" below are decisions and not accidents.
     raw = "".join(r["payload"] for r in rows)
     for name, sentinel in (
         ("looked-up customer name", DETAIL_CUSTOMER_NAME),
+        ("looked-up customer plan", DETAIL_CUSTOMER_PLAN),
+        ("looked-up customer signup date", DETAIL_SIGNED_UP),
         ("another visitor's earlier subject", DETAIL_PRIOR_SUBJECT),
     ):
         assert raw.count(sentinel) == 2, (
@@ -612,11 +648,23 @@ def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
     )
     # The prose vector, by value: the model's own sentence names both, and the whole
     # point is that no field-level rule could have stopped it.
-    assert DETAIL_CUSTOMER_NAME not in demo_json, (
-        "the model's prose republished the looked-up customer's name"
+    assert DETAIL_SIGNED_UP not in demo_json, (
+        "the model's prose republished the looked-up customer's signup date — a field the"
+        " persona exemption does not name, so the exemption has widened to the record"
     )
     assert DETAIL_PRIOR_SUBJECT not in demo_json, (
         "the model's prose republished another visitor's ticket subject"
+    )
+    # ...and the two fields that ARE exempt survive, in the same document, from the same
+    # record, through the same field. This is the payoff half: without it the mask can
+    # regress to redacting the demo's own reply and nothing here notices.
+    demo_prose = " ".join(s["text"] for s in demo if s["type"] == "text" and s.get("text"))
+    assert DETAIL_CUSTOMER_NAME in demo_prose, (
+        "the looked-up customer's name was masked out of the demo's own prose — the reply"
+        " that is the demo's payoff reads as a redacted document"
+    )
+    assert DETAIL_CUSTOMER_PLAN in demo_prose, (
+        "the looked-up customer's plan was masked out of the demo's own prose"
     )
     # ...and what replaced them is the mask, not a step that quietly vanished.
     assert "[withheld]" in demo_json, "the prose lost its content instead of its secrets"
@@ -2118,22 +2166,37 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
 # nothing the visitor wrote, so that their absence can only be explained by a mask
 # derived from what the run's non-allowlisted tools returned.
 #
-# TWO DIFFERENT PROPERTIES LIVE HERE NOW, and they are not the same strength. The name
-# and the plan are still in the lookup's result, still restated by the model, and still
-# closed by the MASK — a floor under literals that a paraphrase walks past. The other
-# visitor's SUBJECT is closed STRUCTURALLY: the tool stopped returning it, so the model
-# cannot restate, paraphrase or gist it. Only the second kind is a proof.
+# THREE DIFFERENT PROPERTIES LIVE HERE NOW, and they are not the same strength.
+#
+# The customer's ADDRESS and SIGNUP DATE are still in the lookup's result, still restated
+# by the model, and still closed by the MASK — a floor under literals that a paraphrase
+# walks past. The other visitor's SUBJECT is closed STRUCTURALLY: the tool stopped
+# returning it, so the model cannot restate, paraphrase or gist it. Only the second kind
+# is a proof.
+#
+# The customer's NAME and PLAN are the third: they are deliberately NOT masked
+# (`events._PERSONA_EXEMPT_FIELDS`), because this service's customers are four fictional
+# personas hardcoded in a public repo and the reply that reads "Hi [withheld], as a
+# [withheld] plan customer" is the demo's payoff rendered as a redacted document. This
+# test used to assert their absence; it now asserts their PRESENCE, beside the signup
+# date's absence — the same record, the same sentence, one field masked and two not, which
+# is what keeps the exemption from widening unnoticed.
 PROSE_EMAIL = "prose-sentinel-1c4d@example.com"
-PROSE_NAME = "PROSE-CUSTOMER-NAME-77b2"                    # customers.name
+PROSE_NAME = "PROSE-CUSTOMER-NAME-77b2"                    # customers.name — EXEMPT
 PROSE_OTHER_SUBJECT = "PROSE-ANOTHER-VISITORS-SUBJECT-9d3e"  # someone else's ticket
+# customers.signed_up — the non-exempt free-text field of the SAME record. It is the one
+# sentinel here that ONLY the run-derived harvest can mask: the address is also handed in
+# by the route's own `withheld`, so masking it says nothing about `withheld_from_run`.
+PROSE_SIGNED_UP = "PROSE-SIGNUP-DATE-4b60"
 # The visitor's OWN subject, which lookup_customer hands back too (it selects the last
 # ten tickets for the address, and this run's ticket is one of them). It must survive:
 # withholding a visitor's own words from their own trace is not a security property.
 PROSE_OWN_SUBJECT = "Refund for yesterday's charge"
 PROSE_BODY = "PROSE-VISITOR-BODY-5a8f"                     # the visitor's own words
-# The plan is "pro" on purpose. It is what the deployed seed data actually holds, it is
-# three characters, and it is a substring of ordinary English — so it is the value that
-# decides whether the mask can be both complete and legible.
+# The plan is "pro" on purpose. It is what the deployed seed data actually holds, and it
+# is a substring of ordinary English ("processing", "provide") — so it is the value that
+# decides whether publishing it can be done by FIELD without a value-based skip list
+# rewriting every word that happens to contain it.
 PROSE_PLAN = "pro"
 
 
@@ -2145,7 +2208,7 @@ def _seed_the_prose_customer() -> int:
     """
     app.state.conn.execute(
         "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
-        (PROSE_EMAIL, PROSE_NAME, PROSE_PLAN, "2025-01-01"),
+        (PROSE_EMAIL, PROSE_NAME, PROSE_PLAN, PROSE_SIGNED_UP),
     )
     cur = app.state.conn.execute(
         "INSERT INTO tickets (customer_email, subject, body, origin) VALUES (?, ?, ?, ?)",
@@ -2173,15 +2236,16 @@ def _script_the_prose_restatement_run(ticket_id: int) -> None:
         response([tool_use_block("lookup_customer", {"email": PROSE_EMAIL})]),
         response([
             text_block(
-                f"{PROSE_NAME} is on the {PROSE_PLAN} plan and has 2 tickets on file,"
-                f" the earlier one still unresolved. I am processing"
-                f" '{PROSE_OWN_SUBJECT}' now."
+                f"{PROSE_NAME} is on the {PROSE_PLAN} plan, signed up on"
+                f" {PROSE_SIGNED_UP}, and has 2 tickets on file, the earlier one still"
+                f" unresolved. I am processing '{PROSE_OWN_SUBJECT}' now."
             ),
             tool_use_block("create_escalation", {
                 "ticket_id": ticket_id,
                 "reason": (
-                    f"{PROSE_NAME} ({PROSE_PLAN} plan) has written in before and that"
-                    f" ticket is still open. This ticket: {PROSE_BODY}"
+                    f"{PROSE_NAME} ({PROSE_PLAN} plan, since {PROSE_SIGNED_UP}) has"
+                    f" written in before and that ticket is still open. This ticket:"
+                    f" {PROSE_BODY}"
                 ),
                 "priority": "high",
             }),
@@ -2206,36 +2270,63 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
     the result anyway, because the tool returned it to the model before any of this ran.
     Prose is the model restating it. There is no field to deny.
 
-    TWO STRENGTHS, AND THIS DOCSTRING NAMES WHICH IS WHICH. The customer's NAME and PLAN
-    are still in the lookup's result, so their absence below is the MASK working: literals
-    do not survive, and the GIST is not covered — a paraphrase ("the customer on our top
-    tier") shares no substring and no mask sees it. That is a floor, not a proof, and the
-    limit is stated in `mask_withheld` and `project_run_detail`. The other visitor's
-    SUBJECT is different in kind: `lookup_customer` no longer returns it, so it is not in
-    the context, not in the run's rows, and not available to be paraphrased either. The
-    assertion below that it is absent from the response is therefore a REGRESSION GUARD on
-    a value nothing carries; the proof is the absence from the run's own rows, asserted
-    here beside the id that shows the lookup saw that person's ticket regardless.
+    THREE STRENGTHS, AND THIS DOCSTRING NAMES WHICH IS WHICH. The customer's SIGNUP DATE
+    is still in the lookup's result, so its absence below is the MASK working: literals do
+    not survive, and the GIST is not covered — a paraphrase ("they have been with us since
+    early last year") shares no substring and no mask sees it. That is a floor, not a
+    proof, and the limit is stated in `mask_withheld` and `project_run_detail`. The other
+    visitor's SUBJECT is different in kind: `lookup_customer` no longer returns it, so it
+    is not in the context, not in the run's rows, and not available to be paraphrased
+    either. The assertion below that it is absent from the response is therefore a
+    REGRESSION GUARD on a value nothing carries; the proof is the absence from the run's
+    own rows, asserted here beside the id that shows the lookup saw that person's ticket
+    regardless.
+
+    THE THIRD IS THE INVERSE, and it is why this test was rewritten. The customer's NAME
+    and PLAN are exempt by field (`events._PERSONA_EXEMPT_FIELDS`) and must be published
+    IN THE CLEAR. This test used to assert their absence; that premise is reversed, and
+    what replaces it is stronger than deleting the assertions would have been — the name,
+    the plan and the signup date ride the SAME customer record and the SAME sentence, so
+    the exemption's exact width is asserted rather than assumed. The signup date is the
+    load-bearing half: it is the one sentinel here that ONLY `withheld_from_run` can mask
+    (the address is also handed in by the route), so it doubles as the proof the harvest is
+    still running at all.
 
     MUTATION 1 (the mask): in `project_run_detail`, make `prose_withheld` just `withheld`
     — drop the `withheld_from_run(parsed, ...)` term. The raw payloads stay redacted, the
-    shipped test above stays green, and the name and the plan come back through `text` and
-    the escalation reason. The other visitor's subject does NOT come back, which is the
+    shipped test above stays green, and the signup date comes back through `text` and the
+    escalation reason. The other visitor's subject does NOT come back, which is the
     difference this test now records.
 
     MUTATION 2 (the payload): restore `subject` to `lookup_customer`'s SELECT and put
     `PROSE_OTHER_SUBJECT` back into the scripted prose. The run carries it again and the
     mask is what stands between it and the response — the state this fix replaced.
 
-    MUTATION 3 (legibility): make `_mask_pattern` a bare `re.escape(secret)` with no
-    word boundaries. "processing" becomes "[withheld]cessing" and the legibility
-    assertion reds — a mask that shreds ordinary English is one nobody keeps.
+    MUTATION 3 (the exemption widened): make `_collect_strings` skip the whole `customer`
+    record — `if owner == "customer": continue`. The name and plan assertions stay green
+    and the signup-date assertion reds.
 
-    MUTATION 4 (the short value): raise `_MIN_WITHHOLD_LEN` to 4. "pro" is no longer
-    collected and the plan assertion reds — three characters is the length at which the
-    deployed seed data's own plan names live.
+    MUTATION 4 (the exemption deleted): empty `_PERSONA_EXEMPT_FIELDS`. The name and plan
+    assertions red and the demo's payoff reads as a redacted document again.
 
-    NO LONGER A MUTATION OF THIS TEST, recorded rather than quietly dropped: deleting the
+    TWO MUTATIONS THIS TEST HAS LOST, both to the same cause, recorded rather than quietly
+    dropped. Both were carried by "pro", and "pro" is no longer harvested:
+
+    - Making `_mask_pattern` a bare `re.escape(secret)` used to turn "processing" into
+      "[withheld]cessing" and red the legibility assertion. Nothing this run harvests is a
+      substring of ordinary English any more (an address and two dates), so it now passes
+      under that mutation — MEASURED, not assumed. The word-boundary property is still
+      guarded, at unit level, by
+      `test_the_mask_covers_the_sub_token_and_whitespace_forms_of_a_name` (its "Miami"
+      case and its wrapped-name cases), which does red.
+    - Raising `_MIN_WITHHOLD_LEN` to 4 used to red the plan assertion, because "pro" is
+      three characters and was harvested. It no longer reds THIS test. The floor itself is
+      still guarded elsewhere and measured to be: that mutation reds
+      `test_the_harvest_takes_a_customer_record_apart_by_field` (on "pro" arriving under a
+      non-exempt key) and `test_the_mask_covers_the_sub_token_and_whitespace_forms_of_a_name`
+      (on "Mia", a three-character given name).
+
+    ALSO NO LONGER A MUTATION OF THIS TEST, recorded rather than quietly dropped: deleting the
     route's `authored=` argument used to red the "the visitor's own subject survives"
     assertion, because the lookup handed that subject back among the address's last ten
     and the harvest then withheld the visitor's words from the visitor. With `subject`
@@ -2268,12 +2359,16 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
     raw_by_type: dict[str, str] = {}
     for row in rows:
         raw_by_type[row["type"]] = raw_by_type.get(row["type"], "") + row["payload"]
-    assert PROSE_NAME in raw_by_type.get("tool_result", ""), (
-        "the looked-up customer's name never reached the lookup's stored result"
+    assert PROSE_SIGNED_UP in raw_by_type.get("tool_result", ""), (
+        "the looked-up customer's signup date never reached the lookup's stored result"
     )
-    assert PROSE_NAME in raw_by_type.get("text", ""), (
-        "the name was never restated in the model's prose — the vector is not armed"
+    assert PROSE_SIGNED_UP in raw_by_type.get("text", ""), (
+        "the signup date was never restated in the model's prose — the vector is not armed"
     )
+    # The two EXEMPT sentinels ride the same two rows, so the presence assertions below
+    # are about the exemption and not about a fixture that never carried them.
+    assert PROSE_NAME in raw_by_type.get("tool_result", "")
+    assert PROSE_NAME in raw_by_type.get("text", "")
     assert PROSE_PLAN in raw_by_type.get("text", "")
 
     # --- anti-vacuity, half two: the STRUCTURAL sentinel is in the database, its ticket
@@ -2313,10 +2408,11 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
 
     # --- the disclosure, closed -------------------------------------------------------
     assert body["demo"] is True, "not the full-fidelity branch — the test proves nothing"
-    # The mask's half: this literal WAS in the context and WAS restated.
-    assert PROSE_NAME not in whole, (
-        "the looked-up customer's name is on the keyless public route, restated by the"
-        " model"
+    # The mask's half: this literal WAS in the context and WAS restated, and it is the one
+    # the route does not hand in — so only `withheld_from_run` can have masked it.
+    assert PROSE_SIGNED_UP not in whole, (
+        "the looked-up customer's signup date is on the keyless public route, restated by"
+        " the model — a field the persona exemption does not name"
     )
     # The structural half's tail: a regression guard, not a proof — the value is absent
     # here because it was never in the run (asserted above), so this line only catches a
@@ -2325,35 +2421,276 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
         "another visitor's ticket subject reached the keyless public route by some path"
         " other than the lookup"
     )
-    # The plan, asserted as a WORD over the fields the model authored rather than over
-    # the whole document: "pro" occurs inside ordinary words, and an absence assertion
-    # that a knowledge-base chunk could break would say nothing about this vector.
     authored_fields = [s["text"] for s in body["steps"] if s.get("text")]
     authored_fields += [
         s["input"]["reason"] for s in body["steps"]
         if s.get("tool") == "create_escalation" and isinstance(s.get("input"), dict)
     ]
     assert authored_fields, "no model-authored field was published — vacuous"
-    for field in authored_fields:
-        assert not re.search(rf"\b{PROSE_PLAN}\b", field), (
-            f"the looked-up customer's plan survived in model-authored text: {field!r}"
-        )
+    prose = " ".join(authored_fields)
+
+    # --- and the exemption, in the same document ---------------------------------------
+    # The name and the plan came off the same record as the signup date above and out of
+    # the same sentence, and they are published. Asserted over the model-authored fields
+    # rather than the whole document: "pro" occurs inside ordinary words, so a presence
+    # assertion over `whole` could be satisfied by a knowledge-base chunk and would say
+    # nothing about this vector.
+    assert PROSE_NAME in prose, (
+        "the seeded persona's name was masked out of the demo's payoff prose — the reply"
+        " reads as a redacted document, which is the bug the exemption fixes"
+    )
+    assert re.search(rf"\b{PROSE_PLAN}\b", prose), (
+        f"the seeded persona's plan was masked out of the demo's payoff prose: {prose!r}"
+    )
 
     # --- and D-02's payoff is intact --------------------------------------------------
     # Redaction, not deletion: what the visitor wrote is still theirs to read.
     assert "[withheld]" in whole, "the prose lost its content instead of its secrets"
     assert PROSE_BODY in whole, "the visitor's own words were withheld from the visitor"
-    prose = " ".join(authored_fields)
     assert PROSE_OWN_SUBJECT in prose, (
         "the visitor's OWN subject was masked out of their own trace — it is what they"
         " typed, and withholding a visitor's words from themselves is not a security"
         " property. It survives structurally now (the lookup no longer returns any"
         " subject, so nothing harvests it) rather than by the `authored` exemption"
     )
-    # The mask is a token mask, not a substring shredder: ordinary English survives.
+    # The mask is a token mask, not a substring shredder: ordinary English survives. A
+    # REGRESSION GUARD, not proof — see the docstring. While "pro" was harvested this line
+    # red'd under a boundary-less `_mask_pattern`; nothing this run now harvests occurs
+    # inside an English word, so what it catches today is a FUTURE harvested literal that
+    # does. The proof of the boundary rule lives in the unit test named in the docstring.
     assert "processing" in prose, (
-        "masking the plan rewrote an unrelated word — a drill-down full of spurious"
+        "masking a literal rewrote an unrelated word — a drill-down full of spurious"
         " [withheld] markers teaches a visitor to ignore the real ones"
+    )
+
+
+# --- the persona exemption: the two fields the harvest deliberately does not take ------
+#
+# `events._PERSONA_EXEMPT_FIELDS` keeps the looked-up customer's `name` and `plan` out of
+# the mask, so the demo's payoff reply reads "Hi Mia, as a pro plan customer..." instead of
+# "Hi [withheld], as a [withheld] plan customer..." — the second was reproduced on the live
+# deployment, and a page that redacts its own product demo teaches every visitor to skim
+# past the marker.
+#
+# THE EXEMPTION IS SAFE ONLY BECAUSE RELAY'S CUSTOMERS ARE FIXTURES: four fictional
+# personas hardcoded in `db.SEED_CUSTOMERS` in a public repo. The tests below pin both
+# halves of that — the behaviour, and the condition it rests on.
+SEEDED_EMAIL, SEEDED_NAME, SEEDED_PLAN, SEEDED_SIGNED_UP = next(
+    row for row in SEED_CUSTOMERS if row[0] == "mia@datalane.ai"
+)
+
+
+def test_the_harvest_takes_a_customer_record_apart_by_field():
+    """The exemption's exact width, at the level it is written: which fields, and where.
+
+    Four properties in one assertion set, because the failure modes are opposite and each
+    one alone permits the others:
+
+    1. `customer.name` and `customer.plan` are NOT harvested — the payoff.
+    2. `customer.email` and `customer.signed_up` STILL ARE — the exemption did not widen
+       to the record, which is the mistake that would turn a legibility fix into the
+       disclosure the mask exists to prevent.
+    3. The same two literals arriving under ANY OTHER key ARE harvested — this is what
+       makes the exemption key-aware rather than a value-based skip list. A skip list of
+       "Mia Torres"/"pro" would unmask those strings everywhere, including where some
+       other tool returned them about somebody else.
+    4. A `plan` that is not a string is still harvested through. The exemption is
+       restricted to string values so a field that later carries a dict of free text does
+       not walk out through the hole its own key opened.
+
+    MUTATION 1: empty `_PERSONA_EXEMPT_FIELDS`. Property 1 reds.
+    MUTATION 2: in `_collect_strings`, skip on the key alone —
+    `if key in {"name", "plan"}: continue`. Property 3 reds, because the value-based-ish
+    form cannot tell the customer record from anything else that has a `name`.
+    MUTATION 3: in `_collect_strings`, skip the whole record — `if owner == "customer"`.
+    Property 2 reds.
+    MUTATION 4: drop the `isinstance(item, str)` guard from the skip. Property 4 reds.
+    """
+    harvested = set(withheld_from_run([({"type": "tool_result"}, {
+        "tool": "lookup_customer",
+        "result": {
+            "found": True,
+            "customer": {
+                "email": SEEDED_EMAIL,
+                "name": SEEDED_NAME,
+                "plan": SEEDED_PLAN,
+                "signed_up": SEEDED_SIGNED_UP,
+            },
+            "recent_tickets": [{"id": 7, "status": "open", "created_at": "2026-08-14"}],
+        },
+    })]))
+
+    # 1 — the exempt fields, whole and per component (`_name_components` splits a name, so
+    # the greeting form has to be absent too or the exemption does not reach the prose).
+    for value in (SEEDED_NAME, "Mia", "Torres", SEEDED_PLAN):
+        assert value not in harvested, (
+            f"{value!r} is still harvested — the demo's payoff prose publishes it as"
+            " [withheld] and reads as a redacted document"
+        )
+
+    # 2 — the rest of the SAME record is untouched.
+    for value in (SEEDED_EMAIL, SEEDED_SIGNED_UP):
+        assert value in harvested, (
+            f"{value!r} stopped being harvested — the exemption widened from two fields"
+            " to the whole customer record, which is a disclosure and not a legibility fix"
+        )
+
+    # 3 — the same literals under other keys, from a tool that is not the lookup.
+    elsewhere = set(withheld_from_run([({"type": "tool_result"}, {
+        "tool": NF1_TOOL,
+        "result": {"name": SEEDED_NAME, "plan": SEEDED_PLAN, "owner": SEEDED_NAME},
+    })]))
+    for value in (SEEDED_NAME, SEEDED_PLAN):
+        assert value in elsewhere, (
+            f"{value!r} was exempted by VALUE rather than by field — every other tool's"
+            " output carrying that string is now unmasked too"
+        )
+
+    # 4 — a non-string `plan` is not skipped.
+    nested = set(withheld_from_run([({"type": "tool_result"}, {
+        "tool": "lookup_customer",
+        "result": {"customer": {"plan": {"tier": "pro", "note": "NESTED-FREE-TEXT-3d71"}}},
+    })]))
+    assert "NESTED-FREE-TEXT-3d71" in nested, (
+        "free text nested under an exempt key escaped the harvest — the exemption must"
+        " skip string values only"
+    )
+
+
+def test_a_demo_run_publishes_the_seeded_personas_name_and_plan_in_the_clear(
+    client, monkeypatch
+):
+    """The payoff, end to end on the anonymous walk, with the DEPLOYED seed data.
+
+    The values are read out of `db.SEED_CUSTOMERS` rather than written here, so this is
+    the reply a visitor to the live demo actually gets — and if the seed data changes, the
+    test follows it instead of quietly testing a value nobody ships.
+
+    BOTH DIRECTIONS IN ONE DOCUMENT, which is the whole point: the persona's name and plan
+    are published, and the address and signup date from the SAME lookup result are not.
+    Without the second half an exemption that widened to the customer record would look
+    exactly like this one.
+
+    The signup date is the load-bearing absence. The address is also handed to the
+    projector by the route's own `withheld`, so masking it says nothing about the harvest;
+    the signup date can only have been masked by `withheld_from_run`.
+
+    MUTATION 1: empty `_PERSONA_EXEMPT_FIELDS`. Both presence assertions red — this is the
+    live behaviour the exemption was added to fix.
+    MUTATION 2: in `_collect_strings`, skip the whole `customer` record. The signup-date
+    absence reds.
+    MUTATION 3: in `project_run_detail`, make `prose_withheld` just `withheld`. The
+    signup-date absence reds — so this test also carries the harvest's own floor.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    visitor_body = "SEEDED-VISITOR-BODY-2e19"
+    ticket_id = _demo_ticket(
+        client, SEEDED_EMAIL, f"what is my rate limit? {visitor_body}"
+    )
+    assert _origin_of(ticket_id) == "demo"
+
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": SEEDED_EMAIL})]),
+        response([
+            text_block(
+                f"Hi {SEEDED_NAME.split()[0]}, thanks for reaching out! As a"
+                f" {SEEDED_PLAN} plan customer your workspace is allowed 600 requests"
+                f" per minute. I have {SEEDED_NAME} on file at {SEEDED_EMAIL} since"
+                f" {SEEDED_SIGNED_UP}."
+            ),
+            tool_use_block("create_escalation", {
+                "ticket_id": ticket_id,
+                "reason": (
+                    f"{SEEDED_NAME} ({SEEDED_PLAN} plan, {SEEDED_EMAIL}, since"
+                    f" {SEEDED_SIGNED_UP}) needs a limit raise. This ticket:"
+                    f" {visitor_body}"
+                ),
+                "priority": "high",
+            }),
+        ]),
+        response([text_block("escalated")], stop_reason="end_turn"),
+    ])
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    assert "event: error" not in resp.text
+    uid = resp.headers["X-Relay-Run-Uid"]
+
+    # Anti-vacuity: all four values really rode the lookup's stored result, so each verdict
+    # below is a decision the harvest made rather than a value the fixture never carried.
+    lookups = [
+        r["payload"] for r in app.state.conn.execute(
+            "SELECT type, payload FROM run_events WHERE run_uid = ?", (uid,)
+        ).fetchall()
+        if r["type"] == "tool_result" and '"lookup_customer"' in r["payload"]
+    ]
+    assert lookups, "the run never looked the customer up"
+    for value in (SEEDED_NAME, SEEDED_PLAN, SEEDED_EMAIL, SEEDED_SIGNED_UP):
+        assert any(value in payload for payload in lookups), (
+            f"{value!r} never reached the lookup's stored result"
+        )
+
+    with _anon(client) as anon:
+        body = anon.get(f"/runs/{uid}").json()
+    assert body["demo"] is True, "not the full-fidelity branch — the test proves nothing"
+    whole = json.dumps(body)
+
+    authored_fields = [s["text"] for s in body["steps"] if s.get("text")]
+    authored_fields += [
+        s["input"]["reason"] for s in body["steps"]
+        if s.get("tool") == "create_escalation" and isinstance(s.get("input"), dict)
+    ]
+    assert authored_fields, "no model-authored field was published — vacuous"
+    prose = " ".join(authored_fields)
+
+    # The payoff: the reply reads as a reply.
+    assert SEEDED_NAME in prose, (
+        f"the seeded persona's name was withheld from the demo's own reply: {prose!r}"
+    )
+    assert SEEDED_NAME.split()[0] in prose, "the greeting form was withheld"
+    assert re.search(rf"\b{SEEDED_PLAN}\b", prose), (
+        f"the seeded persona's plan was withheld from the demo's own reply: {prose!r}"
+    )
+
+    # And the exemption did not widen: two other fields of the same record, still masked.
+    assert SEEDED_SIGNED_UP not in whole, (
+        "the persona's signup date is on the keyless public route — the exemption covers"
+        " two named fields, not the customer record"
+    )
+    assert SEEDED_EMAIL not in whole, "the persona's address is on the keyless public route"
+    assert "[withheld]" in prose, "nothing was masked at all — the mask is not running"
+    assert visitor_body in whole, "the visitor's own words were withheld from the visitor"
+
+
+def test_nothing_outside_the_seed_creates_a_customer_row():
+    """The CONDITION `_PERSONA_EXEMPT_FIELDS` rests on, asserted instead of assumed.
+
+    Publishing a customer's name and plan on a keyless route is only defensible while
+    every customer is one of four fictional personas hardcoded in a public repo. The day
+    this service gains a signup path, an import or a CRM sync, the exemption stops being a
+    legibility fix and becomes the disclosure the mask exists to prevent — and the person
+    who adds that path is not going to be reading events.py.
+
+    So this fails at their feet instead, and the message tells them where the lever is.
+
+    STATED PLAINLY, THIS IS A REGRESSION GUARD, NOT A PROOF. It is a static scan of
+    `src/relay` for `INSERT INTO customers`; an ORM, a raw migration file, an admin script
+    or a manual `sqlite3` session on the Fly volume all go around it. What it catches is
+    the ordinary way this codebase would grow that path, which is the case worth catching.
+
+    MUTATION: add `INSERT INTO customers (email) VALUES (?)` to any module under
+    `src/relay` other than db.py. This reds and names the file.
+    """
+    src = Path(__file__).parent.parent / "src" / "relay"
+    pattern = re.compile(r"INSERT\s+(OR\s+\w+\s+)?INTO\s+customers", re.IGNORECASE)
+    offenders = sorted(
+        path.name for path in src.glob("*.py")
+        if path.name != "db.py" and pattern.search(path.read_text(encoding="utf-8"))
+    )
+    assert offenders == [], (
+        f"{offenders} writes customer rows, so this service no longer holds only the"
+        " four fictional personas in db.SEED_CUSTOMERS. That is the condition"
+        " events._PERSONA_EXEMPT_FIELDS is safe under: it publishes a customer's name and"
+        " plan on the keyless GET /runs/{uid}. Delete that set (or narrow it to ids you"
+        " can prove are fictional) before shipping this."
     )
 
 
@@ -2366,7 +2703,13 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
 # sentinels below are their own set because the property is the inverse of every other
 # test in this file: what must SURVIVE, and beside it the proof the mask still ran.
 STATUS_EMAIL = "status-legibility-2f6b@example.com"
-STATUS_NAME = "STATUS-CUSTOMER-NAME-4d91"      # customers.name — must still be masked
+STATUS_NAME = "STATUS-CUSTOMER-NAME-4d91"      # customers.name — EXEMPT, and unasserted here
+# customers.signed_up — free text from the same lookup result, and NOT exempt. This is the
+# "the mask is still running" half. It used to be STATUS_NAME; the persona exemption
+# reversed that premise, and the signup date replaces it at the same strength: same tool,
+# same result, same record, still harvested, and — unlike the address — not also handed to
+# the projector by the route, so masking it can only be the run-derived harvest.
+STATUS_SIGNED_UP = "STATUS-SIGNUP-DATE-7c25"
 STATUS_BODY = "STATUS-VISITOR-BODY-8e07"       # the visitor's own words
 
 
@@ -2380,7 +2723,7 @@ def _seed_the_status_customer() -> None:
     """
     app.state.conn.execute(
         "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
-        (STATUS_EMAIL, STATUS_NAME, "enterprise", "2025-01-01"),
+        (STATUS_EMAIL, STATUS_NAME, "enterprise", STATUS_SIGNED_UP),
     )
     app.state.conn.execute(
         "INSERT INTO tickets (customer_email, subject, body, status, origin)"
@@ -2402,13 +2745,20 @@ def test_a_demo_runs_prose_keeps_the_words_relay_itself_assigns(client, monkeypa
 
     BOTH HALVES, because either alone is worthless. If the statuses survive but the mask
     is not running, this passes against a completely unredacted response; so the
-    customer's NAME (free text, and in the same lookup result) must be masked in the same
-    document. If the mask runs but the statuses vanish, that is the shipped bug.
+    customer's SIGNUP DATE (free text, in the same lookup result, and not exempt) must be
+    masked in the same document. If the mask runs but the statuses vanish, that is the
+    shipped bug.
+
+    THAT SECOND HALF USED TO BE THE CUSTOMER'S NAME, and it was re-pointed rather than
+    dropped when the name became exempt (`events._PERSONA_EXEMPT_FIELDS`). The signup date
+    is the same strength: same tool, same result, same record, still harvested — and it is
+    strictly better at isolating the harvest, because the address that also rides that
+    record is handed to the projector by the route as well.
 
     MUTATION: drop the `_ENUMERABLE_VALUES` condition from `_collect_strings` in
-    events.py — i.e. harvest every string again. The statuses come back out as
-    "[withheld]" and the survival assertions red while the name assertion stays green,
-    which is what tells the two halves apart.
+    events.py — i.e. harvest every non-exempt string again. The statuses come back out as
+    "[withheld]" and the survival assertions red while the signup-date assertion stays
+    green, which is what tells the two halves apart.
 
     Anti-vacuity: the statuses really are in the lookup's stored result (so the harvest
     had them to take), and the published prose really is model-authored text.
@@ -2422,14 +2772,14 @@ def test_a_demo_runs_prose_keeps_the_words_relay_itself_assigns(client, monkeypa
         response([tool_use_block("lookup_customer", {"email": STATUS_EMAIL})]),
         response([
             text_block(
-                f"{STATUS_NAME} has two tickets: this one is still open and the earlier"
-                f" one is resolved."
+                f"{STATUS_NAME} (signed up {STATUS_SIGNED_UP}) has two tickets: this one"
+                f" is still open and the earlier one is resolved."
             ),
             tool_use_block("create_escalation", {
                 "ticket_id": ticket_id,
                 "reason": (
-                    f"{STATUS_NAME} has one open ticket and one resolved. This ticket:"
-                    f" {STATUS_BODY}"
+                    f"{STATUS_NAME} (signed up {STATUS_SIGNED_UP}) has one open ticket"
+                    f" and one resolved. This ticket: {STATUS_BODY}"
                 ),
                 "priority": "high",
             }),
@@ -2449,9 +2799,9 @@ def test_a_demo_runs_prose_keeps_the_words_relay_itself_assigns(client, monkeypa
         if r["type"] == "tool_result" and '"lookup_customer"' in r["payload"]
     ]
     assert lookups, "the run never looked the customer up"
-    for status in ('"status": "open"', '"status": "resolved"'):
-        assert any(status in payload for payload in lookups), (
-            f"the lookup result never carried {status} — the harvest had nothing to take"
+    for value in ('"status": "open"', '"status": "resolved"', STATUS_SIGNED_UP):
+        assert any(value in payload for payload in lookups), (
+            f"the lookup result never carried {value} — the harvest had nothing to take"
         )
 
     with _anon(client) as anon:
@@ -2475,8 +2825,8 @@ def test_a_demo_runs_prose_keeps_the_words_relay_itself_assigns(client, monkeypa
 
     # Half two: the mask is still running in this very document, on free text from the
     # same tool result. Without this the assertions above would pass against no mask.
-    assert STATUS_NAME not in whole, (
-        "the looked-up customer's name survived — the mask is not running, so the"
+    assert STATUS_SIGNED_UP not in whole, (
+        "the looked-up customer's signup date survived — the mask is not running, so the"
         " statuses above prove nothing"
     )
     assert "[withheld]" in prose, "no literal was masked at all in the published prose"
@@ -2485,22 +2835,77 @@ def test_a_demo_runs_prose_keeps_the_words_relay_itself_assigns(client, monkeypa
 
 # --- NF-1: the forms a name is actually written in ------------------------------------
 #
-# The mask is whole-token by design and the harvested literal is the WHOLE `customers.name`
-# value, so "Hi Mia," walked past a mask holding "Mia Torres" — and "Hi Mia," is not an
-# edge case, it is what prompts.py asks for by name ("Address the customer by name").
-# These sentinels are a realistically SHAPED name rather than an uppercase slug, because
-# the harvest's component split is gated on the value looking like a proper noun: a
-# sentinel that is not name-shaped would test a code path the deployed seed data cannot
-# reach.
+# The mask is whole-token by design and the harvested literal is a WHOLE proper-noun-shaped
+# value, so "Hi Marisol," walked past a mask holding "Marisol Quintanilla" — and the
+# greeting is not an edge case, it is what prompts.py asks for by name ("Address the
+# customer by name"). These sentinels are a realistically SHAPED name rather than an
+# uppercase slug, because the harvest's component split is gated on the value looking like
+# a proper noun: a sentinel that is not name-shaped would test a code path nothing reaches.
+#
+# WHERE THE NAME COMES FROM CHANGED, and this is the coverage note rather than a detail.
+# It used to be `customers.name`, which is now exempt (`events._PERSONA_EXEMPT_FIELDS`),
+# so the SHIPPED registry no longer produces any harvested proper-noun-shaped value at all
+# — `lookup_customer` is the one non-allowlisted tool in it, and its remaining harvested
+# fields are an address and two dates. `_name_components` is therefore unreachable through
+# today's tools, and it is kept because `_DEMO_RAW_TOOLS` is DEFAULT-DENY: the property it
+# holds is "a tool added later has its output withheld from the model's prose, in every
+# form the model writes it", and that promise is made to a tool that does not exist yet.
+# So that is what these tests drive — one extra READ tool registered on the live registry,
+# named for what it stands for. Stated plainly: this is coverage of a documented contract
+# for a future caller, not of a path a visitor can walk today.
 NF1_EMAIL = "nf1-greeting-6b30@example.com"
+NF1_PERSONA = "NF1-CUSTOMER-NAME-8a52"     # customers.name — exempt, published in the clear
+NF1_TOOL = "lookup_account_owner"
 NF1_FIRST = "Marisol"
 NF1_LAST = "Quintanilla"
 NF1_NAME = f"{NF1_FIRST} {NF1_LAST}"
+NF1_ACCOUNT = "acct-4471"
 NF1_BODY = "NF1-VISITOR-BODY-31c7"
 
 
-def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, monkeypatch):
-    """NF-1, walked anonymously: the sub-token forms of the name are covered too.
+class _AccountOwnerInput(BaseModel):
+    account: str
+
+
+@contextmanager
+def _a_tool_added_later(result: dict):
+    """Register one extra READ tool on the live registry, for the length of one block.
+
+    `_DEMO_RAW_TOOLS` is default-deny so that a tool added later is redacted — as a raw
+    payload AND, through `withheld_from_run`, as the model's restatement of it — until
+    somebody names it there on purpose. Nothing in the shipped registry exercises that
+    promise any more: the one non-allowlisted tool is `lookup_customer`, whose only
+    proper-noun-shaped field is exempt. So the tool is added here, on the real registry the
+    route reads for `known_tools`, and the walk is otherwise the shipped one.
+
+    Restored in a finally even though the `client` fixture rebuilds `app.state` per test:
+    a registry left mutated is the kind of cross-test coupling that presents as flakiness.
+    """
+    spec = ToolSpec(
+        schema={
+            "name": NF1_TOOL,
+            "description": "Look up the person who owns an account.",
+            "input_schema": {
+                "type": "object",
+                "properties": {"account": {"type": "string"}},
+                "required": ["account"],
+                "additionalProperties": False,
+            },
+        },
+        tier="read",
+        input_model=_AccountOwnerInput,
+        execute=lambda account: json.dumps(result),
+    )
+    saved = app.state.registry
+    app.state.registry = {**saved, NF1_TOOL: spec}
+    try:
+        yield
+    finally:
+        app.state.registry = saved
+
+
+def test_a_demo_runs_greeting_cannot_republish_a_harvested_first_name(client, monkeypatch):
+    """NF-1, walked anonymously: the sub-token forms of a harvested name are covered too.
 
     THE SAME WALK as the prose test above — no credential, /metrics, harvest a uid,
     GET /runs/{uid} — against the form the model actually writes. The verifier's table:
@@ -2508,7 +2913,14 @@ def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, 
     are sub-tokens and whitespace variants of the literal the mask claims to hold, not the
     paraphrase vector this file concedes; a paraphrase shares no substring.
 
-    ANTI-VACUITY, both halves: the full name really is in the lookup's stored result (so
+    THE LITERAL MOVED, AND THE COVERAGE THIS TEST NOW HAS IS NARROWER. It used to be the
+    looked-up customer's own name, which is exempt now, so the harvested name here comes
+    from a tool added later — see `_a_tool_added_later` and the section comment for why
+    that is the only remaining source and what it does and does not prove. The mask
+    machinery under test is unchanged; what changed is that no visitor can walk this
+    vector today, and the guard exists for the tool that reintroduces it.
+
+    ANTI-VACUITY, both halves: the full name really is in that tool's stored result (so
     the harvest had it to take), and the GREETING FORM really is in the model's stored
     prose (so its absence downstream can only be the mask, not a model that never wrote
     it).
@@ -2516,12 +2928,16 @@ def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, 
     MUTATION that must turn this red: make `_name_components` in events.py return `[]`
     unconditionally — i.e. harvest the name only as a whole string, which is the shipped
     behaviour NF-1 was raised against. The greeting and the possessive republish the
-    customer's given name on the keyless route.
+    given name on the keyless route.
 
     SECOND MUTATION: drop the `islower()` gate in `_name_components` so every multi-word
     value is split. This test stays green under it — the gate is guarded by
     `test_the_component_split_leaves_a_tool_error_as_one_literal` below, and stated here
     so nobody reads this test as covering the boundary as well as the disclosure.
+
+    THIRD MUTATION: add `NF1_TOOL` to `_DEMO_RAW_TOOLS`. Every absence assertion reds at
+    once — which is the default-deny half, and the reason the fixture is a REGISTERED tool
+    rather than a hand-written row.
 
     The whitespace-run half of NF-1 (a name written across a line break, or with a double
     space, masking to ONE marker rather than two) is pinned in the unit test below, where
@@ -2530,7 +2946,7 @@ def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, 
     monkeypatch.setattr(settings, "voyage_api_key", None)
     app.state.conn.execute(
         "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
-        (NF1_EMAIL, NF1_NAME, "enterprise", "2025-01-01"),
+        (NF1_EMAIL, NF1_PERSONA, "enterprise", "2025-01-01"),
     )
     app.state.conn.commit()
     ticket_id = _demo_ticket(client, NF1_EMAIL, f"charged twice. {NF1_BODY}")
@@ -2538,6 +2954,7 @@ def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, 
 
     app.state.client = FakeClient([
         response([tool_use_block("lookup_customer", {"email": NF1_EMAIL})]),
+        response([tool_use_block(NF1_TOOL, {"account": NF1_ACCOUNT})]),
         response([
             text_block(
                 f"Hi {NF1_FIRST}, thanks for writing. I am processing this now and"
@@ -2553,33 +2970,37 @@ def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, 
         ]),
         response([text_block("escalated")], stop_reason="end_turn"),
     ])
-    resp = client.post(f"/tickets/{ticket_id}/process")
-    assert "event: error" not in resp.text
-    uid = resp.headers["X-Relay-Run-Uid"]
+    with _a_tool_added_later({"owner": NF1_NAME, "account": NF1_ACCOUNT}):
+        resp = client.post(f"/tickets/{ticket_id}/process")
+        assert "event: error" not in resp.text
+        uid = resp.headers["X-Relay-Run-Uid"]
 
-    rows = app.state.conn.execute(
-        "SELECT type, payload FROM run_events WHERE run_uid = ?", (uid,)
-    ).fetchall()
-    lookups = [
-        r["payload"] for r in rows
-        if r["type"] == "tool_result" and '"lookup_customer"' in r["payload"]
-    ]
-    assert lookups, "the run never looked the customer up"
-    assert any(NF1_NAME in payload for payload in lookups), (
-        "the whole name never reached the lookup's stored result — the harvest had"
-        " nothing to split"
-    )
-    assert any(
-        f"Hi {NF1_FIRST}," in r["payload"] for r in rows if r["type"] == "text"
-    ), "the greeting form was never written — the vector is not armed"
+        rows = app.state.conn.execute(
+            "SELECT type, payload FROM run_events WHERE run_uid = ?", (uid,)
+        ).fetchall()
+        owner_results = [
+            r["payload"] for r in rows
+            if r["type"] == "tool_result" and f'"{NF1_TOOL}"' in r["payload"]
+        ]
+        assert owner_results, "the run never called the tool the name rides on"
+        assert any(NF1_NAME in payload for payload in owner_results), (
+            "the whole name never reached that tool's stored result — the harvest had"
+            " nothing to split"
+        )
+        assert any(
+            f"Hi {NF1_FIRST}," in r["payload"] for r in rows if r["type"] == "text"
+        ), "the greeting form was never written — the vector is not armed"
 
-    with _anon(client) as anon:
-        metrics = anon.get("/metrics")
-        assert metrics.status_code == 200
-        assert uid in [
-            r["run_uid"] for r in metrics.json()["last_runs"] if r.get("run_uid")
-        ], "the uid is not anonymously enumerable — this is not the reproduction's walk"
-        detail = anon.get(f"/runs/{uid}")
+        # Inside the block: the route reads `known_tools` off the live registry, and a
+        # drill-down taken after the tool is gone would render it "unknown" and test a
+        # different projection than the one a deployed registry produces.
+        with _anon(client) as anon:
+            metrics = anon.get("/metrics")
+            assert metrics.status_code == 200
+            assert uid in [
+                r["run_uid"] for r in metrics.json()["last_runs"] if r.get("run_uid")
+            ], "the uid is not anonymously enumerable — this is not the reproduction's walk"
+            detail = anon.get(f"/runs/{uid}")
     assert detail.status_code == 200
     body = detail.json()
     whole = json.dumps(body)
@@ -2599,7 +3020,7 @@ def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, 
         (NF1_LAST, "the surname"),
     ):
         assert form not in whole, (
-            f"{why} of the looked-up customer is on the keyless public route: {prose!r}"
+            f"{why} that a later tool returned is on the keyless public route: {prose!r}"
         )
 
     # D-02's payoff is intact: redaction, not deletion, and ordinary English survives.
@@ -2611,12 +3032,13 @@ def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, 
     )
 
 
-def _harvest_of_a_lookup(name: str, plan: str = "pro") -> tuple[str, ...]:
+def _harvest_of_a_lookup(name: str = "Mia Torres", plan: str = "pro") -> tuple[str, ...]:
     """The real harvest off a real-shaped `lookup_customer` result.
 
     Built through `withheld_from_run` rather than by hand so the literals under test are
     the ones the shipped code produces — a hand-written tuple would pass whatever the
-    harvest did.
+    harvest did. Defaulted to the deployed seed data's own persona, because what this is
+    used for now is asserting which of that record's fields the harvest DOES NOT take.
     """
     return withheld_from_run([({"type": "tool_result"}, {
         "tool": "lookup_customer",
@@ -2633,6 +3055,19 @@ def _harvest_of_a_lookup(name: str, plan: str = "pro") -> tuple[str, ...]:
     })])
 
 
+def _harvest_of_a_later_tools_row(owner: str) -> tuple[str, ...]:
+    """The harvest off a tool that is not in `_DEMO_RAW_TOOLS` and is not the lookup.
+
+    The only remaining source of a harvested PROPER-NOUN-SHAPED value: see the NF-1 section
+    comment. The tool name is fictional on purpose — default-deny means an unrecognised one
+    is harvested, which is the whole property being relied on here.
+    """
+    return withheld_from_run([({"type": "tool_result"}, {
+        "tool": NF1_TOOL,
+        "result": {"owner": owner, "account": NF1_ACCOUNT},
+    })])
+
+
 def test_the_mask_covers_the_sub_token_and_whitespace_forms_of_a_name():
     """NF-1 at the unit level: every rendering in the verifier's table, and its shape.
 
@@ -2646,6 +3081,10 @@ def test_the_mask_covers_the_sub_token_and_whitespace_forms_of_a_name():
     "[withheld]  [withheld] here", which is the over-marking NF-4 warns costs more than it
     protects.
 
+    The literal is a later tool's free text rather than `customers.name`, for the reason
+    the section comment gives: the seeded personas' names are exempt now, so this is the
+    machinery holding for every value that is still harvested.
+
     MUTATION 1: `_name_components` returns `[]`. The greeting, the possessive and the
     bare-surname cases red — the shipped NF-1 bug.
 
@@ -2653,11 +3092,13 @@ def test_the_mask_covers_the_sub_token_and_whitespace_forms_of_a_name():
     `re.escape(secret)`. The wrapped and double-spaced cases red: the whole-name literal
     stops matching and the output carries two markers where the name is one value.
 
-    MUTATION 3: raise `_MIN_WITHHOLD_LEN` to 4 — nothing here reds, and that is recorded
-    rather than hidden: no component under test is three characters. The short-value rule
-    is pinned by the shipped `pro` assertions elsewhere in this file.
+    MUTATION 3: raise `_MIN_WITHHOLD_LEN` to 4. This DOES red, at the harvest assertion —
+    "Mia" is three characters, and it is the greeting form the system prompt asks for.
+    (The docstring here used to claim the opposite — "nothing here reds, no component under
+    test is three characters" — which was false in the shipped tree and is the kind of
+    claim this project keeps finding. Measured, not reasoned about.)
     """
-    withheld = _harvest_of_a_lookup("Mia Torres")
+    withheld = _harvest_of_a_later_tools_row("Mia Torres")
     assert {"Mia Torres", "Mia", "Torres"} <= set(withheld), (
         "the harvest did not take the name whole AND per component — every case below"
         " would then be testing a mask that was never given the literal"
@@ -2744,9 +3185,18 @@ def test_the_component_split_leaves_a_tool_error_as_one_literal():
 # unit-level in their fixtures (rows built by hand, no model, no HTTP) and that is stated
 # rather than implied: the anonymous-walk tests above are what prove the route; these
 # prove the properties those tests would silently stop depending on.
-NF3_NAME = "Mireille Vasquez"                      # customers.name — proper-noun shaped
+#
+# THE HARVESTED LITERAL MOVED, for the reason the NF-1 section states: `customers.name`
+# and `customers.plan` are exempt now (`events._PERSONA_EXEMPT_FIELDS`), so the fixture
+# below carries the SAME person's name back through a tool added later — the case
+# `_DEMO_RAW_TOOLS`'s default-deny exists for. The properties under test are properties of
+# the MASK, not of the lookup, and every one of them still has to hold for every literal
+# the harvest does take. The customer record is kept in the fixture because its `email` is
+# the route's own withheld literal and NF-3 (5) is about the overlap between the two.
+NF3_NAME = "Mireille Vasquez"          # a later tool's free text — proper-noun shaped
 NF3_EMAIL = "mireille@northwind-labs.example"      # the route's own withheld literal
-NF3_PLAN = "enterprise"
+NF3_TIER = "platinum"                  # a later tool's free text — short and recasable
+NF3_PLAN = "enterprise"                # customers.plan — EXEMPT, and not asserted on here
 
 
 def _stored_rows(*events: tuple[str, dict]) -> list[dict]:
@@ -2763,7 +3213,7 @@ def _stored_rows(*events: tuple[str, dict]) -> list[dict]:
 
 
 def _lookup_row(name: str = NF3_NAME, email: str = NF3_EMAIL) -> tuple[str, dict]:
-    """One stored `lookup_customer` result — the tool the whole mask is derived from."""
+    """One stored `lookup_customer` result. `email` is what the harvest still takes here."""
     return ("tool_result", {"tool": "lookup_customer", "is_error": False, "result": {
         "found": True,
         "customer": {
@@ -2771,6 +3221,24 @@ def _lookup_row(name: str = NF3_NAME, email: str = NF3_EMAIL) -> tuple[str, dict
         },
         "recent_tickets": [{"id": 7, "status": "open", "created_at": "2026-08-14"}],
     }})
+
+
+def _owner_row(name: str = NF3_NAME, tier: str = NF3_TIER) -> tuple[str, dict]:
+    """One stored result from a tool added later — where the harvested NAME comes from.
+
+    Not `lookup_customer`: a customer record's `name` and `plan` are exempt by field, so
+    the shipped lookup no longer supplies a proper-noun-shaped literal for the mask to be
+    tested against. This is the same person, reached by the tool `_DEMO_RAW_TOOLS`'s
+    default-deny is written for.
+    """
+    return ("tool_result", {"tool": NF1_TOOL, "is_error": False, "result": {
+        "owner": name, "tier": tier, "account": NF1_ACCOUNT,
+    }})
+
+
+def _harvested_rows() -> tuple[tuple[str, dict], ...]:
+    """The two stored results every NF-3 fixture below derives its mask from."""
+    return (_lookup_row(), _owner_row())
 
 
 def _only_step(steps: list[dict], type_: str) -> dict:
@@ -2781,9 +3249,11 @@ def _only_step(steps: list[dict], type_: str) -> dict:
     return matching[0]
 
 
-def _harvest_of_the_lookup_row() -> tuple[str, ...]:
-    """The literals the shipped harvest derives from `_lookup_row`'s stored result."""
-    return withheld_from_run([({"type": "tool_result"}, _lookup_row()[1])])
+def _harvest_of_the_rows() -> tuple[str, ...]:
+    """The literals the shipped harvest derives from `_harvested_rows`."""
+    return withheld_from_run([
+        ({"type": "tool_result"}, payload) for _, payload in _harvested_rows()
+    ])
 
 
 def _demo_steps(rows: list[dict], **kwargs) -> list[dict]:
@@ -2793,6 +3263,7 @@ def _demo_steps(rows: list[dict], **kwargs) -> list[dict]:
         full_fidelity=True,
         known_tools={
             "lookup_customer": frozenset({"email"}),
+            NF1_TOOL: frozenset({"account"}),
             "search_docs": frozenset({"query"}),
             "send_reply": frozenset({"ticket_id", "body", "citations"}),
         },
@@ -2803,10 +3274,9 @@ def _demo_steps(rows: list[dict], **kwargs) -> list[dict]:
 def test_the_mask_catches_a_literal_the_model_recased():
     """NF-3 (1): `re.IGNORECASE` is load-bearing, and no test wrote a recased restatement.
 
-    The mask's docstring argues the case explicitly — "the model writes 'Pro' for the
-    plan it read as 'pro'" — because a restatement is not a copy. The model reads the
-    lookup's JSON and writes English, and English recases: a name at the start of a
-    sentence, a plan in title case, a shouted "ENTERPRISE".
+    The mask's docstring argues the case explicitly — a restatement is not a copy. The
+    model reads a tool's JSON and writes English, and English recases: a name at the start
+    of a sentence, a tier in title case, a shouted "PLATINUM".
 
     BOTH HALVES, or this proves nothing: the exact-cased literal must be masked (so the
     mask is running at all) and the recased ones must be masked too (so it is running
@@ -2817,17 +3287,17 @@ def test_the_mask_catches_a_literal_the_model_recased():
     the shape a case-sensitive mask fails in — it catches the vector it was shown.
     """
     written = (
-        f"{NF3_NAME} is on the {NF3_PLAN} plan."
-        f" MIREILLE VASQUEZ upgraded to ENTERPRISE last week, and Mireille asked again."
+        f"{NF3_NAME} is on the {NF3_TIER} tier."
+        f" MIREILLE VASQUEZ upgraded to PLATINUM last week, and Mireille asked again."
     )
-    steps = _demo_steps(_stored_rows(_lookup_row(), ("text", {"text": written})))
+    steps = _demo_steps(_stored_rows(*_harvested_rows(), ("text", {"text": written})))
     published = _only_step(steps, "text")["text"]
 
     assert "[withheld]" in published, "no literal was masked at all — the mask is not on"
     assert NF3_NAME not in published, (
         "the exact-cased name survived — this test is not about casing at all"
     )
-    for recased in ("MIREILLE VASQUEZ", "ENTERPRISE", "Mireille"):
+    for recased in ("MIREILLE VASQUEZ", "PLATINUM", "Mireille"):
         assert recased not in published, (
             f"the model recased the literal as {recased!r} and it was published:"
             f" {published!r}"
@@ -2853,7 +3323,7 @@ def test_the_mask_covers_a_secret_the_model_used_as_a_dict_key():
     on the keyless route as a JSON key.
     """
     rows = _stored_rows(
-        _lookup_row(),
+        *_harvested_rows(),
         ("tool_use", {"tool": "search_docs", "input": {
             "query": "billing cycle",
             f"note for {NF3_NAME}": "their plan question",
@@ -2937,7 +3407,7 @@ def test_the_guardrails_missing_citations_are_masked():
     keyless route through the one field the guardrail branch composes from model output.
     """
     rows = _stored_rows(
-        _lookup_row(),
+        *_harvested_rows(),
         ("guardrail", {
             "guard": "citation", "tool": "send_reply", "action": "denied",
             "missing_citations": [f"{NF3_NAME}-account-notes.md"],
@@ -2986,12 +3456,12 @@ def test_masking_longest_first_leaves_no_tail_of_a_longer_literal():
     """
     written = f"I emailed {NF3_EMAIL} about the charge."
     steps = _demo_steps(
-        _stored_rows(_lookup_row(), ("text", {"text": written})),
+        _stored_rows(*_harvested_rows(), ("text", {"text": written})),
         withheld=(NF3_EMAIL,),
     )
     published = _only_step(steps, "text")["text"]
 
-    assert "Mireille" in _harvest_of_the_lookup_row(), (
+    assert "Mireille" in _harvest_of_the_rows(), (
         "the harvest no longer yields the name component that overlaps the address —"
         " the overlap this test is about does not exist and it proves nothing"
     )
