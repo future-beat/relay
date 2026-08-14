@@ -537,6 +537,19 @@ async def run_detail(run_uid: str) -> dict:
     passed to the projector as a `withheld` literal so the model's prose cannot carry it
     out either.
 
+    This route passes ONE literal, and deliberately no longer tries to enumerate the
+    rest. The address is what the model was handed in its prompt, so it can appear in
+    prose even when the lookup missed and no tool result carries it; everything else the
+    run looked up is derived by the projector from the run's own tool results
+    (`withheld_from_run`), because a list assembled here would only ever cover the
+    columns whoever last edited this function thought of. The customer's NAME, their
+    PLAN and the ticket SUBJECTS beside them were exactly that gap: masked nowhere,
+    restated into prose by a model this service's own prompt instructs to read them.
+
+    None of that makes prose safe, and this docstring will not claim it does: masking is
+    by literal, so a paraphrase of what the run looked up survives it. See
+    `project_run_detail`.
+
     A run whose steps the 30-day retention swept is NOT a 404. `purge_expired_run_events`
     deliberately spares the `runs` row, so "no steps" is the normal end state of the back
     catalogue, and a visitor following a link into it has to be able to tell "this run
@@ -605,11 +618,13 @@ async def run_detail(run_uid: str) -> dict:
         raise HTTPException(404, "unknown run")
 
     demo = origin == "demo"
-    # The literals the demo branch must not republish at any depth, whatever field they
-    # arrive in. Exactly one today: the address the ticket names, which /tickets accepts
-    # from anyone holding the published key and which the model's own prose restates
-    # once lookup_customer has read it back. Empty off the demo branch, where nothing
-    # raw is published for it to hide in.
+    # The one literal only THIS route knows: the address the ticket names, which
+    # /tickets accepts from anyone holding the published key and which reaches the model
+    # through the prompt rather than through a tool result — so it is still in the prose
+    # of a run whose lookup returned {"found": false} and whose rows therefore carry it
+    # nowhere. Everything the run LOOKED UP is the projector's to derive from the run's
+    # own rows; adding it here would be a second, staler copy of that decision. Empty off
+    # the demo branch, where nothing raw is published for a literal to hide in.
     withheld = ()
     if demo and ticket is not None and ticket["customer_email"]:
         withheld = (ticket["customer_email"],)
@@ -653,6 +668,10 @@ async def run_detail(run_uid: str) -> dict:
                 for name, spec in app.state.registry.items()
             },
             withheld=withheld,
+            # The visitor's own subject, which `lookup_customer` hands back among the
+            # address's last ten tickets — this run's own row is one of them. Without
+            # it the run-derived mask withholds the visitor's words from the visitor.
+            authored=(ticket["subject"],) if demo and ticket is not None else (),
         ),
     }
     if note is not None:
