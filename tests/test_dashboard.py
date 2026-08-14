@@ -2840,10 +2840,22 @@ def test_the_drill_panel_renders_the_run_states(client):
     assert "None" not in html
 
 
-# A frame field concatenated straight into a step line: `+ f.reason` or `d.tool +`.
-# The lookbehind keeps `head.textContent +` from reading as `d.textContent +`.
+# A frame field reaching rendered text without the placeholder helper, in either of the
+# two ways it can: concatenated into a line (`+ f.reason`, `d.tool +`) or handed straight
+# to `el(...)` as its text argument (`el("span", { class: "score" }, r.score)`).
+#
+# Both alternations were needed and neither was there. `s.` — the drill panel's step
+# fields — was outside the prefix class entirely, which is how `renderStepBody` came to
+# interpolate ten of them bare while this test was cited as the reason WR-10 was fixed.
+# And a bare `el()` argument has no `+` anywhere near it, so unwrapping `dash(r.score)`
+# inside `renderChunks` — a function this test DOES scan — left the suite green.
+#
+# The lookbehind keeps `head.textContent +` from reading as `d.textContent +`, and
+# `steps.forEach` / `chips.append` / `results.forEach` from reading as `s.forEach`.
 _BARE_FRAME_FIELD = re.compile(
-    r"\+\s*(?<![\w$.])[fdr]\.\w+|(?<![\w$.])[fdr]\.\w+\s*\+"
+    r"\+\s*(?<![\w$.])[fdrs]\.\w+"
+    r"|(?<![\w$.])[fdrs]\.\w+\s*\+"
+    r"|,\s*(?<![\w$.])[fdrs]\.\w+\s*\)"
 )
 
 
@@ -2863,11 +2875,35 @@ def test_no_step_describer_interpolates_a_raw_frame_field(client):
     covers the fields someone thought of. So this greps each renderer for a frame field
     adjacent to a `+` and requires there to be none.
 
+    SCOPE, WIDENED (06-VERIFICATION). This test was cited as WR-10's regression guard
+    while it could see neither of the two holes the verifier then proved green: the drill
+    panel's own 8-branch describer `renderStepBody` was not scanned AND its `s.` fields
+    were not in the pattern's prefix class, and a field handed to `el()` as a bare text
+    argument has no `+` for the pattern to find — so unwrapping `dash(r.score)` inside
+    `renderChunks`, which WAS scanned, changed nothing. A rule that is documented as
+    mechanical has to actually be mechanical; both are covered now.
+
     MUTATION 1 (executed): unwrap one field — `"error · " + f.reason` in `describe`.
     Reds naming the field it found.
 
     MUTATION 2 (executed): unwrap `describeOwn`'s `d.cost_usd`. Reds the same way, which
-    is the point of scanning all four bodies rather than one.
+    is the point of scanning every body rather than one.
+
+    MUTATION 3 (executed): unwrap `dash(s.tool)` in `renderStepBody`'s tool_use branch —
+    the hole the verifier found, on the renderer that had ten of them.
+
+    MUTATION 4 (executed): unwrap `dash(r.score)` in `renderChunks` to a bare `el()` text
+    argument — the hole that was green inside a function this test already scanned.
+
+    WHAT THE PATTERN STILL CANNOT SEE, named rather than implied: it matches three
+    shapes — a field beside a `+`, and a field handed to a call as its last argument.
+    A field reached through any OTHER expression is invisible to it, and the page has
+    exactly one such site: `STEP_LABELS[s.type] || dash(s.type)`, where the fallback arm
+    is the render. Unwrapping that leaves this loop green (executed and confirmed), so it
+    is pinned BY EXAMPLE below instead. Extending the pattern to fallback arms was tried
+    and rejected: it also matches `if (s.expected_ticket_id || s.supplied_ticket_id)`,
+    which is a condition and not a render, and a guard that forces dash() into
+    conditionals is one the next person deletes.
 
     WEAK BY CONSTRUCTION: grep over the served source. Nothing here feeds a
     field-missing frame through a describer and reads the rendered line back — there is
@@ -2885,6 +2921,10 @@ def test_no_step_describer_interpolates_a_raw_frame_field(client):
         ("runNode", "feed", "function runNode(f) {"),
         ("describeOwn", "try", "function describeOwn(name, d) {"),
         ("renderChunks", "drill", "function renderChunks(results, host) {"),
+        # The drill panel's own describers. `renderStepBody` is where the fields are
+        # densest — eight branches, ten fields — and it was the one nobody scanned.
+        ("renderStepBody", "drill", "function renderStepBody(s, host) {"),
+        ("renderSteps", "drill", "function renderSteps(steps) {"),
     )
 
     for name, where, opener in renderers:
@@ -2901,6 +2941,15 @@ def test_no_step_describer_interpolates_a_raw_frame_field(client):
         for literal in re.findall(r'"([^"]*)"', body):
             for word in ("undefined", "null", "None"):
                 assert word not in literal, f"{name} renders the word {word!r}"
+
+    # The one render the pattern above cannot reach, pinned by example: the step's kind
+    # label falls back to the raw type when STEP_LABELS has no entry for it, and that
+    # fallback arm is a render like any other. A step whose type this map does not know
+    # would otherwise print the word the language uses for an absent value, in the
+    # panel's own heading row.
+    assert "STEP_LABELS[s.type] || dash(s.type)" in blocks["drill"], (
+        "the step kind label's fallback arm does not go through the placeholder helper"
+    )
 
     # The whole-document rule tests/test_auth.py owns, restated where it can be broken.
     assert "None" not in html
