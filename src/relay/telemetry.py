@@ -137,8 +137,37 @@ _PUBLIC_RUN_COLUMNS = (
 # --- /metrics aggregation ---------------------------------------------------------
 # Named module-level constants, following ratelimit.DAILY_SPEND_SQL's precedent: these
 # run on an ungated route polled every 5s per open tab, so they are the queries you
-# want to be able to grep for. Every one of them replaces a Python aggregation over a
-# full materialisation of `runs` — a read whose cost grew for the life of the volume.
+# want to be able to grep for.
+#
+# WHAT THEY ACTUALLY COST. Measured with EXPLAIN QUERY PLAN against a populated `runs`,
+# and pinned by test_the_metrics_query_plans_are_what_this_comment_says so the two
+# cannot drift. This block used to claim every read here was an aggregation that had
+# replaced a full materialisation; three of them still read every row, and a comment
+# asserting a bound the code does not have is worse than no comment, because the next
+# reader will not re-measure (WR-03):
+#
+#   TOTALS_SQL                SCAN runs
+#   OUTCOMES_SQL              SCAN runs + temp b-tree for the GROUP BY
+#   OUTCOME_DISTRIBUTION_SQL  SCAN runs + temp b-trees for the GROUP BY and ORDER BY
+#   WINDOW_PERCENTILE_SQL     SEARCH runs USING INDEX idx_runs_created_at, then a temp
+#                             b-tree ORDER BY over the window — TWICE per request (p50
+#                             and p95 are two calls)
+#   LAST_RUNS_SQL             SCAN runs, but in reverse rowid order with no ORDER BY
+#                             b-tree, so LIMIT 20 stops it after 20 rows — bounded
+#   DAILY_BUCKETS_SQL         SEARCH runs USING INDEX idx_runs_created_at — bounded to
+#                             settings.metrics_window_days
+#
+# So: the first three grow with the table for the life of the Fly volume. The percentile
+# pair is bounded to the metrics window — but that WHERE is there because the card and
+# the chart have to be one statistic (WR-09), not as a cost control, and removing it for
+# a display reason would silently un-bound this read too.
+#
+# All six run inside one asyncio.to_thread (main.py) holding Database's process-wide
+# lock for the whole read, and /metrics carries no rate-limit dependency at all — so an
+# unauthenticated `while :; do curl $H/metrics; done` is a lock-holding loop competing
+# with every in-flight run's per-event write. Bounding the three scans and metering the
+# route are DEFERRED, not done: see
+# .planning/phases/06-dashboard-experience/deferred-items.md.
 
 TOTALS_SQL = (
     "SELECT COUNT(*)                        AS runs,"
@@ -216,8 +245,14 @@ _OUTCOME_BUCKETS = (
 
 LAST_RUNS_LIMIT = 20
 
-# ORDER BY id DESC LIMIT 20 in SQL, not `rows[-20:][::-1]` in Python: the slice was
-# the last unbounded read left on this route.
+# ORDER BY id DESC LIMIT 20 in SQL, not `rows[-20:][::-1]` in Python: the slice
+# materialised every row of `runs` to keep twenty of them.
+#
+# It is NOT, as this comment used to say, "the last unbounded read left on this route"
+# (WR-03) — TOTALS_SQL, OUTCOMES_SQL and OUTCOME_DISTRIBUTION_SQL all still scan the
+# whole table, and the header block above measures them. What makes THIS one bounded is
+# that `id` is the rowid, so `ORDER BY id DESC` is a backwards b-tree walk with no sort
+# step and the LIMIT stops it after twenty rows.
 LAST_RUNS_SQL = (
     f"SELECT {', '.join(_PUBLIC_RUN_COLUMNS)} FROM runs"
     f" ORDER BY id DESC LIMIT {LAST_RUNS_LIMIT}"

@@ -16,11 +16,18 @@ default), so every seed here inserts through `_insert_run` with an explicit
 
 import math
 import random
+import re
 import sqlite3
+from pathlib import Path
 
+from relay import telemetry
 from relay.config import settings
 from relay.telemetry import (
     DAILY_BUCKETS_SQL,
+    LAST_RUNS_SQL,
+    OUTCOME_DISTRIBUTION_SQL,
+    OUTCOMES_SQL,
+    TOTALS_SQL,
     WINDOW_PERCENTILE_SQL,
     _percentile,
     _window_offset,
@@ -497,3 +504,87 @@ def test_the_p50_card_is_the_windows_median_not_a_day_average(conn):
     # ...and the two wrong-but-plausible answers are excluded by name.
     assert payload["latency_ms"]["p50"] != 550, "the card averages the daily p50s"
     assert payload["latency_ms"]["p50"] != 100, "the card reads only the latest day"
+
+
+def _plan(conn, sql: str, params: tuple = ()) -> str:
+    rows = conn.execute("EXPLAIN QUERY PLAN " + sql, params).fetchall()
+    return " ".join(r["detail"] for r in rows)
+
+
+def test_the_metrics_query_plans_are_what_this_comment_says(conn):
+    """WR-03: the module comment above these queries claimed a bound they do not have.
+
+    It read "Every one of them replaces a Python aggregation over a full materialisation
+    of `runs`", and `deferred-items.md` recorded "every read is aggregated or bounded
+    (`LIMIT 20`, the daily `WHERE`)". Three of the six still read every row. A stale
+    "this is bounded" note is exactly how the next person skips checking, so the comment
+    now quotes the measured plans — and this test is what stops that from going stale in
+    turn: change a query without changing the comment and this reds.
+
+    /metrics is ungated and polled every 5s per tab, and all six run inside one
+    `asyncio.to_thread` holding Database's process-wide lock. Bounding the three scans
+    and metering the route are deferred, deliberately; this test asserts the CURRENT
+    truth so the deferral stays visible rather than becoming folklore.
+
+    MUTATION (executed): add `WHERE created_at >= datetime('now', '-14 days')` to
+    TOTALS_SQL. The scan assertion reds — which is the point: the comment would then be
+    describing a query that no longer exists.
+
+    Plan strings are matched with tolerant patterns (`SCAN [TABLE] runs`) because the
+    exact wording changed in SQLite 3.36 and the project floor is Python 3.11.
+    """
+    for i in range(60):
+        _insert_run(conn, day_offset=-(i % 40), duration_ms=100 + i)
+
+    scan = re.compile(r"\bSCAN (TABLE )?runs\b")
+    seek = re.compile(r"\bSEARCH (TABLE )?runs USING INDEX idx_runs_created_at\b")
+    offset = _window_offset()
+
+    # 1. The three that still read every row. Named individually: "some of them scan"
+    #    is the claim the old comment blurred.
+    for name, sql in (
+        ("TOTALS_SQL", TOTALS_SQL),
+        ("OUTCOMES_SQL", OUTCOMES_SQL),
+        ("OUTCOME_DISTRIBUTION_SQL", OUTCOME_DISTRIBUTION_SQL),
+    ):
+        plan = _plan(conn, sql)
+        assert scan.search(plan), f"{name} is no longer a full scan — fix the comment: {plan}"
+        assert not seek.search(plan), f"{name} became bounded — fix the comment: {plan}"
+
+    # 2. The percentile pair: bounded to the window by WR-09, and still sorting it.
+    percentile_plan = _plan(conn, WINDOW_PERCENTILE_SQL, (offset, 0.50))
+    assert seek.search(percentile_plan), f"the percentile fell back to a scan: {percentile_plan}"
+    assert "USE TEMP B-TREE FOR ORDER BY" in percentile_plan, (
+        "the percentile stopped sorting — the comment says it does"
+    )
+
+    # 3. LAST_RUNS_SQL: a scan by name, bounded in fact, and the reason is the ABSENCE
+    #    of a sort step. The control below is what makes that absence mean something —
+    #    an equivalent query that cannot use the rowid order does grow the b-tree.
+    last_runs_plan = _plan(conn, LAST_RUNS_SQL)
+    assert scan.search(last_runs_plan)
+    assert "USE TEMP B-TREE FOR ORDER BY" not in last_runs_plan, (
+        "ORDER BY id DESC stopped riding the rowid — LIMIT 20 no longer bounds the read"
+    )
+    control = _plan(conn, "SELECT id FROM runs ORDER BY duration_ms DESC LIMIT 20")
+    assert "USE TEMP B-TREE FOR ORDER BY" in control, (
+        "this SQLite does not report sort steps at all — the assertion above is vacuous"
+    )
+
+    # 4. The comment says all of the above, in those words.
+    header = (
+        Path(telemetry.__file__).read_text(encoding="utf-8")
+        .split("# --- /metrics aggregation", 1)[1]
+        .split("TOTALS_SQL = (", 1)[0]
+    )
+    for claim in (
+        "TOTALS_SQL                SCAN runs",
+        "OUTCOMES_SQL              SCAN runs",
+        "OUTCOME_DISTRIBUTION_SQL  SCAN runs",
+        "idx_runs_created_at",
+        "bounded",
+        "DEFERRED",
+    ):
+        assert claim in header, f"the module comment no longer states {claim!r}"
+    # ...and it does not restate the claim that was false.
+    assert "Every one of them replaces" not in header
