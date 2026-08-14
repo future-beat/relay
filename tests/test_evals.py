@@ -233,6 +233,94 @@ async def test_the_report_artifact_carries_citations_and_retrieval(monkeypatch):
     assert result["retrieval"]["mode"] == "keyword"
 
 
+# Another visitor's typed words, filed against the same seeded address the golden case
+# uses — the shape the deployed Try-it form produces, where every visitor picks a seeded
+# customer and edits the subject.
+JUDGE_OTHER_SUBJECT = "ANOTHER-VISITORS-SUBJECT-IN-THE-JUDGE-CONTEXT-71ba"
+
+
+async def test_the_judge_sees_the_agents_payload_and_no_more(monkeypatch):
+    """The judge's `customer_record` IS `lookup_customer`'s output — same tool, same
+    fields, no free text.
+
+    WHY THIS IS PINNED AT ALL. `evals.py` hands the judge a customer record with the
+    comment "give the judge exactly what the agent could see". Nothing enforced that: a
+    future edit that "enriches" the record with a SELECT over `tickets` would give the
+    grader context the agent never had — a correct "I have no record of that" scored as a
+    miss, a lucky guess about a prior ticket scored as grounded — and would ALSO put
+    another visitor's typed words into a paid third-party call. Grading noise and a
+    disclosure, from one line, with nothing failing.
+
+    Asserted by VALUE (the other visitor's subject is not in the record) and by SHAPE
+    (each history entry has exactly the tool's key set), because they fail differently: a
+    richer query with the same columns breaks the value half, and a `SELECT *` that
+    happens to find no free text breaks the shape half.
+
+    MUTATION: in `run_case`, build the record from a query instead of the tool —
+    `conn.execute("SELECT id, subject, status FROM tickets WHERE customer_email = ?"...)`
+    or add `subject` back to `lookup_customer`'s own SELECT. Both red.
+
+    Anti-vacuity: the other visitor's ticket is genuinely in the address's history (its
+    id is in the record) and the record genuinely carries the customer's profile — so the
+    absence of the subject is a claim about the payload, not about an empty record.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)  # keyword mode, no network
+
+    email = next(iter(SEED_EMAILS))
+    real_init_db = evals.init_db
+
+    def _init_with_another_visitors_ticket(conn):
+        # run_case builds its own :memory: DB, so this is the seam where a third party's
+        # earlier ticket can exist before the run — exactly what the deployed demo
+        # address accumulates.
+        real_init_db(conn)
+        conn.execute(
+            "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+            (email, JUDGE_OTHER_SUBJECT, "filed by a previous visitor"),
+        )
+        conn.commit()
+
+    monkeypatch.setattr(evals, "init_db", _init_with_another_visitors_ticket)
+
+    captured: dict[str, str] = {}
+
+    async def _fake_judge(client, case, final_text, kb_text, customer_record):
+        captured["record"] = customer_record
+        return {"grounded": True, "invented_claims": [], "quality": 5, "reasoning": "ok"}
+
+    monkeypatch.setattr(evals, "judge_grounding", _fake_judge)
+    client = FakeClient([
+        response([tool_use_block(
+            "send_reply",
+            {"ticket_id": 2, "body": "Refunds are available within 30 days. " * 2,
+             "citations": ["billing.md"]},
+        )]),
+        response([text_block("done")], stop_reason="end_turn"),
+    ])
+    await evals.run_case(client, {
+        "id": "judge-context", "customer_email": email,
+        "subject": "Refund", "body": "Can I get a refund?",
+        "expected_action": "send_reply", "expected_categories": ["billing"],
+    }, kb_text="(kb)")
+
+    record = captured.get("record")
+    assert record, "the judge was never called — every assertion below would be vacuous"
+    payload = json.loads(record.split("\nThe ticket under review was filed at")[0])
+
+    # Anti-vacuity: the record really is the lookup's payload, and the other visitor's
+    # ticket really is in the history it returned.
+    assert payload["found"] is True
+    assert payload["customer"]["email"] == email
+    assert len(payload["recent_tickets"]) == 2, payload["recent_tickets"]
+
+    assert JUDGE_OTHER_SUBJECT not in record, (
+        "another visitor's typed words are in the judge's context — and in a paid call"
+    )
+    for entry in payload["recent_tickets"]:
+        assert set(entry) == {"id", "status", "created_at"}, entry
+    assert set(payload["customer"]) == {"email", "name", "plan", "signed_up"}
+
+
 # --- EVAL-01: labeled retrieval set + recall/MRR (report-only, D-03) -------------
 # All three pin keyword mode: with no key retrieve() cannot reach Voyage, so the
 # free suite bills nothing and conftest's _no_outbound_http guard never fires.
