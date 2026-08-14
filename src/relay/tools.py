@@ -43,8 +43,22 @@ def lookup_customer(db: Database, email: str) -> str:
     ).fetchone()
     if row is None:
         return json.dumps({"found": False})
+    # NO `subject`. It was the ONE free-text field in this payload, and it is the one
+    # field a stranger can write: the Try-it form pins each example to a seeded customer
+    # and lets the visitor edit the subject, so `recent_tickets` for a demo address
+    # accumulates every previous visitor's typed words — handed to the model, restated
+    # into prose, and published on the keyless /runs/{uid}. Everything left here is
+    # enumerable or a fictional constant (`id`, `created_at`, and `status` from a closed
+    # set; the customer row is four hardcoded personas in a public repo), so dropping this
+    # column removes the disclosure CLASS rather than filtering it — the mask over the
+    # prose is a floor under literals and never a proof about paraphrase (events.py).
+    #
+    # The signal survives: prompts.py uses history for exactly one decision — escalate
+    # when the customer is frustrated or at risk of leaving — and that reads off HOW MANY
+    # tickets, HOW RECENT, and HOW MANY UNRESOLVED. Nothing asks the model to quote a
+    # prior subject, and the reply is supposed to address the ticket under review.
     tickets = db.execute(
-        "SELECT id, subject, status, created_at FROM tickets"
+        "SELECT id, status, created_at FROM tickets"
         " WHERE customer_email = ? ORDER BY created_at DESC LIMIT 10",
         (email,),
     ).fetchall()

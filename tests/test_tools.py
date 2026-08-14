@@ -31,6 +31,94 @@ def test_lookup_customer_missing(registry):
     assert result["found"] is False
 
 
+# Someone else's typed words, filed against the same address — the shape the Try-it form
+# actually produces, where every visitor picks a seeded customer and edits the subject.
+# Improbable on purpose: an absence assertion over a plausible string says nothing.
+OTHER_VISITORS_SUBJECT = "SOMEONE-ELSES-TYPED-SUBJECT-8c41"
+
+
+def test_lookup_customer_returns_no_free_text(conn, registry):
+    """The payload carries no field a stranger can write into (the structural fix).
+
+    This is the whole reason the tool changed: `recent_tickets[].subject` was the only
+    free-text field `lookup_customer` returned, it is visitor-typed, and everything this
+    tool returns reaches the model's context — hence the model's prose, hence the keyless
+    /runs/{uid}. The mask downstream filters LITERALS; it cannot see a paraphrase. So the
+    property has to be that the words are never in the context, not that they are masked
+    on the way out.
+
+    Asserted two ways, because they fail differently: by VALUE (the seeded subject is
+    absent from the serialised payload) and by SHAPE (the exact key set of each record,
+    so a future migration that adds a `body` or a `notes` column to `tickets` reds here
+    rather than shipping a new disclosure with no test failure). The value assertion
+    alone would pass against a payload that grew a different free-text column; the shape
+    assertion alone would pass against a `subject` renamed to `title`.
+
+    MUTATION: restore `subject` to the SELECT in `lookup_customer`
+    (`SELECT id, subject, status, created_at FROM tickets ...`). Both halves red.
+
+    Anti-vacuity: the ticket really is in the address's history — `recent_tickets` is
+    non-empty and its id is the row just inserted — so "no subject in the payload" is a
+    claim about what the tool returns, not about a lookup that found nothing.
+    """
+    cur = conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body) VALUES (?, ?, ?)",
+        ("ava@acmecorp.com", OTHER_VISITORS_SUBJECT, "filed by a previous demo visitor"),
+    )
+    conn.commit()
+
+    raw = registry["lookup_customer"].execute(email="ava@acmecorp.com")
+    result = json.loads(raw)
+
+    assert result["found"] is True
+    assert result["recent_tickets"], "the address has no history — the assertions are vacuous"
+    assert cur.lastrowid in [t["id"] for t in result["recent_tickets"]], (
+        "the ticket carrying the subject is not in the returned history — vacuous"
+    )
+
+    assert OTHER_VISITORS_SUBJECT not in raw, (
+        "lookup_customer hands another visitor's typed words to the model"
+    )
+    for ticket in result["recent_tickets"]:
+        assert set(ticket) == {"id", "status", "created_at"}, ticket
+    # The customer row too: named columns, none of them free text (four fictional
+    # personas hardcoded in a public repo — enumerable constants, not secrets).
+    assert set(result["customer"]) == {"email", "name", "plan", "signed_up"}
+
+
+def test_lookup_customer_keeps_the_escalation_signal(conn, registry):
+    """...and dropping the text kept what the prompt actually reads history FOR.
+
+    prompts.py uses history for one decision — escalate when the customer is frustrated
+    or at risk of leaving — and that signal is how many tickets, how recent, how many
+    unresolved. If the payload had been reduced to a bare count, or the statuses dropped
+    along with the subjects, the tool would still pass the leak test above while the
+    escalation cases quietly lost their input. So this pins the signal, not the shape.
+
+    MUTATION: drop `status` (or `created_at`) from the SELECT — reds here while
+    test_lookup_customer_returns_no_free_text stays green, which is the point of having
+    both.
+    """
+    for subject, status in (
+        ("first complaint", "escalated"),
+        ("second complaint", "open"),
+        ("third complaint", "open"),
+    ):
+        conn.execute(
+            "INSERT INTO tickets (customer_email, subject, body, status)"
+            " VALUES (?, ?, ?, ?)",
+            ("ava@acmecorp.com", subject, "body", status),
+        )
+    conn.commit()
+
+    result = json.loads(registry["lookup_customer"].execute(email="ava@acmecorp.com"))
+    tickets = result["recent_tickets"]
+
+    assert len(tickets) == 3, "the count — how many times they have written in"
+    assert sum(t["status"] == "open" for t in tickets) == 2, "how many are unresolved"
+    assert all(t["created_at"] for t in tickets), "how recent each one is"
+
+
 def test_search_docs_grounds_billing_questions(registry):
     result = json.loads(registry["search_docs"].execute(query="refund policy"))
     docs = [r["doc"] for r in result["results"]]
