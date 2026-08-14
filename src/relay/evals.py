@@ -356,6 +356,16 @@ async def run_case(
     outcome = extract_outcome(events)
     # Give the judge exactly what the agent could see: the lookup_customer tool
     # output (profile + ticket history) and when the ticket was filed.
+    #
+    # "Exactly" is held by CALLING THE TOOL, never by restating its query here. The
+    # payload changed — `recent_tickets` no longer carries `subject`, because that was
+    # the one field another visitor could type into and everything this tool returns
+    # reaches the model's context (tools.py) — and this line needed no edit to stay true,
+    # which is the property worth keeping. A judge given MORE than the agent saw marks a
+    # correct "I have no record of that" as a miss and a lucky guess about a prior ticket
+    # as grounded; a judge given less does the reverse. Both are grading noise that looks
+    # like agent quality, so the two contexts move together or not at all.
+    # `test_the_judge_sees_the_agents_payload_and_no_more` reds if this becomes a query.
     filed_at = conn.execute(
         "SELECT created_at FROM tickets WHERE id = ?", (ticket["id"],)
     ).fetchone()[0]

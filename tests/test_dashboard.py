@@ -430,6 +430,14 @@ def _leaky_run_events() -> list:
             "customer": {
                 "email": DETAIL_EMAIL, "name": DETAIL_CUSTOMER_NAME, "plan": "enterprise",
             },
+            # `subject` here is deliberately a payload shape `lookup_customer` no
+            # longer produces — it stopped returning anyone's ticket text. These rows
+            # are hand-written, and keeping the field is what keeps this test about the
+            # PROJECTOR: the mask stays as defence-in-depth for whatever a future tool
+            # returns, and `_DEMO_RAW_TOOLS` is default-deny for the same reason, so
+            # both need a free-text value from a non-allowlisted tool to be tested at
+            # all. `status` beside it is the enumerable value that must NOT be harvested
+            # (NF-4).
             "recent_tickets": [
                 {"id": 1, "subject": DETAIL_PRIOR_SUBJECT, "status": "open"},
             ],
@@ -1687,9 +1695,9 @@ DRILL_BODY = "SENTINEL-DRILL-BODY-92fa10"             # -> create_escalation.rea
 DRILL_KEY = "sk-ant-SENTINEL-DRILL-KEY-6d0b3e"        # -> search_docs.query
 DRILL_CITE = "sentinel-fabricated-doc-7b4c92.md"      # -> guardrail.missing_citations
 # An EARLIER ticket's subject, filed against the same address by someone else (CR-02).
-# It rides lookup_customer's `recent_tickets` and nothing else, so it is the only
-# sentinel that can see that vector: a fix which redacts the `customer` object and
-# leaves the ten subjects beside it passes every other assertion in this file.
+# It USED to ride lookup_customer's `recent_tickets` — and now rides nothing at all,
+# because that tool no longer returns `subject`. Kept as an absence sentinel: the claim
+# it makes moved from "the mask caught it on the way out" to "it was never in the run".
 DRILL_SUBJECT = "SENTINEL-EARLIER-TICKET-SUBJECT-5a3d81"
 
 DRILL_SENTINELS = (
@@ -1698,6 +1706,16 @@ DRILL_SENTINELS = (
     ("api key", DRILL_KEY),
     ("fabricated citation", DRILL_CITE),
     ("earlier ticket subject", DRILL_SUBJECT),
+)
+
+# The four the run genuinely carries, for the presence half. DRILL_SUBJECT is
+# deliberately not among them: presence-then-absence is the right idiom while a MASK is
+# what stands between a value and the keyless route, and the wrong one once the value is
+# not in the context at all. Asserting it is "present in the run's raw rows" would now
+# fail — and that failure would BE the fix landing, which is not a thing to keep green.
+# Its own property is proved by `_prove_the_earlier_subject_never_entered_the_run`.
+DRILL_IN_RUN_SENTINELS = tuple(
+    pair for pair in DRILL_SENTINELS if pair[1] != DRILL_SUBJECT
 )
 
 
@@ -1737,25 +1755,27 @@ def _script_the_four_vector_run(ticket_id: int) -> None:
     ])
 
 
-def _seed_the_looked_up_customer() -> None:
+def _seed_the_looked_up_customer() -> int:
     """A real customers row AND an earlier ticket of theirs, so lookup_customer returns
     what it returns in production: a whole record — email, name, plan — plus up to ten
-    of that address's ticket subjects.
+    of that address's tickets.
 
-    The earlier ticket is the CR-02 half. Those subjects belong to whoever else has been
-    filing against this address (on the deployed service, the owner key), so they are
-    third-party content that no visitor authored, and until this row existed no test in
-    this suite could see that vector at all.
+    The earlier ticket is the CR-02 half. It belongs to whoever else has been filing
+    against this address (on the deployed service, the owner key), so it is third-party
+    content that no visitor authored — and its SUBJECT is the thing `lookup_customer`
+    stopped returning. Returns its id, because the id is what makes the absence of the
+    subject a claim about the payload rather than about a lookup that missed.
     """
     app.state.conn.execute(
         "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
         (DRILL_EMAIL, "Drill Sentinel", "enterprise", "2025-01-01"),
     )
-    app.state.conn.execute(
+    cur = app.state.conn.execute(
         "INSERT INTO tickets (customer_email, subject, body, origin) VALUES (?, ?, ?, ?)",
         (DRILL_EMAIL, DRILL_SUBJECT, "filed by someone else, long before this run", None),
     )
     app.state.conn.commit()
+    return cur.lastrowid
 
 
 def _prove_the_sentinels_are_really_in_the_run(uid: str, body: str) -> None:
@@ -1766,7 +1786,7 @@ def _prove_the_sentinels_are_really_in_the_run(uid: str, body: str) -> None:
     this project has shipped before.
     """
     assert "event: error" not in body
-    for name, sentinel in DRILL_SENTINELS:
+    for name, sentinel in DRILL_IN_RUN_SENTINELS:
         assert sentinel in body, (
             f"the {name} sentinel never reached the run's own owner-facing stream —"
             " every absence assertion below would be vacuous"
@@ -1776,13 +1796,65 @@ def _prove_the_sentinels_are_really_in_the_run(uid: str, body: str) -> None:
             "SELECT payload FROM run_events WHERE run_uid = ?", (uid,)
         ).fetchall()
     )
-    for name, sentinel in DRILL_SENTINELS:
+    for name, sentinel in DRILL_IN_RUN_SENTINELS:
         # D-01: run_events is private and full-fidelity. If redaction had leaked into
         # the PERSISTENCE path, the drill-down would be clean for the wrong reason and
         # this phase would have nothing to drill into.
         assert sentinel in raw, (
             f"the {name} sentinel is missing from the raw run_events rows"
         )
+
+
+def _prove_the_earlier_subject_never_entered_the_run(uid: str, body: str, other_id: int) -> None:
+    """The OTHER half, and the one the structural fix is about: the third party's typed
+    words are in the database, their ticket IS in the history the lookup returned, and
+    the words are in no row of this run.
+
+    This is not the presence-then-absence idiom, because the property is not the same
+    property. That idiom proves a MASK: the value reached the run, and something removed
+    it on the way out — which is a floor under literals and says nothing about the model
+    paraphrasing what it read. The claim here is stronger and simpler: the value was
+    never handed to the model, so there is nothing to restate, mask or paraphrase.
+
+    Anti-vacuity is the ID, and it is what stops this from passing for the wrong reasons.
+    "The subject is absent" is also true of a run that never called the tool, of a lookup
+    that missed, and of a seeding bug that filed the ticket against another address. So:
+    the row exists, the lookup RAN, and the lookup's own stored result names that exact
+    ticket id — the tool returned that person's ticket and did not return their text.
+
+    MUTATION: restore `subject` to `lookup_customer`'s SELECT. The last three assertions
+    red, from the raw rows, the stream and the payload all at once.
+    """
+    seeded = app.state.conn.execute(
+        "SELECT subject FROM tickets WHERE id = ?", (other_id,)
+    ).fetchone()
+    assert seeded is not None and seeded["subject"] == DRILL_SUBJECT, (
+        "the third party's ticket is not in the database — nothing was ever at risk"
+    )
+
+    rows = app.state.conn.execute(
+        "SELECT type, payload FROM run_events WHERE run_uid = ?", (uid,)
+    ).fetchall()
+    lookups = [
+        r["payload"] for r in rows
+        if r["type"] == "tool_result" and '"lookup_customer"' in r["payload"]
+    ]
+    assert lookups, "the run never looked the customer up — the absence below is vacuous"
+    assert any(f'"id": {other_id}' in payload for payload in lookups), (
+        "the third party's ticket is not in the history the lookup returned — the"
+        " absence below would be about a lookup that never saw them"
+    )
+
+    for payload in lookups:
+        assert DRILL_SUBJECT not in payload, (
+            "lookup_customer handed another person's typed words to the model"
+        )
+    assert all(DRILL_SUBJECT not in r["payload"] for r in rows), (
+        "a third party's subject reached this run's rows by some other path"
+    )
+    assert DRILL_SUBJECT not in body, (
+        "a third party's subject reached the run's own owner-facing stream"
+    )
 
 
 def test_run_detail_never_leaks_a_non_demo_runs_content(client, monkeypatch):
@@ -1809,7 +1881,7 @@ def test_run_detail_never_leaks_a_non_demo_runs_content(client, monkeypatch):
     drill-down that leaks nothing because it publishes nothing.
     """
     monkeypatch.setattr(settings, "voyage_api_key", None)
-    _seed_the_looked_up_customer()
+    other_id = _seed_the_looked_up_customer()
     # The OWNER key, so tickets.origin is 'owner' and the run is redacted.
     ticket_id = _make_ticket(
         client, DRILL_EMAIL, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
@@ -1820,6 +1892,7 @@ def test_run_detail_never_leaks_a_non_demo_runs_content(client, monkeypatch):
     assert resp.status_code == 200
     uid = resp.headers["X-Relay-Run-Uid"]
     _prove_the_sentinels_are_really_in_the_run(uid, resp.text)
+    _prove_the_earlier_subject_never_entered_the_run(uid, resp.text, other_id)
     assert _origin_of(ticket_id) == "owner"
 
     with _anon(client) as anon:
@@ -1875,7 +1948,7 @@ def test_full_fidelity_is_server_decided(client, monkeypatch):
     and the sentinel assertion fires.
     """
     monkeypatch.setattr(settings, "voyage_api_key", None)
-    _seed_the_looked_up_customer()
+    other_id = _seed_the_looked_up_customer()
     ticket_id = _make_ticket(
         client, DRILL_EMAIL, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
     )
@@ -1883,6 +1956,7 @@ def test_full_fidelity_is_server_decided(client, monkeypatch):
     resp = client.post(f"/tickets/{ticket_id}/process")
     uid = resp.headers["X-Relay-Run-Uid"]
     _prove_the_sentinels_are_really_in_the_run(uid, resp.text)
+    _prove_the_earlier_subject_never_entered_the_run(uid, resp.text, other_id)
 
     with _anon(client) as anon:
         plain = anon.get(f"/runs/{uid}")
@@ -1933,8 +2007,9 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
 
     MUTATION 1 (the shipped code, before CR-01): drop `and raw_tool in _DEMO_RAW_TOOLS`
     / `and payload.get("tool") in _DEMO_RAW_TOOLS` from project_run_detail — the raw
-    customer row and its ten ticket subjects come back and the address/subject
-    assertions fire.
+    customer row comes back and the address assertion fires. (The ten subjects that used
+    to come back with it are gone at the source now; see the payload test in
+    tests/test_tools.py and `_prove_the_earlier_subject_never_entered_the_run`.)
     MUTATION 2 (the prose vector): make `prose_withheld` just `withheld` in
     project_run_detail — i.e. drop the run-derived term. The model's own sentence names
     the address it just read, and the assertion fires from a different field than
@@ -1948,7 +2023,7 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
     and it is where that mutation reds.
     """
     monkeypatch.setattr(settings, "voyage_api_key", None)
-    _seed_the_looked_up_customer()
+    other_id = _seed_the_looked_up_customer()
     # The DEMO key, so tickets.origin is 'demo' — the whole difference from the leak
     # test above is which credential posted /tickets. The address is DRILL_EMAIL: the
     # ticket's own customer and the one the agent looks up are THE SAME ADDRESS, which
@@ -1961,6 +2036,7 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
     resp = client.post(f"/tickets/{ticket_id}/process")
     uid = resp.headers["X-Relay-Run-Uid"]
     _prove_the_sentinels_are_really_in_the_run(uid, resp.text)
+    _prove_the_earlier_subject_never_entered_the_run(uid, resp.text, other_id)
 
     with _anon(client) as anon:
         detail = anon.get(f"/runs/{uid}").json()
@@ -1995,8 +2071,11 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
     assert DRILL_EMAIL not in whole, (
         "a third party's address is on the keyless public route"
     )
-    # The subjects beside the customer row are an independent vector: a fix that
-    # redacted `customer` and left `recent_tickets` would pass the line above.
+    # Another person's subject: a REGRESSION GUARD now, not a proof. It is absent from
+    # this response because `lookup_customer` never returned it — proved at the source by
+    # `_prove_the_earlier_subject_never_entered_the_run` above, which is where a
+    # regression in the payload reds. This line only catches a NEW path from `tickets`
+    # to the response that bypasses the tool entirely.
     assert DRILL_SUBJECT not in whole, (
         "another person's ticket subject is on the keyless public route"
     )
@@ -2031,6 +2110,12 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
 # test is different: these must ride the LOOKUP'S RESULT and the model's prose and
 # nothing the visitor wrote, so that their absence can only be explained by a mask
 # derived from what the run's non-allowlisted tools returned.
+#
+# TWO DIFFERENT PROPERTIES LIVE HERE NOW, and they are not the same strength. The name
+# and the plan are still in the lookup's result, still restated by the model, and still
+# closed by the MASK — a floor under literals that a paraphrase walks past. The other
+# visitor's SUBJECT is closed STRUCTURALLY: the tool stopped returning it, so the model
+# cannot restate, paraphrase or gist it. Only the second kind is a proof.
 PROSE_EMAIL = "prose-sentinel-1c4d@example.com"
 PROSE_NAME = "PROSE-CUSTOMER-NAME-77b2"                    # customers.name
 PROSE_OTHER_SUBJECT = "PROSE-ANOTHER-VISITORS-SUBJECT-9d3e"  # someone else's ticket
@@ -2045,17 +2130,22 @@ PROSE_BODY = "PROSE-VISITOR-BODY-5a8f"                     # the visitor's own w
 PROSE_PLAN = "pro"
 
 
-def _seed_the_prose_customer() -> None:
-    """A customers row and an earlier ticket filed against it by SOMEONE ELSE."""
+def _seed_the_prose_customer() -> int:
+    """A customers row and an earlier ticket filed against it by SOMEONE ELSE.
+
+    Returns that ticket's id: it is what proves the lookup saw the other visitor's
+    ticket while returning none of their words.
+    """
     app.state.conn.execute(
         "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
         (PROSE_EMAIL, PROSE_NAME, PROSE_PLAN, "2025-01-01"),
     )
-    app.state.conn.execute(
+    cur = app.state.conn.execute(
         "INSERT INTO tickets (customer_email, subject, body, origin) VALUES (?, ?, ?, ?)",
         (PROSE_EMAIL, PROSE_OTHER_SUBJECT, "filed by another visitor", "demo"),
     )
     app.state.conn.commit()
+    return cur.lastrowid
 
 
 def _script_the_prose_restatement_run(ticket_id: int) -> None:
@@ -2063,19 +2153,28 @@ def _script_the_prose_restatement_run(ticket_id: int) -> None:
 
     Nothing here is contrived: this is the shape the system prompt asks for, and the
     verifier's live reproduction produced the same sentence from the real model.
+
+    The model no longer names the OTHER visitor's subject, and that is not the fixture
+    going easy on itself — it is the fixture staying honest. A model can only restate
+    what it was handed, `lookup_customer` no longer hands it anyone's subject, and a
+    scripted sentence quoting a string that was never in the context would test the mask
+    against an input the system cannot produce. What it CAN still restate off that
+    payload is the history's shape — how many tickets, how recent — which is exactly the
+    signal prompts.py reads it for, so that is what this run says.
     """
     app.state.client = FakeClient([
         response([tool_use_block("lookup_customer", {"email": PROSE_EMAIL})]),
         response([
             text_block(
-                f"{PROSE_NAME} is on the {PROSE_PLAN} plan. Their recent tickets include"
-                f" '{PROSE_OTHER_SUBJECT}'. I am processing '{PROSE_OWN_SUBJECT}' now."
+                f"{PROSE_NAME} is on the {PROSE_PLAN} plan and has 2 tickets on file,"
+                f" the earlier one still unresolved. I am processing"
+                f" '{PROSE_OWN_SUBJECT}' now."
             ),
             tool_use_block("create_escalation", {
                 "ticket_id": ticket_id,
                 "reason": (
-                    f"{PROSE_NAME} ({PROSE_PLAN} plan) also wrote in about"
-                    f" '{PROSE_OTHER_SUBJECT}'. This ticket: {PROSE_BODY}"
+                    f"{PROSE_NAME} ({PROSE_PLAN} plan) has written in before and that"
+                    f" ticket is still open. This ticket: {PROSE_BODY}"
                 ),
                 "priority": "high",
             }),
@@ -2100,22 +2199,26 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
     the result anyway, because the tool returned it to the model before any of this ran.
     Prose is the model restating it. There is no field to deny.
 
-    WHAT IS PROVED HERE: that these literals do not survive. What is NOT proved, in this
-    test or anywhere in this suite, is that the GIST does not — a paraphrase ("the
-    customer on our top tier") shares no substring with the value and no mask sees it.
-    That limit is stated in `mask_withheld` and `project_run_detail`, and it is the
-    reason this is a floor rather than a proof.
+    TWO STRENGTHS, AND THIS DOCSTRING NAMES WHICH IS WHICH. The customer's NAME and PLAN
+    are still in the lookup's result, so their absence below is the MASK working: literals
+    do not survive, and the GIST is not covered — a paraphrase ("the customer on our top
+    tier") shares no substring and no mask sees it. That is a floor, not a proof, and the
+    limit is stated in `mask_withheld` and `project_run_detail`. The other visitor's
+    SUBJECT is different in kind: `lookup_customer` no longer returns it, so it is not in
+    the context, not in the run's rows, and not available to be paraphrased either. The
+    assertion below that it is absent from the response is therefore a REGRESSION GUARD on
+    a value nothing carries; the proof is the absence from the run's own rows, asserted
+    here beside the id that shows the lookup saw that person's ticket regardless.
 
-    MUTATION 1 (the fix itself): in `project_run_detail`, make `prose_withheld` just
-    `withheld` — drop the `withheld_from_run(parsed, ...)` term. The raw payloads stay
-    redacted, the shipped test above stays green, and the name, the plan and the other
-    visitor's subject all come back through `text` and the escalation reason.
+    MUTATION 1 (the mask): in `project_run_detail`, make `prose_withheld` just `withheld`
+    — drop the `withheld_from_run(parsed, ...)` term. The raw payloads stay redacted, the
+    shipped test above stays green, and the name and the plan come back through `text` and
+    the escalation reason. The other visitor's subject does NOT come back, which is the
+    difference this test now records.
 
-    MUTATION 2 (the visitor's own words): drop the `authored=` argument at the route's
-    call site. The absence half still passes and the "the visitor's own subject
-    survives" assertion reds — the demo would publish "[withheld]" where the visitor's
-    own subject stood, which is D-02's payoff replaced by a redaction of the visitor to
-    themselves.
+    MUTATION 2 (the payload): restore `subject` to `lookup_customer`'s SELECT and put
+    `PROSE_OTHER_SUBJECT` back into the scripted prose. The run carries it again and the
+    mask is what stands between it and the response — the state this fix replaced.
 
     MUTATION 3 (legibility): make `_mask_pattern` a bare `re.escape(secret)` with no
     word boundaries. "processing" becomes "[withheld]cessing" and the legibility
@@ -2124,9 +2227,18 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
     MUTATION 4 (the short value): raise `_MIN_WITHHOLD_LEN` to 4. "pro" is no longer
     collected and the plan assertion reds — three characters is the length at which the
     deployed seed data's own plan names live.
+
+    NO LONGER A MUTATION OF THIS TEST, recorded rather than quietly dropped: deleting the
+    route's `authored=` argument used to red the "the visitor's own subject survives"
+    assertion, because the lookup handed that subject back among the address's last ten
+    and the harvest then withheld the visitor's words from the visitor. With `subject`
+    gone from the payload there is nothing for `authored` to exempt, so that argument is
+    now unexercised by this test and by the suite. It is left in place deliberately — it
+    is the exemption a future tool returning visitor-authored text would need — and the
+    NF-2 oracle it carries is out of scope for this pass.
     """
     monkeypatch.setattr(settings, "voyage_api_key", None)
-    _seed_the_prose_customer()
+    other_id = _seed_the_prose_customer()
     ticket_id = _demo_ticket(
         client,
         PROSE_EMAIL,
@@ -2139,27 +2251,44 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
     assert "event: error" not in resp.text
     submitter_uid = resp.headers["X-Relay-Run-Uid"]
 
-    # --- anti-vacuity: the sentinels really are in the raw rows, twice over ----------
-    # Once because the tool RETURNED them and once because the model RESTATED them. If
-    # either half were missing the absence assertions below would be about a string that
-    # was never in the run.
+    # --- anti-vacuity, half one: the MASKED sentinel is in the raw rows, twice over ---
+    # Once because the tool RETURNED it and once because the model RESTATED it. If either
+    # half were missing the absence assertion below would be about a string that was
+    # never in the run.
     rows = app.state.conn.execute(
         "SELECT type, payload FROM run_events WHERE run_uid = ?", (submitter_uid,)
     ).fetchall()
     raw_by_type: dict[str, str] = {}
     for row in rows:
         raw_by_type[row["type"]] = raw_by_type.get(row["type"], "") + row["payload"]
-    for name, sentinel in (
-        ("the looked-up customer's name", PROSE_NAME),
-        ("another visitor's ticket subject", PROSE_OTHER_SUBJECT),
-    ):
-        assert sentinel in raw_by_type.get("tool_result", ""), (
-            f"{name} never reached the lookup's stored result"
-        )
-        assert sentinel in raw_by_type.get("text", ""), (
-            f"{name} was never restated in the model's prose — the vector is not armed"
-        )
+    assert PROSE_NAME in raw_by_type.get("tool_result", ""), (
+        "the looked-up customer's name never reached the lookup's stored result"
+    )
+    assert PROSE_NAME in raw_by_type.get("text", ""), (
+        "the name was never restated in the model's prose — the vector is not armed"
+    )
     assert PROSE_PLAN in raw_by_type.get("text", "")
+
+    # --- anti-vacuity, half two: the STRUCTURAL sentinel is in the database, its ticket
+    # is in the history the lookup returned, and its words are in no row of this run.
+    # The id is what makes this a claim about the payload: "the subject is absent" is
+    # also true of a lookup that missed or a tool that was never called.
+    assert app.state.conn.execute(
+        "SELECT subject FROM tickets WHERE id = ?", (other_id,)
+    ).fetchone()["subject"] == PROSE_OTHER_SUBJECT
+    lookup_results = [
+        r["payload"] for r in rows
+        if r["type"] == "tool_result" and '"lookup_customer"' in r["payload"]
+    ]
+    assert lookup_results, "the run never looked the customer up"
+    assert any(f'"id": {other_id}' in payload for payload in lookup_results), (
+        "the other visitor's ticket is not in the history the lookup returned — the"
+        " absence assertions would be about a lookup that never saw them"
+    )
+    assert all(PROSE_OTHER_SUBJECT not in r["payload"] for r in rows), (
+        "another visitor's typed words are in this run's context — the tool put them"
+        " there, and no mask downstream can cover the model paraphrasing them"
+    )
 
     # --- the walk: no credential, /metrics, then the run it names ---------------------
     with _anon(client) as anon:
@@ -2177,13 +2306,18 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
 
     # --- the disclosure, closed -------------------------------------------------------
     assert body["demo"] is True, "not the full-fidelity branch — the test proves nothing"
-    for name, sentinel in (
-        ("the looked-up customer's name", PROSE_NAME),
-        ("another visitor's ticket subject", PROSE_OTHER_SUBJECT),
-    ):
-        assert sentinel not in whole, (
-            f"{name} is on the keyless public route, restated by the model"
-        )
+    # The mask's half: this literal WAS in the context and WAS restated.
+    assert PROSE_NAME not in whole, (
+        "the looked-up customer's name is on the keyless public route, restated by the"
+        " model"
+    )
+    # The structural half's tail: a regression guard, not a proof — the value is absent
+    # here because it was never in the run (asserted above), so this line only catches a
+    # new path from `tickets` to the response that goes around the tool.
+    assert PROSE_OTHER_SUBJECT not in whole, (
+        "another visitor's ticket subject reached the keyless public route by some path"
+        " other than the lookup"
+    )
     # The plan, asserted as a WORD over the fields the model authored rather than over
     # the whole document: "pro" occurs inside ordinary words, and an absence assertion
     # that a knowledge-base chunk could break would say nothing about this vector.
@@ -2204,14 +2338,142 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
     assert PROSE_BODY in whole, "the visitor's own words were withheld from the visitor"
     prose = " ".join(authored_fields)
     assert PROSE_OWN_SUBJECT in prose, (
-        "the visitor's OWN subject was masked out of their own trace — lookup_customer"
-        " returns it among the address's last ten tickets, and it is not third-party"
+        "the visitor's OWN subject was masked out of their own trace — it is what they"
+        " typed, and withholding a visitor's words from themselves is not a security"
+        " property. It survives structurally now (the lookup no longer returns any"
+        " subject, so nothing harvests it) rather than by the `authored` exemption"
     )
     # The mask is a token mask, not a substring shredder: ordinary English survives.
     assert "processing" in prose, (
         "masking the plan rewrote an unrelated word — a drill-down full of spurious"
         " [withheld] markers teaches a visitor to ignore the real ones"
     )
+
+
+# --- NF-4: the mask's COST, which is the other way it fails ---------------------------
+#
+# A mask is only kept if the page it produces still reads as English. `lookup_customer`
+# returns each recent ticket's `status`, the harvest used to take every string it found,
+# and so the demo's payoff sentence published as "Your ticket is still [withheld], and
+# the earlier one is [withheld]" — reproduced live in the phase-6 verification. The
+# sentinels below are their own set because the property is the inverse of every other
+# test in this file: what must SURVIVE, and beside it the proof the mask still ran.
+STATUS_EMAIL = "status-legibility-2f6b@example.com"
+STATUS_NAME = "STATUS-CUSTOMER-NAME-4d91"      # customers.name — must still be masked
+STATUS_BODY = "STATUS-VISITOR-BODY-8e07"       # the visitor's own words
+
+
+def _seed_the_status_customer() -> None:
+    """A customer with one earlier RESOLVED ticket, so the lookup returns two statuses.
+
+    Two, not one, because "open" alone could survive by accident — it is also the status
+    of the visitor's own ticket, which `authored` might have exempted for another reason.
+    "resolved" belongs to nobody's authored text and can only survive by being exempt as
+    vocabulary.
+    """
+    app.state.conn.execute(
+        "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
+        (STATUS_EMAIL, STATUS_NAME, "enterprise", "2025-01-01"),
+    )
+    app.state.conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body, status, origin)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (STATUS_EMAIL, "an earlier ask", "already dealt with", "resolved", None),
+    )
+    app.state.conn.commit()
+
+
+def test_a_demo_runs_prose_keeps_the_words_relay_itself_assigns(client, monkeypatch):
+    """NF-4: ticket statuses survive the mask, and the mask is still running (D-02).
+
+    THE FAILURE THIS GUARDS is not a disclosure — it is the mask over-reaching until the
+    drill-down is unreadable, at which point a visitor learns to skim past "[withheld]"
+    and the marker stops meaning anything where it does matter. "open" and "resolved" are
+    two of the three words this service assigns to a ticket, publishes in its own tool
+    schemas, and renders on the dashboard; nobody wrote them, so the harvest — whose job
+    is free text — has no business taking them.
+
+    BOTH HALVES, because either alone is worthless. If the statuses survive but the mask
+    is not running, this passes against a completely unredacted response; so the
+    customer's NAME (free text, and in the same lookup result) must be masked in the same
+    document. If the mask runs but the statuses vanish, that is the shipped bug.
+
+    MUTATION: drop the `_ENUMERABLE_VALUES` condition from `_collect_strings` in
+    events.py — i.e. harvest every string again. The statuses come back out as
+    "[withheld]" and the survival assertions red while the name assertion stays green,
+    which is what tells the two halves apart.
+
+    Anti-vacuity: the statuses really are in the lookup's stored result (so the harvest
+    had them to take), and the published prose really is model-authored text.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    _seed_the_status_customer()
+    ticket_id = _demo_ticket(client, STATUS_EMAIL, f"charged twice. {STATUS_BODY}")
+    assert _origin_of(ticket_id) == "demo"
+
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": STATUS_EMAIL})]),
+        response([
+            text_block(
+                f"{STATUS_NAME} has two tickets: this one is still open and the earlier"
+                f" one is resolved."
+            ),
+            tool_use_block("create_escalation", {
+                "ticket_id": ticket_id,
+                "reason": (
+                    f"{STATUS_NAME} has one open ticket and one resolved. This ticket:"
+                    f" {STATUS_BODY}"
+                ),
+                "priority": "high",
+            }),
+        ]),
+        response([text_block("escalated")], stop_reason="end_turn"),
+    ])
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    assert "event: error" not in resp.text
+    uid = resp.headers["X-Relay-Run-Uid"]
+
+    # Anti-vacuity: the harvest genuinely saw both statuses in a non-allowlisted tool's
+    # result — so their survival below is an exemption, not an absence.
+    lookups = [
+        r["payload"] for r in app.state.conn.execute(
+            "SELECT type, payload FROM run_events WHERE run_uid = ?", (uid,)
+        ).fetchall()
+        if r["type"] == "tool_result" and '"lookup_customer"' in r["payload"]
+    ]
+    assert lookups, "the run never looked the customer up"
+    for status in ('"status": "open"', '"status": "resolved"'):
+        assert any(status in payload for payload in lookups), (
+            f"the lookup result never carried {status} — the harvest had nothing to take"
+        )
+
+    with _anon(client) as anon:
+        body = anon.get(f"/runs/{uid}").json()
+    assert body["demo"] is True
+    whole = json.dumps(body)
+
+    authored_fields = [s["text"] for s in body["steps"] if s.get("text")]
+    authored_fields += [
+        s["input"]["reason"] for s in body["steps"]
+        if s.get("tool") == "create_escalation" and isinstance(s.get("input"), dict)
+    ]
+    assert authored_fields, "no model-authored field was published — vacuous"
+    prose = " ".join(authored_fields)
+
+    # Half one: the words Relay itself assigns are still words.
+    for status in ("open", "resolved"):
+        assert re.search(rf"\b{status}\b", prose), (
+            f"'{status}' was masked out of the demo's own payoff prose (NF-4): {prose!r}"
+        )
+
+    # Half two: the mask is still running in this very document, on free text from the
+    # same tool result. Without this the assertions above would pass against no mask.
+    assert STATUS_NAME not in whole, (
+        "the looked-up customer's name survived — the mask is not running, so the"
+        " statuses above prove nothing"
+    )
+    assert "[withheld]" in prose, "no literal was masked at all in the published prose"
+    assert STATUS_BODY in whole, "the visitor's own words were withheld from the visitor"
 
 
 def test_a_demo_run_whose_lookup_missed_still_withholds_the_address(client, monkeypatch):

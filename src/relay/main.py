@@ -668,9 +668,13 @@ async def run_detail(run_uid: str) -> dict:
                 for name, spec in app.state.registry.items()
             },
             withheld=withheld,
-            # The visitor's own subject, which `lookup_customer` hands back among the
-            # address's last ten tickets — this run's own row is one of them. Without
-            # it the run-derived mask withholds the visitor's words from the visitor.
+            # The visitor's own subject. It was load-bearing while `lookup_customer`
+            # handed the address's last ten SUBJECTS back — this run's own row was one
+            # of them, so without this the run-derived mask withheld the visitor's words
+            # from the visitor. That payload dropped `subject`, so nothing harvested
+            # reaches this exemption today; it is kept for the tool that returns
+            # visitor-authored text next, and events.py states plainly what it does and
+            # does not protect against.
             authored=(ticket["subject"],) if demo and ticket is not None else (),
         ),
     }
