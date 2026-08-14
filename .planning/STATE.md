@@ -5,7 +5,7 @@ milestone_name: milestone
 status: verifying
 stopped_at: Phase 6 planned (7 plans, 6 waves, checker PASS)
 last_updated: "2026-08-12T06:54:38.104Z"
-last_activity: 2026-08-14 -- Phase 06 reviewed; 2 criticals + 7 warnings fixed (417 tests)
+last_activity: 2026-08-14 -- Phase 06 verified; prose-disclosure residual fixed (420 tests)
 progress:
   total_phases: 6
   completed_phases: 5

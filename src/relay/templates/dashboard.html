@@ -640,7 +640,7 @@ function renderSteps(steps) {
     const li = el("li", { class: "step" });
     const head = el("div", { class: "step-head" });
     head.append(el("span", { class: "seq" }, "#" + dash(s.seq)));
-    head.append(el("span", { class: "kind" }, STEP_LABELS[s.type] || s.type));
+    head.append(el("span", { class: "kind" }, STEP_LABELS[s.type] || dash(s.type)));
     head.append(el("span", { class: "at" }, ms(s.elapsed_ms)));
     li.append(head);
     renderStepBody(s, li);
@@ -658,9 +658,17 @@ function line(host, text, cls) {
 // renders as a bare timed row, which looks deliberate and is not — the guardrail step
 // in particular IS the prompt-injection story, and losing it would cost the demo its
 // best moment with nothing failing.
+//
+// EVERY field read here goes through dash() (WR-10). project_run_detail builds each
+// step with `payload.get(...)`, exactly as project() builds a frame, so every one of
+// these is null the moment its source event omits the key — a `notice` row written
+// before `cause` existed renders "notice · retrieval_degraded on search_docs · null" in
+// the panel that is supposed to be the credible part of this page. WR-10 was fixed on
+// the two feed describers and renderChunks and left here, where there are ten of them;
+// the mechanical guard in tests/test_dashboard.py now scans this function too.
 function renderStepBody(s, host) {
   if (s.type === "tool_use") {
-    line(host, "-> " + s.tool);
+    line(host, "-> " + dash(s.tool));
     // KEYS, never values. This is what the server sent: each key is intersected with
     // the tool's declared schema server-side, and whatever that excluded arrives as a
     // count — a number cannot carry a payload.
@@ -668,19 +676,21 @@ function renderStepBody(s, host) {
     (s.arg_keys || []).forEach(k => chips.append(el("span", { class: "chip" }, k)));
     if (s.unknown_arg_count) {
       chips.append(el("span", { class: "chip other" },
-                     "+" + s.unknown_arg_count + " undeclared"));
+                     "+" + dash(s.unknown_arg_count) + " undeclared"));
     }
     host.append(chips);
   } else if (s.type === "tool_result") {
-    line(host, (s.is_error ? "x " : "<- ") + s.tool +
-               (s.denied_by ? " · denied by " + s.denied_by : "") +
+    line(host, (s.is_error ? "x " : "<- ") + dash(s.tool) +
+               (s.denied_by ? " · denied by " + dash(s.denied_by) : "") +
                " · " + ms(s.duration_ms));
     if (s.results) renderChunks(s.results, host);
-    if (s.reply_id) line(host, "reply " + s.reply_id + " · " + s.status);
-    if (s.escalation_id) line(host, "escalation " + s.escalation_id + " · " + s.status);
-    if (s.category) line(host, "category " + s.category);
+    if (s.reply_id) line(host, "reply " + dash(s.reply_id) + " · " + dash(s.status));
+    if (s.escalation_id) {
+      line(host, "escalation " + dash(s.escalation_id) + " · " + dash(s.status));
+    }
+    if (s.category) line(host, "category " + dash(s.category));
   } else if (s.type === "guardrail") {
-    line(host, "guard " + s.guard + " -> " + s.action + " on " + s.tool);
+    line(host, "guard " + dash(s.guard) + " -> " + dash(s.action) + " on " + dash(s.tool));
     // The two ids ARE the payoff: a ticket body that named another ticket, and the
     // guard that refused to act on it.
     if (s.expected_ticket_id || s.supplied_ticket_id) {
@@ -688,25 +698,26 @@ function renderStepBody(s, host) {
                  ", the model supplied #" + dash(s.supplied_ticket_id));
     }
     if (s.missing_count) {
-      line(host, s.missing_count + " citation(s) the reply claimed but never retrieved");
+      line(host, dash(s.missing_count) +
+                 " citation(s) the reply claimed but never retrieved");
     }
   } else if (s.type === "notice") {
-    line(host, "notice · " + s.kind + " on " + s.tool + " · " + s.cause);
+    line(host, "notice · " + dash(s.kind) + " on " + dash(s.tool) + " · " + dash(s.cause));
     line(host, "retrieval mode " + dash(s.retrieval_mode) +
                " · " + dash(s.result_count) + " results");
   } else if (s.type === "usage") {
     line(host, "step " + dash(s.steps) + " · " + dash(s.input_tokens) + " in / " +
                dash(s.output_tokens) + " out · $" + dash(s.cost_usd));
   } else if (s.type === "resolution") {
-    line(host, "resolved via " + s.via + " · " + dash(s.steps) + " steps · $" +
+    line(host, "resolved via " + dash(s.via) + " · " + dash(s.steps) + " steps · $" +
                dash(s.cost_usd));
   } else if (s.type === "error") {
     // `reason` is enumerated and `error_type` is the API's own class name. The error
     // MESSAGE is not published — it echoes model output and ticket text — so there is
     // nothing here to show and nothing here to ask for.
-    line(host, "error · " + s.reason +
-               (s.status ? " · HTTP " + s.status : "") +
-               (s.error_type ? " · " + s.error_type : ""));
+    line(host, "error · " + dash(s.reason) +
+               (s.status ? " · HTTP " + dash(s.status) : "") +
+               (s.error_type ? " · " + dash(s.error_type) : ""));
   } else if (s.type === "text") {
     line(host, dash(s.char_count) + " characters of reasoning");
   }

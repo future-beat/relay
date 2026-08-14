@@ -38,7 +38,9 @@ broker is built in `lifespan` and held on `app.state`, like `RunRegistry`.
 import asyncio
 import json
 import logging
+import re
 import time
+from functools import lru_cache
 from typing import Any
 
 from .config import settings
@@ -281,6 +283,47 @@ _DEMO_RAW_TOOLS = frozenset({"search_docs", "send_reply", "create_escalation", "
 # decision.
 _WITHHELD = "[withheld]"
 
+# A harvested literal shorter than this is not masked. Two reasons, both about the mask
+# being worth having: a one- or two-character value ("1", "ok") carries no disclosure on
+# its own, and masking one would replace a token that occurs everywhere in ordinary prose
+# — a drill-down reading "[withheld]" in forty places teaches a visitor to ignore the
+# marker, which costs more than the token was worth. Three is where the shortest value
+# that IS disclosive lives: a plan name ("pro").
+_MIN_WITHHOLD_LEN = 3
+
+
+@lru_cache(maxsize=1024)
+def _mask_pattern(secret: str) -> re.Pattern[str]:
+    """One literal, matched case-insensitively and only as a whole token.
+
+    Word-bounded rather than a bare substring, because the literals are no longer just
+    an address: they are whatever this run's lookups returned, which includes short
+    ordinary words like a plan name ("pro") and a status ("open"). A substring mask on
+    "pro" rewrites "process" and "provide" into "[withheld]" and turns the demo's own
+    payoff into noise. The boundary is asserted only where the literal's own edge is a
+    word character, so an address (`mia@datalane.ai`, ending in a letter but full of
+    punctuation) and a subject line ending in "?" both still match.
+
+    Case-insensitive because a restatement is not a copy: the model writes "Pro" for the
+    plan it read as "pro", and a mask that only catches the exact casing catches the
+    vector it was shown and not the one it will meet.
+    """
+    left = r"(?<!\w)" if secret[:1].isalnum() or secret[:1] == "_" else ""
+    right = r"(?!\w)" if secret[-1:].isalnum() or secret[-1:] == "_" else ""
+    return re.compile(left + re.escape(secret) + right, re.IGNORECASE)
+
+
+def _ordered(withheld: tuple[str, ...]) -> tuple[str, ...]:
+    """Longest first, deduplicated, total order — so masking is deterministic.
+
+    Longest first because the literals overlap by construction: a ticket subject can
+    contain the customer's name, and masking the name first would leave the rest of the
+    subject standing beside a "[withheld]". `-len` alone is not a total order, and two
+    runs of the same input must produce byte-identical responses (a tampering test
+    compares two responses byte for byte), so the tie-break is the literal itself.
+    """
+    return tuple(sorted({s for s in withheld if s}, key=lambda s: (-len(s), s)))
+
 
 def mask_withheld(value: Any, withheld: tuple[str, ...]) -> Any:
     """Replace every occurrence of a withheld literal, at any depth of a JSON value.
@@ -288,26 +331,105 @@ def mask_withheld(value: Any, withheld: tuple[str, ...]) -> Any:
     The demo branch publishes model prose (`text`, `send_reply.body`,
     `create_escalation.reason`), and prose restates whatever the model just read — so a
     per-field allowlist alone cannot keep a value out of the response, only a field.
-    This is the value-level half: the route hands it the ticket's own `customer_email`,
-    which `run_detail`'s docstring has always claimed is withheld "even on the demo
-    branch" and which was until now withheld only as a COLUMN.
+    This is the value-level half, and `withheld_from_run` below is where its literals
+    come from.
+
+    WHAT THIS CANNOT DO, stated here rather than discovered later: it masks LITERALS. A
+    genuine paraphrase — "the customer on our top tier", "she wrote in last week about a
+    billing problem" — shares no substring with the value it discloses and survives this
+    function untouched. Substring masking is a floor under the disclosure, never a proof
+    of its absence, and the only structural closure for the paraphrase vector is to keep
+    the value out of the model's context in the first place.
 
     Keys are masked as well as values: on the demo branch the raw `input` dict's keys
     are model-chosen strings, so a secret can arrive as one.
     """
     if not withheld:
         return value
+    return _mask(value, _ordered(withheld))
+
+
+def _mask(value: Any, ordered: tuple[str, ...]) -> Any:
     if isinstance(value, str):
-        for secret in withheld:
-            value = value.replace(secret, _WITHHELD)
+        for secret in ordered:
+            value = _mask_pattern(secret).sub(_WITHHELD, value)
         return value
     if isinstance(value, list):
-        return [mask_withheld(v, withheld) for v in value]
+        return [_mask(v, ordered) for v in value]
     if isinstance(value, dict):
-        return {
-            mask_withheld(k, withheld): mask_withheld(v, withheld) for k, v in value.items()
-        }
+        return {_mask(k, ordered): _mask(v, ordered) for k, v in value.items()}
     return value
+
+
+def _collect_strings(value: Any, out: set[str]) -> None:
+    """Every string VALUE in a JSON value, at any depth. Keys are not collected.
+
+    Keys are the tool author's column names — "name", "plan", "status" — and masking
+    those words out of prose would redact the sentence and disclose nothing.
+    """
+    if isinstance(value, str):
+        if len(value) >= _MIN_WITHHOLD_LEN:
+            out.add(value)
+    elif isinstance(value, list):
+        for item in value:
+            _collect_strings(item, out)
+    elif isinstance(value, dict):
+        for item in value.values():
+            _collect_strings(item, out)
+
+
+def withheld_from_run(
+    parsed: list[tuple[Any, dict]], *, authored: tuple[str, ...] = ()
+) -> tuple[str, ...]:
+    """Every string this run's NON-allowlisted tools returned to the model.
+
+    THE RULE, and it is deliberately the same decision as the raw-payload one rather
+    than a second list to remember: `_DEMO_RAW_TOOLS` already names the tools whose
+    output is safe to publish. A tool outside that set has output we refuse to publish —
+    and refusing to publish it as a PAYLOAD while publishing the model's restatement of
+    it as PROSE is not a decision, it is the payload leaving by the other door. So
+    whatever such a tool returned during this run is withheld by value from every field
+    the model composed after reading it.
+
+    Derived from the run's own rows, not from the ticket the route happened to load. The
+    previous version withheld one literal — the address in `tickets.customer_email` —
+    which covered the vector that had been demonstrated and nothing else: the same
+    `lookup_customer` result also carried the customer's NAME, their PLAN and up to ten
+    of that address's ticket SUBJECTS, filed by whoever else has used this service, and
+    the system prompt tells the model to read exactly those ("so you know their plan and
+    history", "Address the customer by name"). Reading the mask off the run's own tool
+    results covers what the model could actually have restated, whatever that turns out
+    to be, and a tool added later joins both halves of the rule on the day it is added.
+
+    Default-deny survives: membership is tested against the allowlist, so an unrecognised
+    or model-invented tool name is outside it and its output is harvested.
+
+    `authored` is what the VISITOR wrote, and it comes back out unmasked, because the
+    rule is about third-party content and the visitor's own submission is definitionally
+    not that. It is load-bearing rather than a nicety: `lookup_customer` selects the last
+    ten tickets for the address, which INCLUDES the one this run is working, and every
+    visitor who picks the same Try-it chip files the same subject — so without this the
+    demo's payoff reply reads "Regarding your [withheld]" about the visitor's own words.
+    Matched whole and case-insensitively, never as a substring: `authored` is
+    visitor-controlled, and "drop any harvested value that appears anywhere in the text
+    I submitted" would let a visitor unmask a third party's value by pasting it. Whole-
+    match cannot, because producing the match requires already holding the value.
+
+    LIMITS, since a mask that is trusted for more than it does is worse than none:
+    - It masks literals, not meanings. A paraphrase survives (see `mask_withheld`).
+    - Strings under `_MIN_WITHHOLD_LEN` are not collected.
+    - Non-strings are not collected. An integer identifier restated in prose survives,
+      because masking "42" wherever it occurs would rewrite costs, counts and timings.
+    """
+    found: set[str] = set()
+    for row, payload in parsed:
+        if row["type"] != "tool_result" or payload.get("tool") in _DEMO_RAW_TOOLS:
+            continue
+        # The whole result, including an error string: a failed lookup's message is
+        # still that tool's output about that person.
+        _collect_strings(payload.get("result"), found)
+    mine = {text.strip().casefold() for text in authored if text}
+    return tuple(value for value in found if value.strip().casefold() not in mine)
 
 
 def project(event: AgentEvent) -> dict | None:
@@ -385,6 +507,7 @@ def project_run_detail(
     full_fidelity: bool,
     known_tools: dict[str, frozenset[str]],
     withheld: tuple[str, ...] = (),
+    authored: tuple[str, ...] = (),
 ) -> list[dict]:
     """Redact one run's persisted events into a public drill-down (D-01, DASH-03).
 
@@ -420,10 +543,36 @@ def project_run_detail(
     `withheld` is the value-level half of the same rule, and it exists because prose
     cannot be allowlisted by field: `text`, `send_reply.body` and
     `create_escalation.reason` are the model restating what it just read. The route
-    passes the ticket's own `customer_email`, so that address is absent from a demo
-    drill-down BY VALUE and not merely as a column. Its default is "nothing extra to
-    withhold", which is the posture every non-demo caller wants — the field allowlist
-    above is what carries the property, and this narrows what survives it.
+    passes the ticket's own `customer_email` — the one literal that is NOT in any tool
+    result when the lookup misses (`{"found": false}`) and is still in the prompt the
+    model was given, so the route stays the only place that knows it. Its default is
+    "nothing extra to withhold", which is the posture every non-demo caller wants.
+
+    The rest of the mask is derived HERE, from this run's own rows, by
+    `withheld_from_run`: every string a tool outside `_DEMO_RAW_TOOLS` returned. That is
+    what makes the prose half of the rule cover the same CATEGORY the payload half does
+    rather than the one literal someone last demonstrated — the caller cannot forget it,
+    because the caller is not asked. It applies to the MODEL-AUTHORED fields only
+    (`text`, tool `input`, `missing_citations`): those are the fields the model composed
+    after reading the lookup, and they are the only channel by which a withheld tool's
+    output can re-enter this response. A published raw `result` is not one of them — it
+    belongs to an allowlisted tool, so it is Relay's own documentation or an id for the
+    visitor's own ticket, and masking a plan name out of the knowledge base would
+    corrupt the demo's payoff to protect nothing.
+
+    AND IT IS A FLOOR, NOT A PROOF. The mask replaces literals; a genuine paraphrase of
+    a name, a plan or someone else's ticket subject shares no substring with the value
+    and survives it. `lookup_customer` still hands the model ten of that address's
+    ticket subjects, and the only structural closure for the paraphrase vector is to
+    stop putting other people's words into the context — a change to the tool's payload,
+    which the eval judge also consumes. Anyone widening this branch should assume prose
+    discloses the GIST of everything the run looked up, and decide whether that is
+    acceptable rather than assume the mask made it safe.
+
+    `authored` names the strings the VISITOR submitted, so the mask does not withhold a
+    visitor's own words from them: the lookup returns the ticket this run is working
+    among the address's last ten, and it is the same subject every visitor who picked
+    that Try-it chip filed. See `withheld_from_run` for why it matches whole strings only.
 
     `known_tools` maps each REGISTERED tool name to the frozenset of its declared
     `input_schema.properties` keys; the caller builds it from `app.state.registry`.
@@ -468,6 +617,16 @@ def project_run_detail(
             }})
             continue
         parsed.append((row, payload))
+
+    # The value mask the model-authored fields are published through: the caller's
+    # literals plus everything this run's non-allowlisted tools returned. Built only on
+    # the branch that publishes prose — the redacted branch has no field for a literal
+    # to hide in, so computing it there would be work done to protect nothing.
+    prose_withheld = (
+        withheld + withheld_from_run(parsed, authored=authored)
+        if full_fidelity
+        else withheld
+    )
 
     # Pass 2 — the run-level facts. Each tool_result pairs with the NEAREST PRECEDING
     # UNPAIRED tool_use of the same tool name, so two interleaved calls to different
@@ -540,7 +699,7 @@ def project_run_detail(
             if full_fidelity:
                 # Counted before masking and published after: the count is a fact about
                 # what the model wrote, and a shorter one would misdescribe the run.
-                step["text"] = mask_withheld(raw_text, withheld)
+                step["text"] = mask_withheld(raw_text, prose_withheld)
         elif t == "tool_use":
             raw_tool = payload.get("tool")
             raw_input = payload.get("input")
@@ -554,7 +713,7 @@ def project_run_detail(
                 # Per tool, not per branch: lookup_customer's one argument is a person's
                 # address the visitor typed into a form — the identifier this route has
                 # always claimed to withhold — and not words they wrote.
-                step["input"] = mask_withheld(raw_input, withheld)
+                step["input"] = mask_withheld(raw_input, prose_withheld)
         elif t == "tool_result":
             detail = _project_tool_result(payload)
             # Its own "type" is the same string as the row's; dropped so the envelope
@@ -609,7 +768,7 @@ def project_run_detail(
             if full_fidelity:
                 # Model-authored text, so it is named here and nowhere near the public
                 # branch. `retrieved_ids` is on NEITHER: it is not in the allowlist.
-                step["missing_citations"] = mask_withheld(missing, withheld)
+                step["missing_citations"] = mask_withheld(missing, prose_withheld)
         elif t == "notice":
             # `result_count`, not `results`, and coerced — project()'s WR-02 coercion
             # copied rather than merely its field name, because the same future edit

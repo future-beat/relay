@@ -32,7 +32,15 @@ class ToolSpec:
 
 
 def lookup_customer(db: Database, email: str) -> str:
-    row = db.execute("SELECT * FROM customers WHERE email = ?", (email,)).fetchone()
+    # Named columns, not `SELECT *`. This result is the one payload in the registry that
+    # is a stored record ABOUT A THIRD PARTY, and everything in it reaches the model's
+    # context — which means it reaches the model's prose, which a demo run publishes on a
+    # keyless route. `SELECT *` makes the next migration that adds a column to
+    # `customers` a disclosure with no code change and no test failure; naming the four
+    # columns makes widening this a decision someone writes down.
+    row = db.execute(
+        "SELECT email, name, plan, signed_up FROM customers WHERE email = ?", (email,)
+    ).fetchone()
     if row is None:
         return json.dumps({"found": False})
     tickets = db.execute(
