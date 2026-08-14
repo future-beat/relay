@@ -316,7 +316,7 @@ _MIN_WITHHOLD_LEN = 3
 
 @lru_cache(maxsize=1024)
 def _mask_pattern(secret: str) -> re.Pattern[str]:
-    """One literal, matched case-insensitively and only as a whole token.
+    """One literal, matched case-insensitively, whole-token, over any run of whitespace.
 
     Word-bounded rather than a bare substring, because the literals are no longer just
     an address: they are whatever this run's lookups returned, which includes short
@@ -329,10 +329,30 @@ def _mask_pattern(secret: str) -> re.Pattern[str]:
     Case-insensitive because a restatement is not a copy: the model writes "Pro" for the
     plan it read as "pro", and a mask that only catches the exact casing catches the
     vector it was shown and not the one it will meet.
+
+    The literal's own whitespace is matched as `\\s+` rather than byte for byte (NF-1).
+    Prose is wrapped, indented and rendered by something that does not preserve the
+    spacing a database column happened to hold, so "Mia Torres" written as "Mia  Torres"
+    or across a line break is the SAME literal restated — not a paraphrase, which is the
+    thing this file concedes it cannot see. Matching the run of whitespace also keeps the
+    multi-word literal LONGER than its own components, which is what makes `_ordered`'s
+    longest-first pass replace the whole name with one marker instead of leaving the
+    surname standing beside a "[withheld]".
+
+    A possessive needs nothing extra and is called out so nobody adds it: "'" is not a
+    word character, so the right-hand boundary is already satisfied and "Mia's" masks to
+    "[withheld]'s".
     """
-    left = r"(?<!\w)" if secret[:1].isalnum() or secret[:1] == "_" else ""
-    right = r"(?!\w)" if secret[-1:].isalnum() or secret[-1:] == "_" else ""
-    return re.compile(left + re.escape(secret) + right, re.IGNORECASE)
+    # Split on whitespace so the parts can be rejoined with \s+. A secret that is ALL
+    # whitespace (or empty) has no parts, and falls back to the plain escaped literal
+    # rather than compiling an empty pattern that would match everywhere.
+    parts = secret.split()
+    if not parts:
+        return re.compile(re.escape(secret), re.IGNORECASE)
+    core = r"\s+".join(re.escape(part) for part in parts)
+    left = r"(?<!\w)" if parts[0][:1].isalnum() or parts[0][:1] == "_" else ""
+    right = r"(?!\w)" if parts[-1][-1:].isalnum() or parts[-1][-1:] == "_" else ""
+    return re.compile(left + core + right, re.IGNORECASE)
 
 
 def _ordered(withheld: tuple[str, ...]) -> tuple[str, ...]:
@@ -383,6 +403,55 @@ def _mask(value: Any, ordered: tuple[str, ...]) -> Any:
     return value
 
 
+def _harvestable(value: str) -> bool:
+    """Whether one string is worth withholding at all: long enough, and not Relay's own.
+
+    The two rules `_collect_strings` has always applied, lifted out because they now
+    apply twice — once to a value, once to each component of a proper-noun-shaped one.
+    """
+    return (
+        len(value) >= _MIN_WITHHOLD_LEN
+        and value.strip().casefold() not in _ENUMERABLE_VALUES
+    )
+
+
+def _name_components(value: str) -> list[str]:
+    """The whitespace-separated components of a PROPER-NOUN-SHAPED value. NF-1.
+
+    The whole-token mask misses the literal's most likely rendering. `customers.name`
+    is harvested whole ("Mia Torres"), `prompts.py` tells the model to "Address the
+    customer by name", and models overwhelmingly render that as the bare given name — so
+    "Hi Mia," used to survive onto the keyless route. That is not the paraphrase vector
+    this file concedes: it is a SUB-TOKEN of the literal the mask claims to catch.
+
+    IT IS DELIBERATELY NOT "split every harvested value on whitespace". The harvest also
+    takes a failed tool's error message, and shredding "invalid tool input — email: value
+    is not a valid email address" into words would put `tool`, `value`, `email` and
+    `address` in the mask and republish the demo's own prose as "[withheld]" — NF-4,
+    which this codebase has already paid for once. A value is split only when it is an
+    ATTRIBUTE rather than a SENTENCE, and the test for that is capitalisation: no
+    component may begin with a lowercase letter. A person's name passes in any script
+    that has case and in the ones that do not; "unknown tool foobar" and every guardrail
+    denial fail on their first word.
+
+    THE TRADEOFF THIS INHERITS, stated for whoever adds a fifth seeded persona: a
+    component is masked wherever it stands as a whole token, INCLUDING where it means the
+    ordinary English word. The four personas in `db.SEED_CUSTOMERS` (Ava, Liam, Noah,
+    Mia — Chen, Patel, Smith, Torres) collide with nothing a support agent writes, so the
+    cost today is zero. A persona named "Bill", "Mark" or "Grant" would publish "your
+    [withheld] is due" on the demo's payoff surface. `_MIN_WITHHOLD_LEN` is the only
+    guard against that and it only stops the two-character case. If a new name collides,
+    the lever is the seed data or an exemption beside `_ENUMERABLE_VALUES` — not a wider
+    mask.
+    """
+    components = value.split()
+    if len(components) < 2:
+        return []  # nothing a whole-literal match would have missed
+    if any(part[:1].islower() for part in components):
+        return []  # a sentence, not a name
+    return [part for part in components if _harvestable(part)]
+
+
 def _collect_strings(value: Any, out: set[str]) -> None:
     """Every FREE-TEXT string VALUE in a JSON value, at any depth. Keys are not collected.
 
@@ -395,13 +464,17 @@ def _collect_strings(value: Any, out: set[str]) -> None:
     the dashboard. It is also the distinction that keeps the mask legible — see NF-4 in
     the phase-6 verification, where "open" and "resolved" came out as "[withheld]" in the
     demo's payoff prose.
+
+    A proper-noun-shaped value is collected whole AND per component, so the greeting form
+    of a name does not walk past a mask that holds the full name — see `_name_components`
+    for why that split is narrow and what it costs. Both halves go through the same two
+    rules above, so a component that is Relay's own vocabulary is no more collected than a
+    whole value that is.
     """
     if isinstance(value, str):
-        if (
-            len(value) >= _MIN_WITHHOLD_LEN
-            and value.strip().casefold() not in _ENUMERABLE_VALUES
-        ):
+        if _harvestable(value):
             out.add(value)
+            out.update(_name_components(value))
     elif isinstance(value, list):
         for item in value:
             _collect_strings(item, out)
@@ -463,6 +536,16 @@ def withheld_from_run(
     LIMITS, since a mask that is trusted for more than it does is worse than none:
     - It masks literals, not meanings. A paraphrase survives (see `mask_withheld`).
     - Strings under `_MIN_WITHHOLD_LEN` are not collected.
+    - A multi-word value is collected per component only when it is proper-noun-shaped
+      (NF-1, `_name_components`). "Mia Torres" contributes "Mia" and "Torres", so the
+      greeting form is covered; a value whose components are lowercase — an error
+      sentence — is masked only as the whole string, because splitting a sentence puts
+      ordinary English in the mask and that costs more than it protects (NF-4). A
+      lowercase-entered name is therefore under-covered by exactly the greeting form
+      this rule was added for.
+    - A component collides with ordinary English on its own terms: a persona whose given
+      name is also a support-desk word would be masked wherever that word appears. See
+      `_name_components` for the argument and the lever.
     - Values in `_ENUMERABLE_VALUES` — Relay's own ticket statuses and categories — are
       not collected. That is a deliberate narrowing to FREE TEXT, and it is safe for
       these values only because they are a closed set this service publishes anyway.
