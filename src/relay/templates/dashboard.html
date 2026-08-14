@@ -496,29 +496,52 @@ function drillNotice(text) {
   drillFacts.append(el("p", { class: "empty" }, text));
 }
 
+// WR-07. Two opens can be in flight at once — the visitor clicks a run in the Recent
+// runs table, then one in the live feed before the first responds — and they resolve in
+// ARRIVAL order, not click order. Without this token the slower first request renders
+// last and the dialog shows a run nobody asked for, under a title naming it and, on a
+// demo-origin run, under a badge reading "You submitted this run".
+let drillGeneration = 0;
+
+// One `await`, and the staleness check is the statement straight after it. That shape
+// is the point: with several awaits, every one of them is a place a render can slip in
+// ahead of a guard, so all the awaiting lives in fetchDrill (which touches no DOM) and
+// this function does its rendering on one side of a single check.
 async function openDrill(uid) {
   if (!uid) return;
+  const mine = ++drillGeneration;
   clear(drillFacts);
   clear(drillSteps);
   drillTitle.textContent = "Run " + String(uid).slice(0, 8);
   drillFacts.append(el("p", { class: "empty" }, "loading the trace…"));
   if (!drillEl.open) drillEl.showModal();
+  const outcome = await fetchDrill(uid);
+  if (mine !== drillGeneration) return;
+  if (outcome.error) { drillNotice(outcome.error); return; }
+  renderDrill(outcome.detail);
+}
+
+// Every await on this path, and NOTHING that touches the panel: a render in here would
+// be a render on the far side of openDrill's generation check, which is the whole bug.
+async function fetchDrill(uid) {
   let resp;
   try {
     resp = await fetch("/runs/" + encodeURIComponent(uid));
   } catch (err) {
-    drillNotice("the trace could not be fetched — the connection failed. Try again.");
-    return;
+    return { error: "the trace could not be fetched — the connection failed. Try again." };
   }
   if (!resp.ok) {
     // The route emits exactly ONE 404 and it means the uid is unknown. That is a
     // different sentence from "swept", which is a 200 about a run that really happened.
-    drillNotice(resp.status === 404
+    return { error: resp.status === 404
       ? "no such run — this service never issued that id"
-      : "the trace is unavailable right now (HTTP " + resp.status + ")");
-    return;
+      : "the trace is unavailable right now (HTTP " + resp.status + ")" };
   }
-  renderDrill(await resp.json());
+  try {
+    return { detail: await resp.json() };
+  } catch (err) {
+    return { error: "the trace came back unreadable — try opening it again." };
+  }
 }
 
 function renderDrill(d) {

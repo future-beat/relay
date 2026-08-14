@@ -2498,6 +2498,60 @@ def test_the_drill_panel_renders_the_run_states(client):
     assert "None" not in html
 
 
+def test_only_the_latest_drill_down_open_may_render(client):
+    """WR-07: two opens in flight resolve in ARRIVAL order, not click order.
+
+    Concrete: the visitor clicks run A in the Recent runs table (a slow response —
+    /runs/{uid} reads run_events, runs and tickets), then clicks run B in the live feed
+    before A comes back. B renders, then A overwrites it. The dialog is now titled with
+    A's ticket and, if A is demo-origin, carries the badge reading "You submitted this
+    run" — for a run the visitor did not submit and did not ask to see.
+
+    The guard is a monotonic token, and the SHAPE is load-bearing: `openDrill` has
+    exactly one `await` and the check is the statement immediately after it, because
+    every additional await is another place a render can land ahead of a check. That is
+    why all the awaiting lives in `fetchDrill`, which touches no DOM at all.
+
+    MUTATION 1 (executed): delete `if (mine !== drillGeneration) return;`. The
+    immediately-after-the-await assertion reds.
+
+    MUTATION 2 (executed): move the fetch back inline — `renderDrill(await
+    resp.json())` in openDrill. The one-await assertion reds with 3 awaits, which is
+    the structure that made the missing guard possible.
+
+    WEAK BY CONSTRUCTION: there is no DOM and no event loop here, so nothing in this
+    test issues two overlapping opens and watches which one wins. It proves the guard
+    exists and is positioned where it cannot be bypassed; that it actually suppresses a
+    superseded render needs a browser.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _DRILL))
+
+    body = code.split("async function openDrill(uid) {", 1)[1].split("\n}\n", 1)[0]
+    assert "const mine = ++drillGeneration;" in body, "the open takes no token"
+    assert "let drillGeneration = 0;" in code, "the token counter is not declared"
+
+    # Exactly one await, and the guard is the very next statement after it.
+    assert body.count("await ") == 1, (
+        "openDrill awaits more than once; every extra await is an unguarded render point"
+    )
+    assert re.search(r"await [^\n]*\n\s*if \(mine !== drillGeneration\) return;", body), (
+        "the staleness check is not the statement immediately after the await"
+    )
+
+    # ...and everything that renders is on the far side of it.
+    _, after = body.split("if (mine !== drillGeneration) return;", 1)
+    for sink in ("drillNotice(", "renderDrill("):
+        assert sink in after, f"{sink} can run for a superseded open"
+
+    # The awaiting helper renders nothing, which is what makes the single check above
+    # sufficient rather than merely first.
+    fetcher = code.split("async function fetchDrill(uid) {", 1)[1].split("\n}\n", 1)[0]
+    for sink in ("drillNotice", "renderDrill", "drillFacts", "drillSteps", "drillTitle",
+                 "drillEl", "append(", "textContent"):
+        assert sink not in fetcher, f"fetchDrill touches the panel with {sink}"
+
+
 def test_the_drill_panel_renders_values_as_text_never_html(client):
     """T-06-23: the panel is the widest surface model-influenced strings reach.
 
