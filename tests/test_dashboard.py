@@ -430,6 +430,14 @@ def _leaky_run_events() -> list:
             "customer": {
                 "email": DETAIL_EMAIL, "name": DETAIL_CUSTOMER_NAME, "plan": "enterprise",
             },
+            # `subject` here is deliberately a payload shape `lookup_customer` no
+            # longer produces — it stopped returning anyone's ticket text. These rows
+            # are hand-written, and keeping the field is what keeps this test about the
+            # PROJECTOR: the mask stays as defence-in-depth for whatever a future tool
+            # returns, and `_DEMO_RAW_TOOLS` is default-deny for the same reason, so
+            # both need a free-text value from a non-allowlisted tool to be tested at
+            # all. `status` beside it is the enumerable value that must NOT be harvested
+            # (NF-4).
             "recent_tickets": [
                 {"id": 1, "subject": DETAIL_PRIOR_SUBJECT, "status": "open"},
             ],
@@ -2340,6 +2348,132 @@ def test_a_demo_runs_prose_cannot_republish_what_the_run_looked_up(client, monke
         "masking the plan rewrote an unrelated word — a drill-down full of spurious"
         " [withheld] markers teaches a visitor to ignore the real ones"
     )
+
+
+# --- NF-4: the mask's COST, which is the other way it fails ---------------------------
+#
+# A mask is only kept if the page it produces still reads as English. `lookup_customer`
+# returns each recent ticket's `status`, the harvest used to take every string it found,
+# and so the demo's payoff sentence published as "Your ticket is still [withheld], and
+# the earlier one is [withheld]" — reproduced live in the phase-6 verification. The
+# sentinels below are their own set because the property is the inverse of every other
+# test in this file: what must SURVIVE, and beside it the proof the mask still ran.
+STATUS_EMAIL = "status-legibility-2f6b@example.com"
+STATUS_NAME = "STATUS-CUSTOMER-NAME-4d91"      # customers.name — must still be masked
+STATUS_BODY = "STATUS-VISITOR-BODY-8e07"       # the visitor's own words
+
+
+def _seed_the_status_customer() -> None:
+    """A customer with one earlier RESOLVED ticket, so the lookup returns two statuses.
+
+    Two, not one, because "open" alone could survive by accident — it is also the status
+    of the visitor's own ticket, which `authored` might have exempted for another reason.
+    "resolved" belongs to nobody's authored text and can only survive by being exempt as
+    vocabulary.
+    """
+    app.state.conn.execute(
+        "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
+        (STATUS_EMAIL, STATUS_NAME, "enterprise", "2025-01-01"),
+    )
+    app.state.conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body, status, origin)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (STATUS_EMAIL, "an earlier ask", "already dealt with", "resolved", None),
+    )
+    app.state.conn.commit()
+
+
+def test_a_demo_runs_prose_keeps_the_words_relay_itself_assigns(client, monkeypatch):
+    """NF-4: ticket statuses survive the mask, and the mask is still running (D-02).
+
+    THE FAILURE THIS GUARDS is not a disclosure — it is the mask over-reaching until the
+    drill-down is unreadable, at which point a visitor learns to skim past "[withheld]"
+    and the marker stops meaning anything where it does matter. "open" and "resolved" are
+    two of the three words this service assigns to a ticket, publishes in its own tool
+    schemas, and renders on the dashboard; nobody wrote them, so the harvest — whose job
+    is free text — has no business taking them.
+
+    BOTH HALVES, because either alone is worthless. If the statuses survive but the mask
+    is not running, this passes against a completely unredacted response; so the
+    customer's NAME (free text, and in the same lookup result) must be masked in the same
+    document. If the mask runs but the statuses vanish, that is the shipped bug.
+
+    MUTATION: drop the `_ENUMERABLE_VALUES` condition from `_collect_strings` in
+    events.py — i.e. harvest every string again. The statuses come back out as
+    "[withheld]" and the survival assertions red while the name assertion stays green,
+    which is what tells the two halves apart.
+
+    Anti-vacuity: the statuses really are in the lookup's stored result (so the harvest
+    had them to take), and the published prose really is model-authored text.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    _seed_the_status_customer()
+    ticket_id = _demo_ticket(client, STATUS_EMAIL, f"charged twice. {STATUS_BODY}")
+    assert _origin_of(ticket_id) == "demo"
+
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": STATUS_EMAIL})]),
+        response([
+            text_block(
+                f"{STATUS_NAME} has two tickets: this one is still open and the earlier"
+                f" one is resolved."
+            ),
+            tool_use_block("create_escalation", {
+                "ticket_id": ticket_id,
+                "reason": (
+                    f"{STATUS_NAME} has one open ticket and one resolved. This ticket:"
+                    f" {STATUS_BODY}"
+                ),
+                "priority": "high",
+            }),
+        ]),
+        response([text_block("escalated")], stop_reason="end_turn"),
+    ])
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    assert "event: error" not in resp.text
+    uid = resp.headers["X-Relay-Run-Uid"]
+
+    # Anti-vacuity: the harvest genuinely saw both statuses in a non-allowlisted tool's
+    # result — so their survival below is an exemption, not an absence.
+    lookups = [
+        r["payload"] for r in app.state.conn.execute(
+            "SELECT type, payload FROM run_events WHERE run_uid = ?", (uid,)
+        ).fetchall()
+        if r["type"] == "tool_result" and '"lookup_customer"' in r["payload"]
+    ]
+    assert lookups, "the run never looked the customer up"
+    for status in ('"status": "open"', '"status": "resolved"'):
+        assert any(status in payload for payload in lookups), (
+            f"the lookup result never carried {status} — the harvest had nothing to take"
+        )
+
+    with _anon(client) as anon:
+        body = anon.get(f"/runs/{uid}").json()
+    assert body["demo"] is True
+    whole = json.dumps(body)
+
+    authored_fields = [s["text"] for s in body["steps"] if s.get("text")]
+    authored_fields += [
+        s["input"]["reason"] for s in body["steps"]
+        if s.get("tool") == "create_escalation" and isinstance(s.get("input"), dict)
+    ]
+    assert authored_fields, "no model-authored field was published — vacuous"
+    prose = " ".join(authored_fields)
+
+    # Half one: the words Relay itself assigns are still words.
+    for status in ("open", "resolved"):
+        assert re.search(rf"\b{status}\b", prose), (
+            f"'{status}' was masked out of the demo's own payoff prose (NF-4): {prose!r}"
+        )
+
+    # Half two: the mask is still running in this very document, on free text from the
+    # same tool result. Without this the assertions above would pass against no mask.
+    assert STATUS_NAME not in whole, (
+        "the looked-up customer's name survived — the mask is not running, so the"
+        " statuses above prove nothing"
+    )
+    assert "[withheld]" in prose, "no literal was masked at all in the published prose"
+    assert STATUS_BODY in whole, "the visitor's own words were withheld from the visitor"
 
 
 def test_a_demo_run_whose_lookup_missed_still_withholds_the_address(client, monkeypatch):

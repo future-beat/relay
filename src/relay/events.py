@@ -45,7 +45,7 @@ from typing import Any
 
 from .config import settings
 from .db import Database
-from .models import AgentEvent
+from .models import AgentEvent, TicketCategory, TicketStatus
 from .retrieval import normalise_citation
 from .runs import ActiveRun
 
@@ -283,6 +283,26 @@ _DEMO_RAW_TOOLS = frozenset({"search_docs", "send_reply", "create_escalation", "
 # decision.
 _WITHHELD = "[withheld]"
 
+# Relay's OWN vocabulary: the closed sets this service defines, publishes in its tool
+# schemas and its API, and renders on the dashboard. These are never harvested, because
+# the harvest is meant to take FREE TEXT — a value somebody wrote — and these are values
+# nobody wrote. Masking them buys nothing and costs the demo's payoff sentence: the
+# lookup returns each recent ticket's `status`, so "Your ticket is still open, and the
+# earlier one is resolved" published as "...still [withheld], and the earlier one is
+# [withheld]" (NF-4, reproduced live), which teaches a visitor to ignore the marker
+# exactly where it matters. Same argument `_mask_pattern` makes for word boundaries,
+# one level up.
+#
+# Derived from the enums rather than written out, so a new status or category joins this
+# set on the day it is added and nobody has to remember. It is a NARROW exemption on
+# purpose: everything else a non-allowlisted tool returns is still harvested by default,
+# including the customer's plan — "pro" is also a short closed-set word, but it is an
+# attribute OF A PERSON rather than of the ticket's processing state, and it stays
+# withheld.
+_ENUMERABLE_VALUES = frozenset(
+    member.value.casefold() for member in (*TicketStatus, *TicketCategory)
+)
+
 # A harvested literal shorter than this is not masked. Two reasons, both about the mask
 # being worth having: a one- or two-character value ("1", "ok") carries no disclosure on
 # its own, and masking one would replace a token that occurs everywhere in ordinary prose
@@ -362,13 +382,23 @@ def _mask(value: Any, ordered: tuple[str, ...]) -> Any:
 
 
 def _collect_strings(value: Any, out: set[str]) -> None:
-    """Every string VALUE in a JSON value, at any depth. Keys are not collected.
+    """Every FREE-TEXT string VALUE in a JSON value, at any depth. Keys are not collected.
 
     Keys are the tool author's column names — "name", "plan", "status" — and masking
     those words out of prose would redact the sentence and disclose nothing.
+
+    Neither are values drawn from Relay's own closed vocabulary (`_ENUMERABLE_VALUES`).
+    The harvest exists to withhold what SOMEBODY WROTE, and a ticket status is not that:
+    it is one of three words this service assigns, publishes in its schemas and shows on
+    the dashboard. It is also the distinction that keeps the mask legible — see NF-4 in
+    the phase-6 verification, where "open" and "resolved" came out as "[withheld]" in the
+    demo's payoff prose.
     """
     if isinstance(value, str):
-        if len(value) >= _MIN_WITHHOLD_LEN:
+        if (
+            len(value) >= _MIN_WITHHOLD_LEN
+            and value.strip().casefold() not in _ENUMERABLE_VALUES
+        ):
             out.add(value)
     elif isinstance(value, list):
         for item in value:
@@ -418,6 +448,10 @@ def withheld_from_run(
     LIMITS, since a mask that is trusted for more than it does is worse than none:
     - It masks literals, not meanings. A paraphrase survives (see `mask_withheld`).
     - Strings under `_MIN_WITHHOLD_LEN` are not collected.
+    - Values in `_ENUMERABLE_VALUES` — Relay's own ticket statuses and categories — are
+      not collected. That is a deliberate narrowing to FREE TEXT, and it is safe for
+      these values only because they are a closed set this service publishes anyway.
+      Adding a genuinely disclosive value to those enums would widen it silently.
     - Non-strings are not collected. An integer identifier restated in prose survives,
       because masking "42" wherever it occurs would rewrite costs, counts and timings.
     """
