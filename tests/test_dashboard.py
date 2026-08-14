@@ -2498,6 +2498,72 @@ def test_the_drill_panel_renders_the_run_states(client):
     assert "None" not in html
 
 
+# A frame field concatenated straight into a step line: `+ f.reason` or `d.tool +`.
+# The lookbehind keeps `head.textContent +` from reading as `d.textContent +`.
+_BARE_FRAME_FIELD = re.compile(
+    r"\+\s*(?<![\w$.])[fdr]\.\w+|(?<![\w$.])[fdr]\.\w+\s*\+"
+)
+
+
+def test_no_step_describer_interpolates_a_raw_frame_field(client):
+    """WR-10: every field these four renderers read is optional, so every one can be null.
+
+    `project()` builds each published frame with `d.get(...)`, so a field is null the
+    moment its source event omits the key — and both feed describers concatenated them
+    directly. An `error` frame with no reason rendered the literal line `error · null`
+    on the public live feed, to every anonymous viewer, on the page whose entire premise
+    is that what it shows is real. `renderChunks` had the same shape (`null · null` for
+    a malformed result row, which `project_run_detail` tolerates on purpose rather than
+    dropping).
+
+    The rule asserted here is mechanical rather than by-example, because the failure is
+    per-field: any ONE unwrapped field is the bug, and an example-based test only ever
+    covers the fields someone thought of. So this greps each renderer for a frame field
+    adjacent to a `+` and requires there to be none.
+
+    MUTATION 1 (executed): unwrap one field — `"error · " + f.reason` in `describe`.
+    Reds naming the field it found.
+
+    MUTATION 2 (executed): unwrap `describeOwn`'s `d.cost_usd`. Reds the same way, which
+    is the point of scanning all four bodies rather than one.
+
+    WEAK BY CONSTRUCTION: grep over the served source. Nothing here feeds a
+    field-missing frame through a describer and reads the rendered line back — there is
+    no DOM in this suite. It proves no field REACHES a line unguarded; that dash()
+    itself returns the placeholder is pinned by test_the_drill_panel_renders_timings.
+    """
+    html = client.get("/dashboard").text
+    blocks = {
+        "feed": _code_only(_block(html, "live feed (/events)")),
+        "try": _code_only(_block(html, _TRY)),
+        "drill": _code_only(_block(html, _DRILL)),
+    }
+    renderers = (
+        ("describe", "feed", "function describe(f) {"),
+        ("runNode", "feed", "function runNode(f) {"),
+        ("describeOwn", "try", "function describeOwn(name, d) {"),
+        ("renderChunks", "drill", "function renderChunks(results, host) {"),
+    )
+
+    for name, where, opener in renderers:
+        block = blocks[where]
+        assert opener in block, f"{name} is gone — the assertions below would be vacuous"
+        body = block.split(opener, 1)[1].split("\n}\n", 1)[0]
+
+        bare = _BARE_FRAME_FIELD.findall(body)
+        assert not bare, f"{name} interpolates raw frame fields: {bare}"
+        assert "dash(" in body, f"{name} routes nothing through the placeholder helper"
+        # ...and nobody "fixed" it by interpolating the word instead of the value.
+        # Over the string LITERALS only: `return null;` in describeOwn is a control
+        # sentinel meaning "already appended, render no line", not rendered text.
+        for literal in re.findall(r'"([^"]*)"', body):
+            for word in ("undefined", "null", "None"):
+                assert word not in literal, f"{name} renders the word {word!r}"
+
+    # The whole-document rule tests/test_auth.py owns, restated where it can be broken.
+    assert "None" not in html
+
+
 def test_only_the_latest_drill_down_open_may_render(client):
     """WR-07: two opens in flight resolve in ARRIVAL order, not click order.
 
@@ -2678,8 +2744,13 @@ def test_the_drill_panel_renders_timings(client):
     assert "s.elapsed_ms" in code, "steps are not timed at all"
     assert "s.duration_ms" in code, "tool calls carry no duration"
     # The one guard both helpers use, asserted as written — a dash, from an explicit
-    # null/undefined test rather than from falsiness (0 is a real timing).
-    assert code.count('(v === null || v === undefined) ? "—"') >= 2
+    # null/undefined test rather than from falsiness (0 is a real timing). Asserted in
+    # the SHARED render-helpers block: dash()/ms() moved there when the feed describers
+    # started needing them too (WR-10), and asserting them here would have gone red on
+    # the move while the property was intact.
+    helpers = _code_only(_block(html, "render helpers"))
+    assert helpers.count('(v === null || v === undefined) ? "—"') >= 2
+    assert "dash(" in code and "ms(" in code, "the panel stopped using the guards"
     assert "None" not in html
 
 

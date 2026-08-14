@@ -179,6 +179,18 @@ function el(tag, attrs, text) {
 function clear(node) {
   while (node.firstChild) node.removeChild(node.firstChild);
 }
+
+// A missing number renders as a dash. Never 0, and never the word the language prints
+// for an absent value: a row written before the elapsed_ms migration did not take zero
+// milliseconds, and saying it did would be an invention a visitor cannot check.
+//
+// Here rather than beside the drill-down (WR-10): every field the feed and the Try-it
+// stream interpolate is a `.get()` in events.project(), so any of them is null the
+// moment its source event omits the key — and both describers were concatenating them
+// straight into a step line, printing `error · null` and `undefined` on the public
+// feed. One placeholder, one definition, all three renderers.
+function dash(v) { return (v === null || v === undefined) ? "—" : String(v); }
+function ms(v) { return (v === null || v === undefined) ? "—" : String(v) + " ms"; }
 // --- render helpers — end ---
 
 // --- metrics poll (/metrics) — begin ---
@@ -484,11 +496,9 @@ const drillFacts = document.getElementById("drill-envelope");
 const drillSteps = document.getElementById("drill-steps");
 document.getElementById("drill-close").addEventListener("click", () => drillEl.close());
 
-// A missing number renders as a dash. Never 0, and never the word Python prints for an
-// absent value: a row written before the elapsed_ms migration did not take zero
-// milliseconds, and saying it did would be an invention a visitor cannot check.
-function dash(v) { return (v === null || v === undefined) ? "—" : String(v); }
-function ms(v) { return (v === null || v === undefined) ? "—" : String(v) + " ms"; }
+// dash() and ms() are in the shared render-helpers block at the top of this script
+// (WR-10): the drill-down had them to itself while the two feed describers, which need
+// them for the same reason, had nothing.
 
 function drillNotice(text) {
   clear(drillFacts);
@@ -710,7 +720,7 @@ function renderChunks(results, host) {
     const chunk = el("div", { class: cited ? "chunk cited" : "chunk uncited" });
     chunk.append(el("span", { class: "tag" },
                     cited ? "cited in the reply" : "retrieved, not cited"));
-    chunk.append(el("span", { class: "doc" }, r.doc + " · " + r.id));
+    chunk.append(el("span", { class: "doc" }, dash(r.doc) + " · " + dash(r.id)));
     chunk.append(el("span", { class: "score" }, dash(r.score)));
     box.append(chunk);
   });
@@ -972,23 +982,25 @@ function onTryFrame(name, data, uid) {
   tryStream.scrollTop = tryStream.scrollHeight;
 }
 
+// Full fidelity, but not full presence: a frame can still omit a field, and this
+// describer had the same defect the public one did (WR-10). Same answer, same helper.
 function describeOwn(name, d) {
-  if (name === "tool_use") return "-> " + d.tool;
-  if (name === "tool_result") return (d.is_error ? "x " : "<- ") + d.tool;
-  if (name === "guardrail") return "guardrail " + d.guard + " -> " + d.action +
-                                   " on " + d.tool;
-  if (name === "notice") return "notice · " + d.kind + " · " + d.tool;
-  if (name === "text") return "thinking: " + d.text;
-  if (name === "usage") return "step " + d.steps + " · $" + d.cost_usd;
-  if (name === "resolution") return "resolved via " + d.via + " · $" + d.cost_usd;
+  if (name === "tool_use") return "-> " + dash(d.tool);
+  if (name === "tool_result") return (d.is_error ? "x " : "<- ") + dash(d.tool);
+  if (name === "guardrail") return "guardrail " + dash(d.guard) + " -> " + dash(d.action) +
+                                   " on " + dash(d.tool);
+  if (name === "notice") return "notice · " + dash(d.kind) + " · " + dash(d.tool);
+  if (name === "text") return "thinking: " + dash(d.text);
+  if (name === "usage") return "step " + dash(d.steps) + " · $" + dash(d.cost_usd);
+  if (name === "resolution") return "resolved via " + dash(d.via) + " · $" + dash(d.cost_usd);
   // An in-stream refusal: a drain landed mid-request, or a step could not be recorded.
   // The server writes the copy for both, and it is a state, not a stack trace.
   if (name === "error") {
     tryStream.append(el("p", { class: "refusal" },
-                        d.note || "the run stopped: " + d.reason));
+                        d.note || "the run stopped: " + dash(d.reason)));
     return null;
   }
-  return name;
+  return dash(name);
 }
 
 // The visitor's own run, badged where the PUBLIC feed shows it — and left in that feed
@@ -1084,16 +1096,21 @@ const feedEl = document.getElementById("feed-list");
 const feedStatus = document.getElementById("feed-status");
 const runNodes = new Map();
 
+// WR-10: every field below is a `.get()` in events.project(), so every one of them is
+// null whenever the source event omits the key — an `error` frame with no reason
+// published `error · null` to every anonymous viewer. dash() is the page's own answer
+// to that and the drill-down already used it everywhere; this is the same rule, applied
+// on the surface that faces the most people.
 function describe(f) {
-  if (f.type === "tool_use") return "-> " + f.tool;
-  if (f.type === "tool_result") return (f.is_error ? "x " : "<- ") + f.tool +
-    (f.denied_by ? " denied by " + f.denied_by : "");
-  if (f.type === "guardrail") return "guardrail " + f.guard + " -> " + f.action;
-  if (f.type === "usage") return "step " + f.steps + " · $" + f.cost_usd;
-  if (f.type === "resolution") return "resolved via " + f.via + " · $" + f.cost_usd;
-  if (f.type === "error") return "error · " + f.reason;
-  if (f.type === "notice") return "notice · " + f.kind + " · " + f.tool;
-  return f.type;
+  if (f.type === "tool_use") return "-> " + dash(f.tool);
+  if (f.type === "tool_result") return (f.is_error ? "x " : "<- ") + dash(f.tool) +
+    (f.denied_by ? " denied by " + dash(f.denied_by) : "");
+  if (f.type === "guardrail") return "guardrail " + dash(f.guard) + " -> " + dash(f.action);
+  if (f.type === "usage") return "step " + dash(f.steps) + " · $" + dash(f.cost_usd);
+  if (f.type === "resolution") return "resolved via " + dash(f.via) + " · $" + dash(f.cost_usd);
+  if (f.type === "error") return "error · " + dash(f.reason);
+  if (f.type === "notice") return "notice · " + dash(f.kind) + " · " + dash(f.tool);
+  return dash(f.type);
 }
 
 // Grouped by run_uid, which is why CR-03 stamps it: several runs are in flight at
@@ -1104,8 +1121,8 @@ function runNode(f) {
     node = document.createElement("li");
     node.dataset.uid = f.run_uid;
     const head = document.createElement("b");
-    head.textContent = "ticket #" + f.ticket_id + " · run " +
-                       String(f.run_uid).slice(0, 8);
+    head.textContent = "ticket #" + dash(f.ticket_id) + " · run " +
+                       dash(f.run_uid).slice(0, 8);
     node.append(head);
     // The frames already carry the uid — which is why CR-03 stamps it — and
     // GET /runs/{uid} answers status "in_flight" for a run whose summary row does not
