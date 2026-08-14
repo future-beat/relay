@@ -2731,6 +2731,280 @@ def test_the_component_split_leaves_a_tool_error_as_one_literal():
     )
 
 
+# --- NF-3: the five properties of the mask that nothing held --------------------------
+#
+# 06-VERIFICATION deleted each of these one at a time and ran the whole suite: 420 green,
+# five times. Everything here is CORRECT in the shipped tree — what was missing is the
+# floor under it, and the reason this phase needed a second pass at all was "documented
+# as guarded, not actually guarded".
+#
+# Each test below names the deletion it exists to catch, and drives `project_run_detail`
+# — the public serialiser the drill-down route calls — wherever the consequence is
+# route-visible, so no guard here can pass against a function nothing calls. They are
+# unit-level in their fixtures (rows built by hand, no model, no HTTP) and that is stated
+# rather than implied: the anonymous-walk tests above are what prove the route; these
+# prove the properties those tests would silently stop depending on.
+NF3_NAME = "Mireille Vasquez"                      # customers.name — proper-noun shaped
+NF3_EMAIL = "mireille@northwind-labs.example"      # the route's own withheld literal
+NF3_PLAN = "enterprise"
+
+
+def _stored_rows(*events: tuple[str, dict]) -> list[dict]:
+    """`run_events` rows in the shape `project_run_detail` reads them out of sqlite.
+
+    Dicts rather than sqlite3.Rows: the projector only ever subscripts `seq`, `type`,
+    `elapsed_ms` and `payload`, and building real rows would put a schema migration
+    between these tests and the property each one is about.
+    """
+    return [
+        {"seq": i, "type": t, "elapsed_ms": i * 10, "payload": json.dumps(payload)}
+        for i, (t, payload) in enumerate(events, start=1)
+    ]
+
+
+def _lookup_row(name: str = NF3_NAME, email: str = NF3_EMAIL) -> tuple[str, dict]:
+    """One stored `lookup_customer` result — the tool the whole mask is derived from."""
+    return ("tool_result", {"tool": "lookup_customer", "is_error": False, "result": {
+        "found": True,
+        "customer": {
+            "email": email, "name": name, "plan": NF3_PLAN, "signed_up": "2025-01-01",
+        },
+        "recent_tickets": [{"id": 7, "status": "open", "created_at": "2026-08-14"}],
+    }})
+
+
+def _only_step(steps: list[dict], type_: str) -> dict:
+    """The one step of a given type. Asserted to be the only one, not merely the first:
+    a projector that emitted two would otherwise be read through whichever came first."""
+    matching = [step for step in steps if step["type"] == type_]
+    assert len(matching) == 1, f"expected one {type_} step, got {len(matching)}"
+    return matching[0]
+
+
+def _harvest_of_the_lookup_row() -> tuple[str, ...]:
+    """The literals the shipped harvest derives from `_lookup_row`'s stored result."""
+    return withheld_from_run([({"type": "tool_result"}, _lookup_row()[1])])
+
+
+def _demo_steps(rows: list[dict], **kwargs) -> list[dict]:
+    """The demo branch of the drill-down: what a keyless GET /runs/{uid} publishes."""
+    return project_run_detail(
+        rows,
+        full_fidelity=True,
+        known_tools={
+            "lookup_customer": frozenset({"email"}),
+            "search_docs": frozenset({"query"}),
+            "send_reply": frozenset({"ticket_id", "body", "citations"}),
+        },
+        **kwargs,
+    )
+
+
+def test_the_mask_catches_a_literal_the_model_recased():
+    """NF-3 (1): `re.IGNORECASE` is load-bearing, and no test wrote a recased restatement.
+
+    The mask's docstring argues the case explicitly — "the model writes 'Pro' for the
+    plan it read as 'pro'" — because a restatement is not a copy. The model reads the
+    lookup's JSON and writes English, and English recases: a name at the start of a
+    sentence, a plan in title case, a shouted "ENTERPRISE".
+
+    BOTH HALVES, or this proves nothing: the exact-cased literal must be masked (so the
+    mask is running at all) and the recased ones must be masked too (so it is running
+    case-insensitively).
+
+    MUTATION that must turn this red: drop `re.IGNORECASE` from `_mask_pattern`. The
+    exact-cased occurrences still mask and the recased ones publish, which is precisely
+    the shape a case-sensitive mask fails in — it catches the vector it was shown.
+    """
+    written = (
+        f"{NF3_NAME} is on the {NF3_PLAN} plan."
+        f" MIREILLE VASQUEZ upgraded to ENTERPRISE last week, and Mireille asked again."
+    )
+    steps = _demo_steps(_stored_rows(_lookup_row(), ("text", {"text": written})))
+    published = _only_step(steps, "text")["text"]
+
+    assert "[withheld]" in published, "no literal was masked at all — the mask is not on"
+    assert NF3_NAME not in published, (
+        "the exact-cased name survived — this test is not about casing at all"
+    )
+    for recased in ("MIREILLE VASQUEZ", "ENTERPRISE", "Mireille"):
+        assert recased not in published, (
+            f"the model recased the literal as {recased!r} and it was published:"
+            f" {published!r}"
+        )
+
+
+def test_the_mask_covers_a_secret_the_model_used_as_a_dict_key():
+    """NF-3 (2): keys are masked, and on the demo branch keys are model-chosen strings.
+
+    The tool_use branch publishes `arg_keys` clamped to the tool's declared schema — but
+    on the full-fidelity branch it ALSO publishes the whole raw `input` dict for an
+    allowlisted tool, keys included and unclamped. Those keys are whatever the model
+    emitted, so a withheld literal can arrive as one. `_mask` masks keys as well as
+    values for exactly this.
+
+    ANTI-VACUITY: the undeclared key really is published (asserted through
+    `unknown_arg_count`, which counts it, and by finding a key outside the schema in the
+    published dict), so its masked form is the mask working rather than the field being
+    dropped.
+
+    MUTATION that must turn this red: in `_mask`, mask values only —
+    `{k: _mask(v, ordered) for k, v in value.items()}`. The customer's name is published
+    on the keyless route as a JSON key.
+    """
+    rows = _stored_rows(
+        _lookup_row(),
+        ("tool_use", {"tool": "search_docs", "input": {
+            "query": "billing cycle",
+            f"note for {NF3_NAME}": "their plan question",
+        }}),
+    )
+    steps = _demo_steps(rows)
+    use = _only_step(steps, "tool_use")
+
+    assert use["arg_keys"] == ["query"], "the declared-key clamp is not the subject here"
+    assert use["unknown_arg_count"] == 1, (
+        "the model's extra key was not counted — the raw dict under test is not the"
+        " shape this guard is about"
+    )
+    published_keys = set(use["input"])
+    assert published_keys - {"query"}, (
+        "the raw input dict published no undeclared key — a key mask would have nothing"
+        " to do and this test would be vacuous"
+    )
+    assert NF3_NAME not in json.dumps(use), (
+        f"the looked-up name reached the keyless route as a dict KEY: {published_keys}"
+    )
+
+
+def test_the_harvest_is_default_deny_by_allowlist_membership():
+    """NF-3 (3): the harvest asks "is this tool allowlisted", not "is it lookup_customer".
+
+    That is the whole point of `withheld_from_run`: refusing to publish a tool's output
+    as a PAYLOAD while publishing the model's restatement of it as PROSE is the payload
+    leaving by the other door, so the two halves read the SAME `_DEMO_RAW_TOOLS` set. A
+    tool added later — or a name the model invented, which resolves to no tool at all —
+    is outside the set and is therefore harvested by default.
+
+    BOTH DIRECTIONS, because either alone permits a broken rule: an unrecognised tool's
+    output IS harvested, and an allowlisted tool's output is NOT (masking Relay's own
+    published documentation out of the demo's prose would corrupt the payoff to protect
+    nothing).
+
+    MUTATION 1: replace the membership test with `payload.get("tool") != "lookup_customer"`.
+    Default-deny collapses to a hardcoded denylist of one and the unrecognised tool's
+    value publishes.
+
+    MUTATION 2: delete the `or payload.get("tool") in _DEMO_RAW_TOOLS` term so every
+    tool is harvested. The knowledge-base sentence joins the mask and the second
+    assertion reds.
+    """
+    third_party = "THIRD-PARTY-VALUE-from-a-tool-nobody-registered"
+    kb_sentence = "Rotate the key from the dashboard within thirty days"
+    harvested = withheld_from_run([
+        ({"type": "tool_result"}, {"tool": "invented_by_the_model", "result": {
+            "note": third_party,
+        }}),
+        ({"type": "tool_result"}, {"tool": "search_docs", "result": {
+            "results": [{"doc": "keys.md", "text": kb_sentence}],
+        }}),
+    ])
+
+    assert third_party in harvested, (
+        "a tool outside _DEMO_RAW_TOOLS was not harvested — the rule is a denylist now,"
+        " and the next tool anyone adds discloses its output through the model's prose"
+    )
+    assert kb_sentence not in harvested, (
+        "Relay's own documentation was harvested into the mask — the demo's payoff prose"
+        " would publish as [withheld] to protect a published knowledge base"
+    )
+
+
+def test_the_guardrails_missing_citations_are_masked():
+    """NF-3 (4): the one guardrail field that carries model-authored strings.
+
+    `missing_citations` is what the model claimed it was citing — model-authored text,
+    echoed back from a ticket body this service does not control — so the demo branch
+    names it beside `text` and the tool `input` as a field the prose mask applies to.
+    The public branch publishes only `missing_count`.
+
+    ANTI-VACUITY: `missing_count` counts the citation (so the field really is populated),
+    and the guardrail's own enumerated fields still publish (so the step is not being
+    dropped wholesale).
+
+    MUTATION that must turn this red: publish `missing` unmasked —
+    `step["missing_citations"] = missing`. The looked-up customer's name goes out on the
+    keyless route through the one field the guardrail branch composes from model output.
+    """
+    rows = _stored_rows(
+        _lookup_row(),
+        ("guardrail", {
+            "guard": "citation", "tool": "send_reply", "action": "denied",
+            "missing_citations": [f"{NF3_NAME}-account-notes.md"],
+            "retrieved_ids": ["billing.md"],
+        }),
+    )
+    steps = _demo_steps(rows)
+    guard = _only_step(steps, "guardrail")
+
+    assert guard["missing_count"] == 1, "the field was empty — nothing to mask"
+    assert guard["guard"] == "citation" and guard["action"] == "denied", (
+        "the guardrail step lost its own enumerated fields — the payoff, not the leak"
+    )
+    assert NF3_NAME not in json.dumps(guard), (
+        f"the looked-up name published through missing_citations: {guard!r}"
+    )
+    assert "[withheld]" in json.dumps(guard["missing_citations"]), (
+        "the field was dropped rather than masked — a denial with no citations shown is"
+        " not the same disclosure decision"
+    )
+
+
+def test_masking_longest_first_leaves_no_tail_of_a_longer_literal():
+    """NF-3 (5): the leak `_ordered` prevents, demonstrated rather than asserted as order.
+
+    The literals OVERLAP by construction, and since NF-1 they overlap more: the harvest
+    takes "Mireille Vasquez" AND its components, while the route hands in the ticket's
+    own `customer_email`. "Mireille" is a whole token INSIDE `mireille@northwind-labs.example`
+    — the "@" is not a word character, so the boundary is satisfied.
+
+    So ordering decides what is published. Longest first replaces the whole address with
+    one marker. Sorted any other way — alphabetically, which is what `sorted()` does
+    without the `-len` key, and where "Mireille" precedes the lowercase address — the
+    component masks first, the address literal no longer matches the string it was meant
+    to cover, and the domain is published beside a "[withheld]" that makes it look
+    handled.
+
+    This asserts the OUTPUT, not the sort: an ordering assertion that does not show the
+    leak is the kind of test this project keeps catching. The tie-break half of
+    `_ordered`'s contract (a total order, so two responses are byte-identical) is a
+    different property and is not what this test covers.
+
+    MUTATION that must turn this red: `key=lambda s: s` in `_ordered` — i.e. drop the
+    `-len(s)` term. The published text becomes
+    "…emailed [withheld]@northwind-labs.example about…".
+    """
+    written = f"I emailed {NF3_EMAIL} about the charge."
+    steps = _demo_steps(
+        _stored_rows(_lookup_row(), ("text", {"text": written})),
+        withheld=(NF3_EMAIL,),
+    )
+    published = _only_step(steps, "text")["text"]
+
+    assert "Mireille" in _harvest_of_the_lookup_row(), (
+        "the harvest no longer yields the name component that overlaps the address —"
+        " the overlap this test is about does not exist and it proves nothing"
+    )
+    assert published == "I emailed [withheld] about the charge.", (
+        f"a tail of the longer literal survived the mask: {published!r}"
+    )
+    assert "northwind-labs.example" not in published, (
+        "the address's domain was published beside a [withheld] that makes the line look"
+        " handled — the partial leak ordering exists to prevent"
+    )
+
+
+
 def test_a_demo_run_whose_lookup_missed_still_withholds_the_address(client, monkeypatch):
     """The one literal the RUN's rows cannot supply: an address nothing looked up.
 
