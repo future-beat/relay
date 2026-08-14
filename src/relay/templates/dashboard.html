@@ -821,8 +821,22 @@ function setupTryIt() {
 // The two calls scripts/demo.sh makes, in the same order and against the same
 // perimeter: create the ticket, then run it. What is sent is what the FIELDS hold, so
 // an edited example is what the agent actually sees.
+// WR-06: `finally`, and it is the ONLY place the button is re-enabled. Every branch
+// used to clear it itself, which meant the one path that can REJECT rather than return
+// — the streaming read below — cleared it nowhere: a dropped connection left "send it"
+// disabled and the status line on "working…" for the life of the page, with a reload as
+// the only recourse, on the page that is this project's call to action and on the
+// failure a scale-to-zero demo produces most often.
 async function submitTryIt() {
   trySend.disabled = true;
+  try {
+    await runTryIt();
+  } finally {
+    trySend.disabled = false;
+  }
+}
+
+async function runTryIt() {
   clear(tryStream);
   clear(tryActions);
   tryState.textContent = "creating the ticket…";
@@ -847,7 +861,6 @@ async function submitTryIt() {
   const ticket = await created.json();
   tryState.textContent = "ticket #" + ticket.id + " — working…";
   await streamRun(ticket.id);
-  trySend.disabled = false;
 }
 
 // The run, streamed. `fetch` and not EventSource, and the reason is a hard limit rather
@@ -871,30 +884,58 @@ async function streamRun(ticketId) {
   // badge below cannot be claimed by anyone else (T-06-30).
   const uid = res.headers.get("X-Relay-Run-Uid");
   if (uid) offerTheTrace(uid);
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let buffer = "";
-  for (;;) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    let cut;
-    // Frames are "\n\n"-delimited and arrive split across chunk boundaries, so the tail
-    // stays in the buffer until its terminator turns up. A regex over the whole body
-    // would only produce anything once the stream ended — which is the opposite of the
-    // thing being demonstrated.
-    while ((cut = buffer.indexOf("\n\n")) !== -1) {
-      const frame = buffer.slice(0, cut);
-      buffer = buffer.slice(cut + 2);
-      let name = "message", data = "";
-      for (const part of frame.split("\n")) {
-        if (part.startsWith("event: ")) name = part.slice(7);
-        else if (part.startsWith("data: ")) data += part.slice(6);
+  if (!res.body) { streamDropped(uid, "the run started, but its stream is unavailable."); return; }
+  // Everything from the reader on is inside the guard: `reader.read()` REJECTS on any
+  // mid-stream transport failure — dropped Wi-Fi, a proxy reset, the machine
+  // autostopping, a deploy landing during a 20-second run — and that rejection used to
+  // escape all the way out of the click handler (WR-06).
+  try {
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let cut;
+      // Frames are "\n\n"-delimited and arrive split across chunk boundaries, so the
+      // tail stays in the buffer until its terminator turns up. A regex over the whole
+      // body would only produce anything once the stream ended — which is the opposite
+      // of the thing being demonstrated.
+      while ((cut = buffer.indexOf("\n\n")) !== -1) {
+        const frame = buffer.slice(0, cut);
+        buffer = buffer.slice(cut + 2);
+        let name = "message", data = "";
+        for (const part of frame.split("\n")) {
+          if (part.startsWith("event: ")) name = part.slice(7);
+          else if (part.startsWith("data: ")) data += part.slice(6);
+        }
+        if (!data) continue;
+        let payload;
+        // One unparseable frame is one frame, not the end of the run: skipping it keeps
+        // the rest of the stream rendering, where letting it throw would take the whole
+        // read loop out through the catch below.
+        try { payload = JSON.parse(data); } catch (err) { continue; }
+        onTryFrame(name, payload, uid);
       }
-      if (data) onTryFrame(name, JSON.parse(data), uid);
     }
+    tryState.textContent = uid ? "run finished" : "run finished (no run id returned)";
+  } catch (err) {
+    streamDropped(uid, "the connection dropped mid-run — the run may still have finished.");
   }
-  tryState.textContent = uid ? "run finished" : "run finished (no run id returned)";
+}
+
+// A transport drop is NOT a refusal, and the page must not say it was. D-08's refusal
+// states are copy the SERVER authored about a decision a control made (renderRefusal,
+// reached only from a non-ok response); this is the network failing underneath a run
+// the service already accepted. So it neither clears the steps already on screen — they
+// really happened — nor claims anything about why the run stopped, and it points at the
+// trace, which is where the truth is.
+function streamDropped(uid, text) {
+  tryState.textContent = "the stream stopped early";
+  tryStream.append(el("p", { class: "refusal" },
+                      uid ? text + " Open the trace to see." : text));
+  tryStream.scrollTop = tryStream.scrollHeight;
 }
 
 // This stream is FULL FIDELITY — it belongs to the caller who created the ticket — so
@@ -951,11 +992,12 @@ function offerTheTrace(uid) {
   tryActions.append(open);
 }
 
+// Re-enabling the button is submitTryIt's `finally` and nowhere else (WR-06): a
+// per-branch clear here is exactly how the streaming read came to have none.
 function tryFailed(text) {
   clear(tryStream);
   tryState.textContent = "";
   tryStream.append(el("p", { class: "refusal" }, text));
-  trySend.disabled = false;
 }
 
 // D-08: a refusal is a designed STATE, not an error. The rate limiter and the budget
@@ -972,7 +1014,6 @@ async function refuse(res) {
     detail = null;
   }
   renderRefusal(res.status, detail);
-  trySend.disabled = false;
 }
 
 function renderRefusal(status, detail) {

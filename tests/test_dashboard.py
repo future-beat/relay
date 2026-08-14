@@ -3016,6 +3016,79 @@ def test_try_it_renders_refusals_as_designed_states(client):
         assert shout not in code, f"a refusal is reported as a fault with {shout}"
 
 
+def test_a_dropped_stream_re_enables_the_form_and_stays_distinct_from_a_refusal(client):
+    """WR-06: the streaming read is guarded, and its state is not a refusal's state.
+
+    `trySend.disabled = false` used to be written on three branches and reached on a
+    fourth that had none: `reader.read()` REJECTS on a mid-stream transport failure, so
+    the rejection escaped `submitTryIt` entirely and left "send it" disabled and the
+    status line on "working…" for the life of the page. A reload was the only recourse,
+    on the page that is this project's call to action and in the failure a
+    scale-to-zero demo produces most often.
+
+    The second half matters as much as the first: a 429/503 is a DESIGNED state D-08
+    authors server-side, and it must not be swallowed by the new catch and re-rendered
+    as "the connection dropped". So this pins that the non-ok branch returns BEFORE the
+    guard, which is what keeps the two apart.
+
+    MUTATION 1 (executed): restore the per-branch clears — put `trySend.disabled =
+    false` back in `tryFailed()` and `refuse()` and drop the `finally`. The count
+    assertion reds with `3 != 1`.
+
+    MUTATION 2 (executed): unwrap the read loop (delete the `try {` before the reader
+    and its `catch`). The structural assertion reds with "the streaming read is not
+    inside a try block".
+
+    WEAK BY CONSTRUCTION, precisely: there is no DOM in this suite, so nothing here
+    drops a connection or reads the button's `disabled` property back. This is a
+    structural grep over the served source — it proves the guard and the single
+    re-enable site EXIST and are positioned as described, not that a real mid-stream
+    reset re-enables a real button. That proof needs a browser.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _TRY))
+
+    # 1. Exactly one re-enable site on the whole path, and it is a `finally` — the only
+    #    construct that runs on the rejecting path as well as the returning ones.
+    assert code.count("trySend.disabled = false") == 1, (
+        "the button is re-enabled per-branch again; a rejecting path will miss one"
+    )
+    assert re.search(r"\}\s*finally\s*\{\s*trySend\.disabled = false;\s*\}", code), (
+        "the single re-enable is not in a finally"
+    )
+
+    # 2. The streaming read is inside a guard, and the guard's catch is in the same
+    #    function. Asserted positionally rather than by token presence: a `try` anywhere
+    #    else in the block would satisfy a bare `"try {" in code`.
+    stream_fn = code.split("async function streamRun(ticketId) {", 1)[1].split("\n}\n", 1)[0]
+    head, tail = stream_fn.split("const reader = res.body.getReader();", 1)
+    assert head.rstrip().endswith("try {"), (
+        "the streaming read is not inside a try block"
+    )
+    assert "} catch (" in tail, "nothing catches a mid-stream rejection"
+    assert "await reader.read()" in tail, "the read moved out of the guarded region"
+    # A null body is its own branch, before the guard — `res.body.getReader()` on a
+    # bodyless response throws for a reason the copy below would misdescribe.
+    assert "if (!res.body)" in head
+
+    # 3. One bad frame is skipped, not fatal: an unguarded JSON.parse inside the loop
+    #    would take the whole stream out through the catch above.
+    assert re.search(r"try \{ payload = JSON\.parse\(data\); \} catch \(\w+\) \{ continue; \}", code)
+
+    # 4. The refusal path returns BEFORE the guard, so a 429/503 still renders
+    #    renderRefusal's designed state and never the dropped-stream copy.
+    assert "if (!res.ok) { await refuse(res); return; }" in head
+    assert "renderRefusal" not in tail
+
+    # 5. ...and the two states say different things. The dropped-stream copy claims
+    #    nothing about why the run stopped and does not clear the steps already shown.
+    dropped = code.split("function streamDropped(uid, text) {", 1)[1]
+    assert "clear(tryStream)" not in dropped.split("\n}\n", 1)[0], (
+        "a transport drop erases steps that really happened"
+    )
+    assert "dropped mid-run" in code and "may still have finished" in code
+
+
 def test_refusals_render_as_product_copy(client, monkeypatch):
     """The SERVER half of D-08: every field the page renders is really on the wire.
 
