@@ -38,9 +38,9 @@
 
 - [x] **DASH-01**: The dashboard receives a live run feed over a public, projection-only SSE `/events` endpoint (no polling; no sensitive data)
 - [x] **DASH-02**: Aggregate cards and outcome distribution (resolved/escalated/error/budget_exceeded/step_limit) render from `/metrics`, computed via SQL aggregation
-- [ ] **DASH-03**: Per-run drill-down shows the full trace from `run_events`: tool calls with inputs/outputs/timings, retrieval chunks with scores and cited-vs-not highlighting, and guardrail denials
+- [x] **DASH-03**: Per-run drill-down shows the full trace from `run_events`: tool calls with inputs/outputs/timings, retrieval chunks with scores and cited-vs-not highlighting, and guardrail denials
 - [x] **DASH-04**: Cost/latency-over-time renders as hand-rolled inline SVG; a gauge shows remaining daily demo budget — no CDN scripts, no build step
-- [ ] **DASH-05**: A "Try it" form with prefilled example tickets submits via the demo key and streams the run live on the page
+- [x] **DASH-05**: A "Try it" form with prefilled example tickets submits via the demo key and streams the run live on the page
 
 ## v2 Requirements (Deferred)
 
@@ -88,6 +88,6 @@ Mapped by roadmap creation 2026-08-06 — 22/22 v1 requirements, no orphans.
 | DATA-03 | Phase 5 | Complete |
 | DASH-01 | Phase 5 | Complete |
 | DASH-02 | Phase 6 | Complete |
-| DASH-03 | Phase 6 | Pending |
+| DASH-03 | Phase 6 | Complete |
 | DASH-04 | Phase 6 | Complete |
-| DASH-05 | Phase 6 | Pending |
+| DASH-05 | Phase 6 | Complete |
