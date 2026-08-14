@@ -23,7 +23,7 @@ from relay import db as db_module
 from relay.agent import _execute_guarded
 from relay.config import settings
 from relay.db import connect, init_db
-from relay.events import project_run_detail
+from relay.events import mask_withheld, project_run_detail, withheld_from_run
 from relay.guardrails import ToolPolicy
 from relay.main import app
 from relay.ratelimit import (
@@ -1768,7 +1768,14 @@ def _seed_the_looked_up_customer() -> int:
     """
     app.state.conn.execute(
         "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
-        (DRILL_EMAIL, "Drill Sentinel", "enterprise", "2025-01-01"),
+        # The name shares no whitespace-separated token with any DRILL_ sentinel, and
+        # that is a constraint rather than a coincidence: since NF-1 the harvest takes a
+        # proper-noun-shaped name PER COMPONENT, so a customer called "Drill Sentinel"
+        # (what this row used to hold) masks the SENTINEL and DRILL tokens out of
+        # `sk-ant-SENTINEL-DRILL-KEY-6d0b3e` — the visitor's own key, published on the
+        # demo branch on purpose. That would red the presence half of the full-fidelity
+        # test for a reason that has nothing to do with the property it asserts.
+        (DRILL_EMAIL, "Rowan Delacroix", "enterprise", "2025-01-01"),
     )
     cur = app.state.conn.execute(
         "INSERT INTO tickets (customer_email, subject, body, origin) VALUES (?, ?, ?, ?)",
@@ -2474,6 +2481,254 @@ def test_a_demo_runs_prose_keeps_the_words_relay_itself_assigns(client, monkeypa
     )
     assert "[withheld]" in prose, "no literal was masked at all in the published prose"
     assert STATUS_BODY in whole, "the visitor's own words were withheld from the visitor"
+
+
+# --- NF-1: the forms a name is actually written in ------------------------------------
+#
+# The mask is whole-token by design and the harvested literal is the WHOLE `customers.name`
+# value, so "Hi Mia," walked past a mask holding "Mia Torres" — and "Hi Mia," is not an
+# edge case, it is what prompts.py asks for by name ("Address the customer by name").
+# These sentinels are a realistically SHAPED name rather than an uppercase slug, because
+# the harvest's component split is gated on the value looking like a proper noun: a
+# sentinel that is not name-shaped would test a code path the deployed seed data cannot
+# reach.
+NF1_EMAIL = "nf1-greeting-6b30@example.com"
+NF1_FIRST = "Marisol"
+NF1_LAST = "Quintanilla"
+NF1_NAME = f"{NF1_FIRST} {NF1_LAST}"
+NF1_BODY = "NF1-VISITOR-BODY-31c7"
+
+
+def test_a_demo_runs_greeting_cannot_republish_the_looked_up_first_name(client, monkeypatch):
+    """NF-1, walked anonymously: the sub-token forms of the name are covered too.
+
+    THE SAME WALK as the prose test above — no credential, /metrics, harvest a uid,
+    GET /runs/{uid} — against the form the model actually writes. The verifier's table:
+    `Hello Mia Torres` was caught, `Hi Mia,` / `Mia  Torres` / `Mia's` all survived. Those
+    are sub-tokens and whitespace variants of the literal the mask claims to hold, not the
+    paraphrase vector this file concedes; a paraphrase shares no substring.
+
+    ANTI-VACUITY, both halves: the full name really is in the lookup's stored result (so
+    the harvest had it to take), and the GREETING FORM really is in the model's stored
+    prose (so its absence downstream can only be the mask, not a model that never wrote
+    it).
+
+    MUTATION that must turn this red: make `_name_components` in events.py return `[]`
+    unconditionally — i.e. harvest the name only as a whole string, which is the shipped
+    behaviour NF-1 was raised against. The greeting and the possessive republish the
+    customer's given name on the keyless route.
+
+    SECOND MUTATION: drop the `islower()` gate in `_name_components` so every multi-word
+    value is split. This test stays green under it — the gate is guarded by
+    `test_the_component_split_leaves_a_tool_error_as_one_literal` below, and stated here
+    so nobody reads this test as covering the boundary as well as the disclosure.
+
+    The whitespace-run half of NF-1 (a name written across a line break, or with a double
+    space, masking to ONE marker rather than two) is pinned in the unit test below, where
+    the exact output shape can be asserted.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    app.state.conn.execute(
+        "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
+        (NF1_EMAIL, NF1_NAME, "enterprise", "2025-01-01"),
+    )
+    app.state.conn.commit()
+    ticket_id = _demo_ticket(client, NF1_EMAIL, f"charged twice. {NF1_BODY}")
+    assert _origin_of(ticket_id) == "demo"
+
+    app.state.client = FakeClient([
+        response([tool_use_block("lookup_customer", {"email": NF1_EMAIL})]),
+        response([
+            text_block(
+                f"Hi {NF1_FIRST}, thanks for writing. I am processing this now and"
+                f" {NF1_FIRST}'s account is not otherwise affected."
+            ),
+            tool_use_block("create_escalation", {
+                "ticket_id": ticket_id,
+                "reason": (
+                    f"{NF1_LAST} has written in before. This ticket: {NF1_BODY}"
+                ),
+                "priority": "high",
+            }),
+        ]),
+        response([text_block("escalated")], stop_reason="end_turn"),
+    ])
+    resp = client.post(f"/tickets/{ticket_id}/process")
+    assert "event: error" not in resp.text
+    uid = resp.headers["X-Relay-Run-Uid"]
+
+    rows = app.state.conn.execute(
+        "SELECT type, payload FROM run_events WHERE run_uid = ?", (uid,)
+    ).fetchall()
+    lookups = [
+        r["payload"] for r in rows
+        if r["type"] == "tool_result" and '"lookup_customer"' in r["payload"]
+    ]
+    assert lookups, "the run never looked the customer up"
+    assert any(NF1_NAME in payload for payload in lookups), (
+        "the whole name never reached the lookup's stored result — the harvest had"
+        " nothing to split"
+    )
+    assert any(
+        f"Hi {NF1_FIRST}," in r["payload"] for r in rows if r["type"] == "text"
+    ), "the greeting form was never written — the vector is not armed"
+
+    with _anon(client) as anon:
+        metrics = anon.get("/metrics")
+        assert metrics.status_code == 200
+        assert uid in [
+            r["run_uid"] for r in metrics.json()["last_runs"] if r.get("run_uid")
+        ], "the uid is not anonymously enumerable — this is not the reproduction's walk"
+        detail = anon.get(f"/runs/{uid}")
+    assert detail.status_code == 200
+    body = detail.json()
+    whole = json.dumps(body)
+    assert body["demo"] is True, "not the full-fidelity branch — the test proves nothing"
+
+    authored_fields = [s["text"] for s in body["steps"] if s.get("text")]
+    authored_fields += [
+        s["input"]["reason"] for s in body["steps"]
+        if s.get("tool") == "create_escalation" and isinstance(s.get("input"), dict)
+    ]
+    assert authored_fields, "no model-authored field was published — vacuous"
+    prose = " ".join(authored_fields)
+
+    for form, why in (
+        (NF1_NAME, "the whole name"),
+        (NF1_FIRST, "the given name, which is the form the system prompt asks for"),
+        (NF1_LAST, "the surname"),
+    ):
+        assert form not in whole, (
+            f"{why} of the looked-up customer is on the keyless public route: {prose!r}"
+        )
+
+    # D-02's payoff is intact: redaction, not deletion, and ordinary English survives.
+    assert "[withheld]" in prose, "the prose lost its content instead of its secrets"
+    assert NF1_BODY in whole, "the visitor's own words were withheld from the visitor"
+    assert "processing" in prose, (
+        "masking a name component rewrote an unrelated word — a drill-down full of"
+        " spurious [withheld] markers teaches a visitor to ignore the real ones"
+    )
+
+
+def _harvest_of_a_lookup(name: str, plan: str = "pro") -> tuple[str, ...]:
+    """The real harvest off a real-shaped `lookup_customer` result.
+
+    Built through `withheld_from_run` rather than by hand so the literals under test are
+    the ones the shipped code produces — a hand-written tuple would pass whatever the
+    harvest did.
+    """
+    return withheld_from_run([({"type": "tool_result"}, {
+        "tool": "lookup_customer",
+        "result": {
+            "found": True,
+            "customer": {
+                "email": "harvest-unit-9f21@example.com",
+                "name": name,
+                "plan": plan,
+                "signed_up": "2024-08-30",
+            },
+            "recent_tickets": [{"id": 7, "status": "open", "created_at": "2026-08-14"}],
+        },
+    })])
+
+
+def test_the_mask_covers_the_sub_token_and_whitespace_forms_of_a_name():
+    """NF-1 at the unit level: every rendering in the verifier's table, and its shape.
+
+    The route test above proves the disclosure is closed on the walk that matters. This
+    one pins the FORMS — including the two the route test cannot assert precisely: a name
+    written across a line break or with a doubled space must mask to ONE marker, not two.
+    That is not cosmetic. `_ordered` masks longest-first so a multi-word literal is
+    replaced before its own components; if the pattern could not span the run of
+    whitespace, the whole-name literal would never match a wrapped name and the components
+    would each leave their own "[withheld]" — the drill-down would read
+    "[withheld]  [withheld] here", which is the over-marking NF-4 warns costs more than it
+    protects.
+
+    MUTATION 1: `_name_components` returns `[]`. The greeting, the possessive and the
+    bare-surname cases red — the shipped NF-1 bug.
+
+    MUTATION 2: in `_mask_pattern`, drop the `\\s+` join and go back to
+    `re.escape(secret)`. The wrapped and double-spaced cases red: the whole-name literal
+    stops matching and the output carries two markers where the name is one value.
+
+    MUTATION 3: raise `_MIN_WITHHOLD_LEN` to 4 — nothing here reds, and that is recorded
+    rather than hidden: no component under test is three characters. The short-value rule
+    is pinned by the shipped `pro` assertions elsewhere in this file.
+    """
+    withheld = _harvest_of_a_lookup("Mia Torres")
+    assert {"Mia Torres", "Mia", "Torres"} <= set(withheld), (
+        "the harvest did not take the name whole AND per component — every case below"
+        " would then be testing a mask that was never given the literal"
+    )
+
+    cases = [
+        # (prose the model writes, what the keyless route must publish)
+        ("Hi Mia, thanks for writing.", "Hi [withheld], thanks for writing."),
+        ("Hello Mia Torres, thanks.", "Hello [withheld], thanks."),
+        ("Hi  Mia   Torres, thanks.", "Hi  [withheld], thanks."),
+        ("Mia\nTorres here.", "[withheld] here."),
+        ("Mia's account is affected.", "[withheld]'s account is affected."),
+        ("MIA TORRES here.", "[withheld] here."),
+        ("(Mia Torres)", "([withheld])"),
+        ("Torres asked us to check.", "[withheld] asked us to check."),
+    ]
+    for written, expected in cases:
+        assert mask_withheld(written, withheld) == expected, (
+            f"the mask published {mask_withheld(written, withheld)!r} for {written!r}"
+        )
+
+    # The other half, and it is the half that decides whether the mask is kept: ordinary
+    # English, Relay's own vocabulary, and the visitor's own sentence all survive intact.
+    legible = (
+        "I am processing this promptly. Your ticket is still open and the earlier one"
+        " is resolved. Miami is not affected."
+    )
+    assert mask_withheld(legible, withheld) == legible, (
+        "the mask rewrote ordinary English, a status, or a word merely containing a"
+        " component"
+    )
+
+
+def test_the_component_split_leaves_a_tool_error_as_one_literal():
+    """The boundary NF-1's component split is gated on, and it is NF-4's boundary too.
+
+    `withheld_from_run` harvests a failed tool's message as well as a successful one —
+    "a failed lookup's message is still that tool's output about that person". Those
+    messages are SENTENCES, and splitting a sentence into its words puts `tool`, `value`,
+    `email` and `address` in the mask, which republishes the demo's own prose as
+    "[withheld]". That is exactly the over-masking NF-4 recorded, one level up.
+
+    So the split is gated on the value looking like a proper noun: no component may begin
+    with a lowercase letter. This test is that gate's only guard.
+
+    MUTATION that must turn this red: delete the `islower()` check in
+    `_name_components` (events.py) so every multi-word value is split. The ordinary words
+    of the error message are harvested and the legibility assertion reds. The NF-1 tests
+    above stay green under it, which is why this one exists separately.
+    """
+    message = "invalid tool input — email: value is not a valid email address"
+    withheld = withheld_from_run([({"type": "tool_result"}, {
+        "tool": "lookup_customer",
+        "is_error": True,
+        "result": {"error": message},
+    })])
+
+    assert message in withheld, (
+        "the failed lookup's message was not harvested at all — this test would be"
+        " asserting the absence of words nothing ever collected"
+    )
+    for word in ("invalid", "tool", "input", "email", "value", "address"):
+        assert word not in withheld, (
+            f"'{word}' was harvested out of an error SENTENCE — the mask now rewrites"
+            " ordinary support prose (NF-4)"
+        )
+
+    prose = "I checked the email address on your account and the tool returned no value."
+    assert mask_withheld(prose, withheld) == prose, (
+        "a tool error's ordinary words were masked out of the model's prose"
+    )
 
 
 def test_a_demo_run_whose_lookup_missed_still_withholds_the_address(client, monkeypatch):
