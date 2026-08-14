@@ -52,7 +52,10 @@ _tokens = itertools.count()
 # itself is parsed on demand, never at import: parsing here would freeze the
 # value before a test could monkeypatch it.
 _LIMIT_SETTINGS: dict[tuple[str, str], str] = {
-    # Consumed before a tier is known, which is what meters the failed-auth path.
+    # Consumed before a tier is known, which is what meters the failed-auth path. Only
+    # on routes that RESOLVE a credential: a public gate charges its own bucket and this
+    # one not at all (WR-02), because there is no key being guessed there and charging it
+    # made every public route's own bucket unreachable behind a smaller shared one.
     ("auth", "anon"): "anon_auth_limit",
     ("process", "demo"): "demo_process_limit",
     ("process", "owner"): "owner_process_limit",

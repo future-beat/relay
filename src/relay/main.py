@@ -24,6 +24,7 @@ from .events import (
     RunEventBroker,
     RunRecorder,
     attribute_to_run,
+    mask_withheld,
     project,
     project_run_detail,
     snapshot_frame,
@@ -138,20 +139,32 @@ def _gate(bucket: str, *, meter_spend: bool = False, public: bool = False):
     precisely when the service was least able to defend itself. The refusal now
     charges its own bucket on the way out, which keeps both properties.
 
-    `public=True` builds the same perimeter minus the credential: the anon meter and
-    then the route's own bucket keyed on "anon". It is for surfaces D-11 keeps open on
-    purpose (the live feed), whose safety is content control rather than access
-    control — an unmetered public surface is still a free-work surface, and on a
-    connection-holding route it is the thing that defeats min_machines_running=0.
+    `public=True` builds the route's OWN bucket keyed on "anon", and nothing else. It is
+    for surfaces D-11 keeps open on purpose (the live feed, the drill-down), whose safety
+    is content control rather than access control — an unmetered public surface is still
+    a free-work surface, and on a connection-holding route it is the thing that defeats
+    min_machines_running=0.
+
+    A public route is deliberately NOT charged the shared `auth` bucket (WR-02). That
+    bucket exists to meter online KEY GUESSING, and a public gate resolves no credential
+    for anyone to guess — while charging it made every public route's own bucket
+    unreachable, because `anon_auth_limit` (60/minute) is smaller than the buckets it
+    preceded (`anon_run_detail_limit`, 120/minute). The consequence was the exact
+    coupling the drill-down's separate bucket was created to prevent: 60 drill-down opens
+    spent the live feed's reconnect allowance, /events answered 429, and EventSource
+    treats a non-200 as terminal — so clicking through the back catalogue silently killed
+    the visitor's own feed. Each public route now meters itself and only itself; this
+    also matches `test_public_routes_are_not_charged_the_anon_meter`, which already
+    states the property for /health and /metrics.
     """
 
     async def _dependency(request: Request, presented: str | None = _API_KEY) -> Tier | None:
-        await enforce("auth", "anon", request)
         if public:
             # No tier to resolve and none to return: the caller presented nothing, and
-            # metering an anonymous bucket is the whole of this gate.
+            # metering this route's own anonymous bucket is the whole of this gate.
             await enforce(bucket, "anon", request)
             return None
+        await enforce("auth", "anon", request)
         tier = _ANY_TIER(presented)
         if meter_spend:
             # Offloaded, because the cost here is acquiring Database's lock, not
@@ -516,7 +529,13 @@ async def run_detail(run_uid: str) -> dict:
     `origin == "demo"` by equality — NULL (a legacy row) and anything else fail closed
     (T-06-14). `customer_email` is withheld even on the demo branch: /tickets accepts an
     arbitrary address from anyone holding the published key, so it is the one field a
-    visitor could use to publish a third party's identifier.
+    visitor could use to publish a third party's identifier. Withheld BY VALUE and not
+    merely as a column (CR-01) — it used to be dropped from this envelope while
+    `lookup_customer`'s raw input and raw result republished it, along with the rest of
+    that person's row and ten of their ticket subjects. The demo branch now publishes
+    raw tool payloads per tool (`_DEMO_RAW_TOOLS`), and the address the ticket names is
+    passed to the projector as a `withheld` literal so the model's prose cannot carry it
+    out either.
 
     A run whose steps the 30-day retention swept is NOT a 404. `purge_expired_run_events`
     deliberately spares the `runs` row, so "no steps" is the normal end state of the back
@@ -569,8 +588,13 @@ async def run_detail(run_uid: str) -> dict:
                 # naming subject/body unconditionally would work identically today and
                 # leave the redacted path holding the text in a local, one edit away
                 # from disclosing it.
+                #
+                # `customer_email` is read here to be WITHHELD, never to be published:
+                # it is the one value the projector needs in order to keep it out of the
+                # model's prose (CR-01), and it appears nowhere in the response.
                 ticket = dict(conn.execute(
-                    "SELECT subject, body FROM tickets WHERE id = ?", (ticket_id,)
+                    "SELECT subject, body, customer_email FROM tickets WHERE id = ?",
+                    (ticket_id,),
                 ).fetchone())
         # fetchall()/fetchone() all happen in here, never after: Database materialises
         # rows while its lock is held.
@@ -581,6 +605,14 @@ async def run_detail(run_uid: str) -> dict:
         raise HTTPException(404, "unknown run")
 
     demo = origin == "demo"
+    # The literals the demo branch must not republish at any depth, whatever field they
+    # arrive in. Exactly one today: the address the ticket names, which /tickets accepts
+    # from anyone holding the published key and which the model's own prose restates
+    # once lookup_customer has read it back. Empty off the demo branch, where nothing
+    # raw is published for it to hide in.
+    withheld = ()
+    if demo and ticket is not None and ticket["customer_email"]:
+        withheld = (ticket["customer_email"],)
     note = None
     if rows and run is not None:
         status = "complete"
@@ -620,13 +652,19 @@ async def run_detail(run_uid: str) -> dict:
                 name: frozenset(spec.schema["input_schema"]["properties"])
                 for name, spec in app.state.registry.items()
             },
+            withheld=withheld,
         ),
     }
     if note is not None:
         detail["note"] = note
     if demo and ticket is not None:
-        # The visitor's own words back, and only these two fields by name (Q3).
-        detail["ticket"] = {"subject": ticket["subject"], "body": ticket["body"]}
+        # The visitor's own words back, and only these two fields by name (Q3) — through
+        # the same value mask as the steps, because a visitor who typed a third party's
+        # address into the body would otherwise publish it here instead.
+        detail["ticket"] = {
+            "subject": mask_withheld(ticket["subject"], withheld),
+            "body": mask_withheld(ticket["body"], withheld),
+        }
     return detail
 
 
@@ -755,9 +793,31 @@ async def dashboard() -> str:
 
     An unconfigured deployment renders a neutral placeholder — /dashboard is the
     public landing surface and must not print "None" as if it were a credential.
+
+    The key lands in TWO parsing contexts and therefore takes TWO escapers (WR-05).
+    `<code>X-API-Key: …</code>` is HTML text, where html.escape() is right. `const
+    DEMO_KEY = "…"` is inside `<script>`, which is RAW TEXT: entity references are not
+    decoded there, so an HTML-escaped `k&amp;y` would be the key the page actually
+    sends and every Try-it submission would 401 while the block above displayed the
+    correct key. json.dumps() emits a complete JS string literal — quotes, backslashes
+    and control characters all handled — which is why the placeholder it replaces
+    includes its own quotes. `<`, `>` and `&` are then re-encoded as \\uXXXX escapes:
+    JSON leaves them bare, and a key containing `</script>` would otherwise close the
+    element from inside a string literal. JS decodes \\u003c back to `<`, so the value
+    the page presents is still the key byte-for-byte.
     """
-    published = escape(settings.demo_key) if settings.demo_key else "(not configured)"
-    return DASHBOARD_HTML.replace("__RELAY_DEMO_KEY__", published)
+    published = settings.demo_key or "(not configured)"
+    js_key = (
+        json.dumps(published)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+    )
+    return (
+        DASHBOARD_HTML
+        .replace('"__RELAY_DEMO_KEY_JS__"', js_key)
+        .replace("__RELAY_DEMO_KEY__", escape(published))
+    )
 
 
 # Exactly the fields the Ticket model declares, named for the same reason

@@ -15,6 +15,14 @@ build/
 # Local data
 *.db
 *.sqlite3
+# SQLite WAL sidecars — *.db does not cover them, and they appear the moment the
+# app runs locally in WAL mode.
+*.db-shm
+*.db-wal
+
+# Local captures — browser exports of the dashboard taken during checkpoints.
+# The repo ships no PDF assets, so the glob costs nothing and survives the next one.
+*.pdf
 
 # Tooling
 .pytest_cache/

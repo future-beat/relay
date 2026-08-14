@@ -5,7 +5,7 @@ milestone_name: milestone
 status: verifying
 stopped_at: Phase 6 planned (7 plans, 6 waves, checker PASS)
 last_updated: "2026-08-12T06:54:38.104Z"
-last_activity: 2026-08-13 -- Phase 06 execution complete; checkpoint + review outstanding
+last_activity: 2026-08-14 -- Phase 06 reviewed; 2 criticals + 7 warnings fixed (417 tests)
 progress:
   total_phases: 6
   completed_phases: 5
@@ -96,3 +96,9 @@ Items acknowledged and carried forward from previous milestone close:
 Last session: 2026-08-12T06:54:38.095Z
 Stopped at: Phase 6 planned (7 plans, 6 waves, checker PASS)
 Resume file: .planning/phases/06-dashboard-experience/06-01-PLAN.md
+
+## Quick Tasks Completed
+
+| Date | Slug | What |
+|------|------|------|
+| 2026-08-13 | dashboard-sparse-states | gitignore PDF/WAL sidecars; explain the latency chart's sparse render and the gauge's idle day |

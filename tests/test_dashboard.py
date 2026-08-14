@@ -12,6 +12,7 @@ import json
 import re
 from contextlib import contextmanager
 from datetime import datetime
+from html import unescape
 from pathlib import Path
 
 import pytest
@@ -528,6 +529,16 @@ def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
     `text` and `missing_citations`, and NOTHING outside that named list: the exact key
     set of a tool_use step is asserted in BOTH branches, so a demo branch built as a
     raw spread fails here rather than being caught only by review.
+
+    The demo branch is an allowlist on a SECOND axis too (CR-01): raw payloads are
+    published per tool, from `_DEMO_RAW_TOOLS`, and `lookup_customer` is on neither
+    side of it — its result is a stored record about a third party, not the visitor's
+    own content. So `DETAIL_EMAIL`, which rides only that tool's input and result, must
+    be ABSENT from both branches while every visitor-authored sentinel stays present.
+
+    MUTATION that must turn this red: drop the `and raw_tool in _DEMO_RAW_TOOLS` /
+    `and payload.get("tool") in _DEMO_RAW_TOOLS` conditions in project_run_detail — the
+    demo branch republishes the customer row and the first assertion below fires.
     """
     rows = _store(conn, _leaky_run_events())
     known = _known_tools(registry)
@@ -536,8 +547,24 @@ def test_project_run_detail_demo_branch_adds_only_named_fields(conn, registry):
     demo = project_run_detail(rows, full_fidelity=True, known_tools=known)
 
     demo_json = json.dumps(demo, default=str)
+    # The third party's address rides lookup_customer's input AND its result, and
+    # nothing else in this run — so its absence is a claim about that tool being off
+    # the raw allowlist, on the branch that is supposed to be the fullest.
+    assert DETAIL_EMAIL not in demo_json, (
+        "the demo branch republished the looked-up customer's address (CR-01)"
+    )
+    lookup_use = next(
+        s for s in demo if s["type"] == "tool_use" and s.get("tool") == "lookup_customer"
+    )
+    lookup_result = next(
+        s for s in demo if s["type"] == "tool_result" and s.get("tool") == "lookup_customer"
+    )
+    assert "input" not in lookup_use, "lookup_customer's raw input is on the demo branch"
+    assert "result" not in lookup_result, "lookup_customer's raw result is on the demo branch"
+    # ...and the redacted shape is still there, so this is redaction and not omission.
+    assert lookup_use["arg_keys"] == ["email"]
+
     for name, sentinel in (
-        ("customer email", DETAIL_EMAIL),        # tool_use.input + tool_result.result
         ("search query", DETAIL_QUERY),
         ("retrieved prose", DETAIL_PROSE),
         ("escalation reason", DETAIL_REASON),
@@ -1426,6 +1453,53 @@ def test_run_detail_is_rate_limited_per_ip(client, monkeypatch):
     assert second.headers["Retry-After"]
 
 
+def test_a_drill_down_flood_leaves_the_live_feed_connectable(client, monkeypatch):
+    """WR-02: the drill-down's own bucket governs the drill-down, and NOTHING else does.
+
+    This is the property `anon_run_detail_limit` was added for, stated in three places
+    (main.py, ratelimit.py, config.py) and untested until now: "a visitor clicking
+    through the back catalogue would otherwise spend the live feed's reconnect allowance
+    and silently break their own feed." `_gate` charged the shared `auth` bucket first on
+    every public route, and with the shipped defaults that bucket (60/minute) is SMALLER
+    than the drill-down's own (120/minute) — so the drill-down's bucket could never bind,
+    and a 60-open flood took /events down with it. EventSource treats a non-200 as
+    terminal, so that is a dead feed and a "reload to watch again" page.
+
+    MUTATION that must turn this red (it is the shipped code): put
+    `await enforce("auth", "anon", request)` back above the `if public:` branch in
+    `_gate._dependency`. The third GET below then 429s from the `auth` bucket — not the
+    route's — and the /events connect that follows is refused too.
+
+    The limits are inverted from production on purpose: `auth` is made TINY and the
+    drill-down's own bucket huge, so anything the flood spends other than its own bucket
+    is what fails. `test_run_detail_is_rate_limited_per_ip` is the complement — it proves
+    the route's own bucket still meters it.
+    """
+    monkeypatch.setattr(settings, "anon_auth_limit", "2/minute")
+    monkeypatch.setattr(settings, "anon_run_detail_limit", "1000/minute")
+    # So the admitted stream closes on its own instead of holding the TestClient open
+    # for the idle ceiling — this test is about the connect, not the stream.
+    monkeypatch.setattr(settings, "events_heartbeat_seconds", 0.01)
+    monkeypatch.setattr(settings, "events_idle_seconds", 0.02)
+
+    uid = "e" * 32
+    with _anon(client) as anon:
+        codes = [anon.get(f"/runs/{uid}").status_code for _ in range(5)]
+        feed = anon.get("/events")
+
+    # The feed FIRST: it is the property this test is named for, and asserting it ahead
+    # of the flood's own status codes means a regression reports the broken feed rather
+    # than the 429 that preceded it.
+    assert feed.status_code == 200, (
+        "the live feed was refused after a drill-down flood — the isolation Phase 5's"
+        f" CR-01 established (drill-down codes were {codes})"
+    )
+    assert feed.headers["content-type"].startswith("text/event-stream")
+    # And every open answered from the route's own generous bucket. A 429 anywhere in
+    # here is another route's bucket binding, which is the same bug seen from its cause.
+    assert codes == [404] * 5, f"a drill-down open was refused by another route's bucket: {codes}"
+
+
 def test_run_detail_read_is_bounded(client, monkeypatch):
     """The per-run read carries a LIMIT — one run cannot be an unbounded response.
 
@@ -1553,12 +1627,18 @@ DRILL_EMAIL = "drill-sentinel-4e81c7@example.com"     # -> lookup_customer input
 DRILL_BODY = "SENTINEL-DRILL-BODY-92fa10"             # -> create_escalation.reason
 DRILL_KEY = "sk-ant-SENTINEL-DRILL-KEY-6d0b3e"        # -> search_docs.query
 DRILL_CITE = "sentinel-fabricated-doc-7b4c92.md"      # -> guardrail.missing_citations
+# An EARLIER ticket's subject, filed against the same address by someone else (CR-02).
+# It rides lookup_customer's `recent_tickets` and nothing else, so it is the only
+# sentinel that can see that vector: a fix which redacts the `customer` object and
+# leaves the ten subjects beside it passes every other assertion in this file.
+DRILL_SUBJECT = "SENTINEL-EARLIER-TICKET-SUBJECT-5a3d81"
 
 DRILL_SENTINELS = (
     ("customer email", DRILL_EMAIL),
     ("ticket body", DRILL_BODY),
     ("api key", DRILL_KEY),
     ("fabricated citation", DRILL_CITE),
+    ("earlier ticket subject", DRILL_SUBJECT),
 )
 
 
@@ -1582,9 +1662,12 @@ def _script_the_four_vector_run(ticket_id: int) -> None:
             "citations": [DRILL_CITE],
         })]),
         # (4) ticket body -> create_escalation.reason, an OBSERVED field, plus the same
-        # string in model prose so the text branch is exercised on the way past.
+        # string in model prose so the text branch is exercised on the way past. The
+        # prose also NAMES THE ADDRESS the model just looked up, because that is what a
+        # real reply does — and on the demo branch prose is published raw, so this is
+        # the vector no field-level allowlist can close (CR-01's value mask closes it).
         response([
-            text_block(f"The customer wrote: {DRILL_BODY}"),
+            text_block(f"The customer {DRILL_EMAIL} wrote: {DRILL_BODY}"),
             tool_use_block("create_escalation", {
                 "ticket_id": ticket_id,
                 "reason": f"customer reported: {DRILL_BODY} — needs a human review",
@@ -1596,11 +1679,22 @@ def _script_the_four_vector_run(ticket_id: int) -> None:
 
 
 def _seed_the_looked_up_customer() -> None:
-    """A real customers row, so lookup_customer returns a whole record — email, name,
-    plan — and the drill-down has something genuine it has to drop."""
+    """A real customers row AND an earlier ticket of theirs, so lookup_customer returns
+    what it returns in production: a whole record — email, name, plan — plus up to ten
+    of that address's ticket subjects.
+
+    The earlier ticket is the CR-02 half. Those subjects belong to whoever else has been
+    filing against this address (on the deployed service, the owner key), so they are
+    third-party content that no visitor authored, and until this row existed no test in
+    this suite could see that vector at all.
+    """
     app.state.conn.execute(
         "INSERT INTO customers (email, name, plan, signed_up) VALUES (?, ?, ?, ?)",
         (DRILL_EMAIL, "Drill Sentinel", "enterprise", "2025-01-01"),
+    )
+    app.state.conn.execute(
+        "INSERT INTO tickets (customer_email, subject, body, origin) VALUES (?, ?, ?, ?)",
+        (DRILL_EMAIL, DRILL_SUBJECT, "filed by someone else, long before this run", None),
     )
     app.state.conn.commit()
 
@@ -1753,26 +1847,47 @@ def test_full_fidelity_is_server_decided(client, monkeypatch):
 
 
 def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
-    """D-02's INVERSE: the Try-it visitor gets the raw trace of their OWN run.
+    """D-02's INVERSE: the Try-it visitor gets the raw trace of their OWN run — and
+    only of their OWN (CR-01, CR-02).
 
-    Without this, "full fidelity for demo runs" is untested and can silently regress to
-    redacted-for-everyone — the drill-down would still pass every leak test above, and
-    the whole payoff of the Try-it flow would be gone with nothing noticing.
+    Without the first half, "full fidelity for demo runs" is untested and can silently
+    regress to redacted-for-everyone: the drill-down would still pass every leak test
+    above, and the whole payoff of the Try-it flow would be gone with nothing noticing.
 
-    The visitor authored this content, so the raw tool inputs and outputs are the point.
-    `customer_email` is still withheld (Q3): /tickets accepts an arbitrary address from
-    anyone holding the published key, so it is the one field a visitor could use to
-    publish a third party's identifier. The ticket's own address below is a separate
-    sentinel that no tool ever sees, so its absence is a claim about the ENVELOPE and
-    not an accident of the run's script.
+    THE PRODUCTION SHAPE, and the reason this test was rewritten. The ticket's own
+    address IS the address the model looks up, because that is what the Try-it form
+    produces — it pins each example to a seeded customer and the system prompt has the
+    agent call lookup_customer first. The previous version gave the ticket a DIFFERENT
+    address from the one the run looked up, so its `assert ticket_address not in ...`
+    was true of a string that appeared nowhere in the run at all: a fixture artifact,
+    not a property. It also asserted `lookup_result["result"]["customer"]["email"] ==
+    DRILL_EMAIL`, which CERTIFIED the disclosure and would have gone red on the fix.
+
+    What the visitor authored stays full fidelity — their ticket text, the model's
+    prose, its tool arguments, its citations — and that half is asserted first, because
+    a projector that published nothing would satisfy every absence assertion below.
+
+    What the SERVICE looked up about someone else does not, by VALUE and not by column
+    name: `assert "customer_email" not in json.dumps(detail)` greps for a key the
+    address is not published under (`lookup_customer` names it `email`), so it could
+    never have seen this.
+
+    MUTATION 1 (the shipped code, before CR-01): drop `and raw_tool in _DEMO_RAW_TOOLS`
+    / `and payload.get("tool") in _DEMO_RAW_TOOLS` from project_run_detail — the raw
+    customer row and its ten ticket subjects come back and the address/subject
+    assertions fire.
+    MUTATION 2 (the prose vector): pass `withheld=()` from run_detail — the model's own
+    sentence, which names the address it just read, republishes it and the same
+    assertion fires from a different field.
     """
     monkeypatch.setattr(settings, "voyage_api_key", None)
     _seed_the_looked_up_customer()
-    ticket_address = "demo-ticket-address-1c9e55@example.com"
     # The DEMO key, so tickets.origin is 'demo' — the whole difference from the leak
-    # test above is which credential posted /tickets.
+    # test above is which credential posted /tickets. The address is DRILL_EMAIL: the
+    # ticket's own customer and the one the agent looks up are THE SAME ADDRESS, which
+    # is the shape the Try-it form actually produces.
     ticket_id = _demo_ticket(
-        client, ticket_address, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
+        client, DRILL_EMAIL, f"my key {DRILL_KEY} stopped working. {DRILL_BODY}"
     )
     assert _origin_of(ticket_id) == "demo"
     _script_the_four_vector_run(ticket_id)
@@ -1785,13 +1900,8 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
 
     assert detail["demo"] is True
     steps = detail["steps"]
-    lookup = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "lookup_customer")
-    # The raw input DICT, not just its key names — asserted as the value it carried.
-    assert lookup["input"] == {"email": DRILL_EMAIL}
-    lookup_result = next(
-        s for s in steps if s["type"] == "tool_result" and s["tool"] == "lookup_customer"
-    )
-    assert lookup_result["result"]["customer"]["email"] == DRILL_EMAIL
+
+    # --- the visitor's OWN content, in full: this half is D-02's payoff --------------
     search = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "search_docs")
     assert DRILL_KEY in search["input"]["query"]
     escalation = next(
@@ -1802,15 +1912,44 @@ def test_a_demo_originated_run_is_full_fidelity(client, monkeypatch):
     assert guard["missing_citations"] == [DRILL_CITE]
     # Model prose is returned too, not just its length.
     assert any(DRILL_BODY in (s.get("text") or "") for s in steps if s["type"] == "text")
-
     # The visitor's own words back — named fields, not a spread of the ticket row.
     assert detail["ticket"] == {
         "subject": "API limits",
         "body": f"my key {DRILL_KEY} stopped working. {DRILL_BODY}",
     }
-    # ...and the email is withheld even here, by key AND by value.
-    assert "customer_email" not in json.dumps(detail)
-    assert ticket_address not in json.dumps(detail)
+
+    # --- and NOTHING the service looked up about anyone else (CR-01, CR-02) ---------
+    whole = json.dumps(detail)
+    # By VALUE, and asserted BEFORE the shape assertions below so a regression reports
+    # the disclosure itself rather than the mechanism that was supposed to prevent it.
+    # This address is the ticket's own AND the one the model looked up AND the one the
+    # model's prose names, so it is reachable through three different fields; the
+    # assertion is about the response, not about any one of them.
+    assert DRILL_EMAIL not in whole, (
+        "a third party's address is on the keyless public route"
+    )
+    # The subjects beside the customer row are an independent vector: a fix that
+    # redacted `customer` and left `recent_tickets` would pass the line above.
+    assert DRILL_SUBJECT not in whole, (
+        "another person's ticket subject is on the keyless public route"
+    )
+    # The key name too, kept from the old version — it is a real (if narrower) guard on
+    # the `tickets` column, and it is NOT what the two assertions above check.
+    assert "customer_email" not in whole
+
+    lookup = next(s for s in steps if s["type"] == "tool_use" and s["tool"] == "lookup_customer")
+    # lookup_customer is off the demo branch's raw allowlist, so its input and its
+    # result are redacted here exactly as they are for everyone else — while the
+    # redacted SHAPE stays, so this is redaction and not omission.
+    assert "input" not in lookup and lookup["arg_keys"] == ["email"]
+    lookup_result = next(
+        s for s in steps if s["type"] == "tool_result" and s["tool"] == "lookup_customer"
+    )
+    assert "result" not in lookup_result and lookup_result["is_error"] is False
+    # Anti-vacuity for the absence half: the address was genuinely in this run's prose,
+    # and what replaced it is the mask rather than a step that vanished.
+    prose = next(s["text"] for s in steps if s["type"] == "text" and s.get("text"))
+    assert "[withheld]" in prose, "the prose step lost its content instead of its secret"
 
 
 # --- Wave 4: the packaged template (D-04) --------------------------------------------
@@ -1851,10 +1990,18 @@ def test_dashboard_is_served_from_the_packaged_template(client):
 
     raw = path.read_text(encoding="utf-8")
     assert "__RELAY_DEMO_KEY__" in raw, "the placeholder is gone from the file on disk"
+    assert '"__RELAY_DEMO_KEY_JS__"' in raw, "the script placeholder is gone from disk"
 
     resp = client.get("/dashboard")
     assert resp.status_code == 200
-    assert resp.text == raw.replace("__RELAY_DEMO_KEY__", "test-demo-key")
+    # Two placeholders because there are two parsing contexts (WR-05); for a key with
+    # no metacharacters both substitutions produce the same text, which is why this
+    # test is not the one that proves they are escaped differently.
+    assert resp.text == (
+        raw
+        .replace('"__RELAY_DEMO_KEY_JS__"', '"test-demo-key"')
+        .replace("__RELAY_DEMO_KEY__", "test-demo-key")
+    )
 
 
 def test_dashboard_substitutes_the_key_per_request(client, monkeypatch):
@@ -1876,6 +2023,56 @@ def test_dashboard_substitutes_the_key_per_request(client, monkeypatch):
 
     # ...and the file on disk was never rewritten to do it.
     assert "__RELAY_DEMO_KEY__" in _packaged_template().read_text(encoding="utf-8")
+
+
+# Every character that one escaper gets wrong in the other context: `&"'<>` are what
+# html.escape() encodes (correct in the <code> block, fatal in the script), and the
+# trailing backslash is what it does NOT encode (harmless in the <code> block, and the
+# character that escapes the closing quote of a JS string literal and kills the page).
+_METACHAR_DEMO_KEY = "k&y\"'<s>\\"
+
+
+def test_the_demo_key_is_escaped_for_the_context_it_lands_in(client, monkeypatch):
+    """WR-05. One key, two parsing contexts, two escapers — decoded, not grepped.
+
+    The failure this pins is silent by construction: with a single html.escape() the
+    page DISPLAYS the right key while the script holds `k&amp;y`, so every Try-it
+    submission 401s and nothing on the server or the page says why. So neither
+    assertion below greps for a rendered form; each one runs the decoder the browser
+    would run for that context and compares against the configured key.
+
+    MUTATION (executed): restore the single-escaper substitution in `dashboard()` —
+    `published = escape(settings.demo_key)` into both placeholders. The HTML
+    assertion stays green; the JS assertion reds with the entity-encoded key.
+    """
+    monkeypatch.setattr(settings, "demo_key", _METACHAR_DEMO_KEY)
+    page = client.get("/dashboard").text
+
+    # HTML text-node context: the browser decodes entity references here.
+    shown = re.search(r"<code>X-API-Key: (.*?)</code>", page)
+    assert shown is not None, "the published-key <code> block is gone"
+    assert unescape(shown.group(1)) == _METACHAR_DEMO_KEY
+
+    # Script context: `<script>` is raw text, so the browser decodes NOTHING before the
+    # JS parser sees it. json.loads is the same string-literal grammar the JS parser
+    # applies (\\uXXXX included), so a literal that survives this is one the browser
+    # reads back as the key — and one that does not parse at all reds here too, which
+    # is the backslash half of the finding.
+    literal = re.search(r"const DEMO_KEY = (.*);", page)
+    assert literal is not None, "the DEMO_KEY assignment is gone"
+    assert json.loads(literal.group(1)) == _METACHAR_DEMO_KEY
+
+    # Anti-vacuity: the two contexts must actually have been given DIFFERENT text. If
+    # this ever holds, one escaper is feeding both again and the assertions above are
+    # agreeing by accident.
+    assert shown.group(1) != json.loads(literal.group(1))
+
+    # `</script>` cannot be written from inside the literal, whatever the key is.
+    monkeypatch.setattr(settings, "demo_key", "a</script><b>x")
+    scripted = client.get("/dashboard").text
+    js = re.search(r"const DEMO_KEY = (.*);", scripted)
+    assert "</script>" not in js.group(1)
+    assert json.loads(js.group(1)) == "a</script><b>x"
 
 
 # --- Wave 4: the page shell (DASH-02) ------------------------------------------------
@@ -1934,6 +2131,91 @@ def test_dashboard_never_renders_through_a_markup_sink(client):
     assert "createElement" in html
 
 
+def _el_body(html: str) -> str:
+    """The source of `el()` alone, from the render-helpers block.
+
+    Scoped to the ONE function, not the block and not the page: `textContent` appears in
+    `svg()`, in `line.textContent`, in `feedStatus.textContent` and in
+    `drillTitle.textContent`, so a page-wide grep for the token survives el() losing its
+    only rendering statement — which is WR-08.
+    """
+    helpers = _block(html, "render helpers")
+    assert "function el(" in helpers, "el() is not in the render-helpers block any more"
+    return helpers.split("function el(", 1)[1].split("\n}", 1)[0]
+
+
+def test_el_writes_its_text_argument_as_text(client):
+    """WR-08: `el()` renders. Every card, chart label, chip, step line and drill-down
+    fact on this page is built by it, so this one statement is the page's whole visible
+    output — and until now nothing in the suite could see it go.
+
+    NAMED MUTATION this closes (a plausible refactor, not an adversarial alias): replace
+    `n.textContent = text` with `n.setAttribute("title", text)`. Every rendered value on
+    the page disappears while the whole 407-test suite, including
+    `test_dashboard_never_renders_through_a_markup_sink` above, stays green — the token
+    `textContent` survives in four other places and no markup sink appears.
+
+    WEAK BY CONSTRUCTION, and specifically weaker than it looks: this is still a grep,
+    scoped to one function's source. It proves that el() contains an assignment of its
+    `text` parameter to `.textContent`; it does NOT prove a browser calls el(), that
+    callers pass a value, or that anything is on screen. There is no DOM in this suite
+    and adding one would make Node a test dependency (ruled out by the threat register),
+    so the rendering claim itself stays a human check — 06-07's checkpoint. What this
+    closes is the specific class where the page's only rendering statement can be
+    deleted in silence.
+    """
+    body = _el_body(client.get("/dashboard").text)
+
+    # The assignment, not the token: `.textContent = text` and nothing weaker.
+    assert re.search(r"\.textContent\s*=\s*text\b", body), (
+        "el() no longer writes its `text` argument through textContent — every value"
+        " the page renders would be invisible, and nothing else in this suite sees it"
+    )
+    # ...and the parameter it writes is genuinely el()'s third argument, so a rename
+    # cannot leave this matching some other `text` in scope.
+    assert re.match(r"\s*tag\s*,\s*attrs\s*,\s*text\s*\)", body), body[:80]
+
+
+def _ci_workflow() -> str:
+    path = Path(__file__).resolve().parent.parent / ".github" / "workflows" / "ci.yml"
+    assert path.exists(), f"the CI workflow moved: {path}"
+    return path.read_text(encoding="utf-8")
+
+
+def test_the_docker_smoke_greps_for_content_only_this_page_has(client):
+    """WR-08: the container smoke asserts the PAGE, not just that something answered.
+
+    `curl -sf /dashboard | grep -q "Relay"` is satisfied by `<title>Relay dashboard</title>`
+    alone — so a build that served `<html><head><title>Relay dashboard</title></head>
+    <body></body></html>` printed "smoke ok". The smoke exists to catch a *served but
+    broken* page (a missing template is already caught by /health never coming up), and
+    that is exactly what a title match cannot see.
+
+    This test is the link between the two files: the tokens the workflow greps for must
+    be tokens the served page actually has, so neither can rot without the other going
+    red. MUTATION: rename `id="try-examples"` in the template — this fails here rather
+    than as a confusing red X in CI on main.
+    """
+    html = client.get("/dashboard").text
+    workflow = _ci_workflow()
+
+    # The workflow greps for these as FIXED strings (`grep -qF`), so the token in the
+    # YAML and the token in the page are byte-for-byte the same thing.
+    for token in ('id="try-examples"', "openDrill"):
+        assert token in workflow, (
+            f"the docker smoke no longer greps for {token} — it is back to a check that"
+            " a bare <title> would satisfy"
+        )
+        assert token in html, f"the served page has no {token} for the smoke to find"
+    # And the migration path: the smoke must start the image a second time against a
+    # database that already exists, which is the only place CI exercises
+    # _add_column_if_missing against a pre-existing table (db.py).
+    assert "docker volume create" in workflow, (
+        "the docker smoke runs with no volume, so a second start against an existing"
+        " database — the whole point of _add_column_if_missing — is never exercised"
+    )
+
+
 def test_dashboard_renders_the_summary_from_metrics(client):
     """DASH-02: the cards and the outcome bars are fed by /metrics' SQL-computed values.
 
@@ -1960,6 +2242,19 @@ def test_dashboard_renders_the_summary_from_metrics(client):
     # Each card's source key, named against the block that builds the cards.
     for key in ("m.runs", "m.latency_ms", "m.cost_usd", "m.tokens", "m.last_runs"):
         assert key in block, f"the summary never reads {key}"
+
+    # WR-09: the two percentile cards are computed over the chart's window, so their
+    # labels have to say which window — from the SERVER's number. A literal here would
+    # keep printing "last 14d" the day metrics_window_days moves, which is the same
+    # class of quiet lie the finding was about.
+    code = _code_only(block)
+    assert "m.latency_ms.window_days" in code, "the p50 card does not name its window"
+    assert not re.search(r'"p50 ms"|"p95 ms"', code), (
+        "a percentile card is labelled with no population at all"
+    )
+    assert not re.search(r"last 14d|last 14 days", code), (
+        "the window length is hardcoded beside the setting that defines it"
+    )
 
 
 def test_dashboard_renders_without_a_demo_key(client, monkeypatch):
@@ -2034,6 +2329,42 @@ def test_the_gauge_reads_the_servers_budget_object(client):
     assert "in flight" in gauge
 
 
+def test_the_gauge_explains_an_idle_day(client):
+    """A hollow ring is honest and unreadable: $0 today looks exactly like a load error.
+
+    The scale-to-zero demo spends nothing on a quiet day, so the gauge's usual render
+    is a grey track with no fill. This pins the copy that makes that a reading rather
+    than a symptom — and pins that it stayed COPY: the branch compares the server's
+    `spent` and adds a sentence, it does not compute a fraction, sum `last_runs`, or
+    substitute a floor for the empty arc (D-11 — the gauge and the spend gate must be
+    incapable of disagreeing).
+
+    MUTATION that must turn this red: delete the `if (spent === 0)` branch — the idle
+    gauge goes back to an unexplained grey ring.
+
+    WEAK BY CONSTRUCTION: grep-level. No DOM, no arc is drawn or measured here; this
+    sees the branch and its copy in the served document.
+    """
+    html = client.get("/dashboard").text
+    gauge = _block(html, "budget gauge")
+    code = _code_only(gauge)
+
+    assert "if (spent === 0) {" in code, "no idle branch in the gauge"
+    assert "Nothing spent yet today" in code, "the idle gauge is unexplained"
+    # Still copy only: the arithmetic below the branch is the server's, unchanged.
+    assert "last_runs" not in code and "reduce(" not in code
+    assert code.count("fraction =") == 1, "the idle branch re-derives the fraction"
+    # The empty arc is still empty, and the one clamp is still the server's two numbers
+    # bounded to [0, 1] — pinned literally, because the tempting way to make an idle
+    # gauge look alive is a minimum fill (`Math.max(0.05, ...)`), which draws spend
+    # that did not happen on the page whose whole claim is that its numbers are real.
+    assert "Math.min(1, Math.max(0, spent / ceiling))" in code, (
+        "the fraction is no longer the server's spend over the server's ceiling"
+    )
+    assert "if (fraction > 0) {" in code, "the fill is no longer gated on real spend"
+    assert "None" not in html
+
+
 def test_charts_have_an_empty_state(client):
     """A demo whose volume was just created must render empty charts, not broken ones.
 
@@ -2055,6 +2386,49 @@ def test_charts_have_an_empty_state(client):
     assert "!points.length" in block, "no empty branch in the latency chart"
     assert block.count('class: "empty"') >= 2
     assert "no runs yet" in block
+    assert "None" not in html
+
+
+def test_the_latency_chart_explains_a_single_day_of_runs(client):
+    """The sparse render is the demo's NORMAL render, so it has to read as deliberate.
+
+    `min_machines_running = 0` plus real traffic means a 14-day window usually holds
+    one busy day. The drawing rule then does the right thing and draws no segment — a
+    line across an idle fortnight would be an invention — but a visitor sees two dots
+    in an empty box, which reads as a broken chart on the one page whose job is
+    credibility. This pins the caption that names the cause, and pins that it did NOT
+    buy legibility by inventing the line.
+
+    The guard is asserted as `points.some(` over `adjacent`, not as a hand-rolled
+    index comparison, because `adjacent` is also what gates the segment: one predicate,
+    so the copy cannot announce a missing line that the drawing just drew.
+
+    MUTATION that must turn this red: delete the sparse branch (the
+    `if (!points.some(...)) { host.append(...) }` block) from renderLatencyChart — the
+    one-day case goes back to two unexplained dots.
+
+    WEAK BY CONSTRUCTION: grep-level, like every front-end assertion in this file.
+    There is no DOM here, so nothing below renders a chart or counts a dot; it sees
+    that the branch and its copy shipped, and that the zero-data branch survived
+    alongside it.
+    """
+    html = client.get("/dashboard").text
+    block = _block(html, "charts (SVG)")
+    code = _code_only(block)
+
+    # Three distinct states, not two: no runs at all, runs on one day, runs on days.
+    assert "!points.length" in code, "the zero-data branch was replaced, not extended"
+    assert "!points.some(" in code, "no sparse branch in the latency chart"
+    assert "adjacent(points[n - 1], p)" in code, (
+        "the sparse branch re-derives adjacency instead of sharing the draw's predicate"
+    )
+    assert "one day with runs in this window" in code, "the one-day case is unexplained"
+    assert "none next to" in code, "days far apart draw no line and say nothing"
+
+    # The caption buys nothing if the fix was to draw the line anyway: the segment is
+    # still gated on adjacency, and no unconditional polyline appeared.
+    assert "if (adjacent(prev, p)) {" in code, "a segment is no longer gated on adjacency"
+    assert "polyline" not in code and "path" not in code.split("renderGauge", 1)[0]
     assert "None" not in html
 
 
@@ -2135,6 +2509,126 @@ def test_the_drill_panel_renders_the_run_states(client):
     # window length hardcoded here that a settings change would silently falsify.
     assert "d.note" in code
     assert "None" not in html
+
+
+# A frame field concatenated straight into a step line: `+ f.reason` or `d.tool +`.
+# The lookbehind keeps `head.textContent +` from reading as `d.textContent +`.
+_BARE_FRAME_FIELD = re.compile(
+    r"\+\s*(?<![\w$.])[fdr]\.\w+|(?<![\w$.])[fdr]\.\w+\s*\+"
+)
+
+
+def test_no_step_describer_interpolates_a_raw_frame_field(client):
+    """WR-10: every field these four renderers read is optional, so every one can be null.
+
+    `project()` builds each published frame with `d.get(...)`, so a field is null the
+    moment its source event omits the key — and both feed describers concatenated them
+    directly. An `error` frame with no reason rendered the literal line `error · null`
+    on the public live feed, to every anonymous viewer, on the page whose entire premise
+    is that what it shows is real. `renderChunks` had the same shape (`null · null` for
+    a malformed result row, which `project_run_detail` tolerates on purpose rather than
+    dropping).
+
+    The rule asserted here is mechanical rather than by-example, because the failure is
+    per-field: any ONE unwrapped field is the bug, and an example-based test only ever
+    covers the fields someone thought of. So this greps each renderer for a frame field
+    adjacent to a `+` and requires there to be none.
+
+    MUTATION 1 (executed): unwrap one field — `"error · " + f.reason` in `describe`.
+    Reds naming the field it found.
+
+    MUTATION 2 (executed): unwrap `describeOwn`'s `d.cost_usd`. Reds the same way, which
+    is the point of scanning all four bodies rather than one.
+
+    WEAK BY CONSTRUCTION: grep over the served source. Nothing here feeds a
+    field-missing frame through a describer and reads the rendered line back — there is
+    no DOM in this suite. It proves no field REACHES a line unguarded; that dash()
+    itself returns the placeholder is pinned by test_the_drill_panel_renders_timings.
+    """
+    html = client.get("/dashboard").text
+    blocks = {
+        "feed": _code_only(_block(html, "live feed (/events)")),
+        "try": _code_only(_block(html, _TRY)),
+        "drill": _code_only(_block(html, _DRILL)),
+    }
+    renderers = (
+        ("describe", "feed", "function describe(f) {"),
+        ("runNode", "feed", "function runNode(f) {"),
+        ("describeOwn", "try", "function describeOwn(name, d) {"),
+        ("renderChunks", "drill", "function renderChunks(results, host) {"),
+    )
+
+    for name, where, opener in renderers:
+        block = blocks[where]
+        assert opener in block, f"{name} is gone — the assertions below would be vacuous"
+        body = block.split(opener, 1)[1].split("\n}\n", 1)[0]
+
+        bare = _BARE_FRAME_FIELD.findall(body)
+        assert not bare, f"{name} interpolates raw frame fields: {bare}"
+        assert "dash(" in body, f"{name} routes nothing through the placeholder helper"
+        # ...and nobody "fixed" it by interpolating the word instead of the value.
+        # Over the string LITERALS only: `return null;` in describeOwn is a control
+        # sentinel meaning "already appended, render no line", not rendered text.
+        for literal in re.findall(r'"([^"]*)"', body):
+            for word in ("undefined", "null", "None"):
+                assert word not in literal, f"{name} renders the word {word!r}"
+
+    # The whole-document rule tests/test_auth.py owns, restated where it can be broken.
+    assert "None" not in html
+
+
+def test_only_the_latest_drill_down_open_may_render(client):
+    """WR-07: two opens in flight resolve in ARRIVAL order, not click order.
+
+    Concrete: the visitor clicks run A in the Recent runs table (a slow response —
+    /runs/{uid} reads run_events, runs and tickets), then clicks run B in the live feed
+    before A comes back. B renders, then A overwrites it. The dialog is now titled with
+    A's ticket and, if A is demo-origin, carries the badge reading "You submitted this
+    run" — for a run the visitor did not submit and did not ask to see.
+
+    The guard is a monotonic token, and the SHAPE is load-bearing: `openDrill` has
+    exactly one `await` and the check is the statement immediately after it, because
+    every additional await is another place a render can land ahead of a check. That is
+    why all the awaiting lives in `fetchDrill`, which touches no DOM at all.
+
+    MUTATION 1 (executed): delete `if (mine !== drillGeneration) return;`. The
+    immediately-after-the-await assertion reds.
+
+    MUTATION 2 (executed): move the fetch back inline — `renderDrill(await
+    resp.json())` in openDrill. The one-await assertion reds with 3 awaits, which is
+    the structure that made the missing guard possible.
+
+    WEAK BY CONSTRUCTION: there is no DOM and no event loop here, so nothing in this
+    test issues two overlapping opens and watches which one wins. It proves the guard
+    exists and is positioned where it cannot be bypassed; that it actually suppresses a
+    superseded render needs a browser.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _DRILL))
+
+    body = code.split("async function openDrill(uid) {", 1)[1].split("\n}\n", 1)[0]
+    assert "const mine = ++drillGeneration;" in body, "the open takes no token"
+    assert "let drillGeneration = 0;" in code, "the token counter is not declared"
+
+    # Exactly one await, and the guard is the very next statement after it.
+    assert body.count("await ") == 1, (
+        "openDrill awaits more than once; every extra await is an unguarded render point"
+    )
+    assert re.search(r"await [^\n]*\n\s*if \(mine !== drillGeneration\) return;", body), (
+        "the staleness check is not the statement immediately after the await"
+    )
+
+    # ...and everything that renders is on the far side of it.
+    _, after = body.split("if (mine !== drillGeneration) return;", 1)
+    for sink in ("drillNotice(", "renderDrill("):
+        assert sink in after, f"{sink} can run for a superseded open"
+
+    # The awaiting helper renders nothing, which is what makes the single check above
+    # sufficient rather than merely first.
+    fetcher = code.split("async function fetchDrill(uid) {", 1)[1].split("\n}\n", 1)[0]
+    for sink in ("drillNotice", "renderDrill", "drillFacts", "drillSteps", "drillTitle",
+                 "drillEl", "append(", "textContent"):
+        assert sink not in fetcher, f"fetchDrill touches the panel with {sink}"
 
 
 def test_the_drill_panel_renders_values_as_text_never_html(client):
@@ -2263,8 +2757,13 @@ def test_the_drill_panel_renders_timings(client):
     assert "s.elapsed_ms" in code, "steps are not timed at all"
     assert "s.duration_ms" in code, "tool calls carry no duration"
     # The one guard both helpers use, asserted as written — a dash, from an explicit
-    # null/undefined test rather than from falsiness (0 is a real timing).
-    assert code.count('(v === null || v === undefined) ? "—"') >= 2
+    # null/undefined test rather than from falsiness (0 is a real timing). Asserted in
+    # the SHARED render-helpers block: dash()/ms() moved there when the feed describers
+    # started needing them too (WR-10), and asserting them here would have gone red on
+    # the move while the property was intact.
+    helpers = _code_only(_block(html, "render helpers"))
+    assert helpers.count('(v === null || v === undefined) ? "—"') >= 2
+    assert "dash(" in code and "ms(" in code, "the panel stopped using the guards"
     assert "None" not in html
 
 
@@ -2653,6 +3152,79 @@ def test_try_it_renders_refusals_as_designed_states(client):
     assert ".refusal {" in html, "the refusal has no styling of its own"
     for shout in ("alert(", "console.error"):
         assert shout not in code, f"a refusal is reported as a fault with {shout}"
+
+
+def test_a_dropped_stream_re_enables_the_form_and_stays_distinct_from_a_refusal(client):
+    """WR-06: the streaming read is guarded, and its state is not a refusal's state.
+
+    `trySend.disabled = false` used to be written on three branches and reached on a
+    fourth that had none: `reader.read()` REJECTS on a mid-stream transport failure, so
+    the rejection escaped `submitTryIt` entirely and left "send it" disabled and the
+    status line on "working…" for the life of the page. A reload was the only recourse,
+    on the page that is this project's call to action and in the failure a
+    scale-to-zero demo produces most often.
+
+    The second half matters as much as the first: a 429/503 is a DESIGNED state D-08
+    authors server-side, and it must not be swallowed by the new catch and re-rendered
+    as "the connection dropped". So this pins that the non-ok branch returns BEFORE the
+    guard, which is what keeps the two apart.
+
+    MUTATION 1 (executed): restore the per-branch clears — put `trySend.disabled =
+    false` back in `tryFailed()` and `refuse()` and drop the `finally`. The count
+    assertion reds with `3 != 1`.
+
+    MUTATION 2 (executed): unwrap the read loop (delete the `try {` before the reader
+    and its `catch`). The structural assertion reds with "the streaming read is not
+    inside a try block".
+
+    WEAK BY CONSTRUCTION, precisely: there is no DOM in this suite, so nothing here
+    drops a connection or reads the button's `disabled` property back. This is a
+    structural grep over the served source — it proves the guard and the single
+    re-enable site EXIST and are positioned as described, not that a real mid-stream
+    reset re-enables a real button. That proof needs a browser.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _TRY))
+
+    # 1. Exactly one re-enable site on the whole path, and it is a `finally` — the only
+    #    construct that runs on the rejecting path as well as the returning ones.
+    assert code.count("trySend.disabled = false") == 1, (
+        "the button is re-enabled per-branch again; a rejecting path will miss one"
+    )
+    assert re.search(r"\}\s*finally\s*\{\s*trySend\.disabled = false;\s*\}", code), (
+        "the single re-enable is not in a finally"
+    )
+
+    # 2. The streaming read is inside a guard, and the guard's catch is in the same
+    #    function. Asserted positionally rather than by token presence: a `try` anywhere
+    #    else in the block would satisfy a bare `"try {" in code`.
+    stream_fn = code.split("async function streamRun(ticketId) {", 1)[1].split("\n}\n", 1)[0]
+    head, tail = stream_fn.split("const reader = res.body.getReader();", 1)
+    assert head.rstrip().endswith("try {"), (
+        "the streaming read is not inside a try block"
+    )
+    assert "} catch (" in tail, "nothing catches a mid-stream rejection"
+    assert "await reader.read()" in tail, "the read moved out of the guarded region"
+    # A null body is its own branch, before the guard — `res.body.getReader()` on a
+    # bodyless response throws for a reason the copy below would misdescribe.
+    assert "if (!res.body)" in head
+
+    # 3. One bad frame is skipped, not fatal: an unguarded JSON.parse inside the loop
+    #    would take the whole stream out through the catch above.
+    assert re.search(r"try \{ payload = JSON\.parse\(data\); \} catch \(\w+\) \{ continue; \}", code)
+
+    # 4. The refusal path returns BEFORE the guard, so a 429/503 still renders
+    #    renderRefusal's designed state and never the dropped-stream copy.
+    assert "if (!res.ok) { await refuse(res); return; }" in head
+    assert "renderRefusal" not in tail
+
+    # 5. ...and the two states say different things. The dropped-stream copy claims
+    #    nothing about why the run stopped and does not clear the steps already shown.
+    dropped = code.split("function streamDropped(uid, text) {", 1)[1]
+    assert "clear(tryStream)" not in dropped.split("\n}\n", 1)[0], (
+        "a transport drop erases steps that really happened"
+    )
+    assert "dropped mid-run" in code and "may still have finished" in code
 
 
 def test_refusals_render_as_product_copy(client, monkeypatch):
