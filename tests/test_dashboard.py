@@ -3434,6 +3434,110 @@ def test_try_it_deep_links_its_own_run(client):
         assert invented not in code, f"the run identity is minted client-side with {invented}"
 
 
+def _fn_body(code: str, opener: str, *, what: str) -> str:
+    """One top-level function's body, by its exact opening line.
+
+    The same idiom `test_only_the_latest_drill_down_open_may_render` uses: nested braces
+    are indented, so the first `\\n}\\n` is the function's own close. The presence
+    assertion comes first because a renamed or deleted function would otherwise make
+    every assertion over the body vacuous — which is the exact failure this file is
+    trying to stop being.
+    """
+    assert opener in code, f"{what} is gone — the assertions below would be vacuous"
+    return code.split(opener, 1)[1].split("\n}\n", 1)[0]
+
+
+def test_try_it_controls_are_bound_to_their_handlers(client):
+    """DASH-05: the send button, the example chips and the deep link are WIRED.
+
+    WHY THIS EXISTS. The three tests above assert that TOKENS are on the page, and a
+    token survives its own wiring being deleted: `openDrill(uid)` sits inside
+    `offerTheTrace`'s body, so `test_try_it_deep_links_its_own_run` stays green when
+    nothing calls `offerTheTrace` at all. 06-VERIFICATION deleted three bindings
+    independently — the send button's, the chips', and the deep link's call site — and
+    the suite stayed at 417 green for each. Silent feature loss on the page that is this
+    project's call to action.
+
+    So this asserts the CHAIN, link by link, in the order a click travels it:
+
+        trySend --click--> submitTryIt -> runTryIt -> streamRun -> offerTheTrace
+                                                                       |
+                                                          --click--> openDrill(uid)
+
+    ...plus the chips' binding to chooseExample, and the two POSITIONS that make the
+    deep link mean what it says: it is offered only after the run was accepted (past the
+    refusal return), and before the read loop, so a stream that drops mid-run still
+    leaves the visitor a way into their own trace.
+
+    MUTATION 1 (executed): delete `trySend.addEventListener("click", submitTryIt);`.
+    MUTATION 2 (executed): delete `chip.addEventListener("click", () => chooseExample(i));`.
+    MUTATION 3 (executed): delete `if (uid) offerTheTrace(uid);`.
+    MUTATION 4 (executed): hoist `offerTheTrace(uid)` above the `if (!res.ok)` refusal
+    return — a rate-limited visitor is then offered "see the full trace" for a run that
+    never started.
+
+    WEAK BY CONSTRUCTION, and this is the honest limit: there is no DOM in this suite
+    and adding one was ruled out, so nothing here dispatches a click or observes a
+    handler run. It proves the binding and the call site are PRESENT and POSITIONED in
+    the shipped source — that they are unremovable without a red — not that a browser
+    fires them. That a click actually opens the visitor's own trace is 06-07's
+    checkpoint step 5, which remains a human check.
+    """
+    html = client.get("/dashboard").text
+    code = _code_only(_block(html, _TRY))
+
+    # --- 1. the send button, and only on a deployment that has a key -----------------
+    setup = _fn_body(code, "function setupTryIt() {", what="setupTryIt")
+    bind = 'trySend.addEventListener("click", submitTryIt)'
+    assert bind in setup, "the send button is bound to nothing — the form cannot submit"
+    guard_at, bind_at = setup.index("if (!TRY_CONFIGURED)"), setup.index(bind)
+    assert guard_at < bind_at, "the binding is not behind the no-key guard"
+    assert "return;" in setup[guard_at:bind_at], (
+        "the no-key branch does not return before the binding — a read-only form would"
+        " still submit"
+    )
+    assert re.search(r"^setupTryIt\(\);", code, re.MULTILINE), "setupTryIt is never called"
+
+    # --- 2. the example chips ---------------------------------------------------------
+    examples = _fn_body(code, "function renderExamples() {", what="renderExamples")
+    assert 'chip.addEventListener("click", () => chooseExample(i))' in examples, (
+        "the example chips are inert — D-06's three examples cannot be chosen"
+    )
+    assert "tryExamplesEl.append(chip)" in examples, (
+        "the chip that was bound is not the chip that reaches the page"
+    )
+    assert "renderExamples();" in setup, "the chips are never rendered"
+
+    # --- 3. the deep link, and where it sits ------------------------------------------
+    stream = _fn_body(code, "async function streamRun(ticketId) {", what="streamRun")
+    offer_at = stream.find("offerTheTrace(uid)")
+    assert offer_at != -1, "streamRun never offers the trace — the deep link is dead code"
+    assert stream.index("if (!res.ok)") < offer_at, (
+        "the trace is offered before the refusal return — a 429'd visitor would be given"
+        " a control for a run that never started"
+    )
+    assert stream.index('res.headers.get("X-Relay-Run-Uid")') < offer_at, (
+        "the trace is offered before the uid the server minted has been read"
+    )
+    assert offer_at < stream.index("res.body.getReader()"), (
+        "the trace is offered only after the read loop — a dropped stream would leave"
+        " the visitor with no way into their own run"
+    )
+
+    # --- the chain between the click and that call ------------------------------------
+    submit = _fn_body(code, "async function submitTryIt() {", what="submitTryIt")
+    assert "await runTryIt()" in submit, "the click handler runs nothing"
+    run_try = _fn_body(code, "async function runTryIt() {", what="runTryIt")
+    assert "await streamRun(ticket.id)" in run_try, "the created ticket is never run"
+
+    # --- and what the offered control does --------------------------------------------
+    offer = _fn_body(code, "function offerTheTrace(uid) {", what="offerTheTrace")
+    assert 'open.addEventListener("click", () => openDrill(uid))' in offer, (
+        "the 'see the full trace' control opens nothing"
+    )
+    assert "tryActions.append(open)" in offer, "the control is built but never shown"
+
+
 def test_try_it_renders_refusals_as_designed_states(client):
     """D-08: 429 and 503 render as the cost control working, in the SERVER's own words.
 
