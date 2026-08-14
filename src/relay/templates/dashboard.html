@@ -209,10 +209,16 @@ const OUTCOME_BUCKETS = [
 ];
 
 function renderCards(m) {
+  // WR-09: the two percentile cards are computed over the CHART'S window, so they say
+  // which window that is — from the server's own number, never a 14 written here beside
+  // a setting that can move. The other cards are lifetime ledger totals and read as
+  // such. A visitor comparing the p50 card with the latency chart below is doing the
+  // right thing, and the page owes them a straight answer.
+  const days = m.latency_ms.window_days;
   const cards = [
     ["runs", String(m.runs)],
-    ["p50 ms", String(m.latency_ms.p50)],
-    ["p95 ms", String(m.latency_ms.p95)],
+    ["p50 ms · last " + dash(days) + "d", String(m.latency_ms.p50)],
+    ["p95 ms · last " + dash(days) + "d", String(m.latency_ms.p95)],
     ["total cost", "$" + m.cost_usd.total],
     ["mean cost", "$" + m.cost_usd.mean_per_run],
     ["tokens in", String(m.tokens.input)],
@@ -370,7 +376,8 @@ const adjacent = (prev, p) => prev !== undefined && p.i - prev.i === 1;
 function renderLatencyChart(series) {
   const host = document.getElementById("chart-latency");
   clear(host);
-  host.append(el("h3", {}, "Latency per day (p50 / p95)"));
+  host.append(el("h3", {}, "Latency per day (p50 / p95) — the same rows the p50 card"
+                           + " is computed over"));
   const points = series
     .map((d, i) => ({ i: i, p50: d.p50_ms, p95: d.p95_ms }))
     .filter(p => p.p50 !== null && p.p50 !== undefined);

@@ -21,8 +21,9 @@ import sqlite3
 from relay.config import settings
 from relay.telemetry import (
     DAILY_BUCKETS_SQL,
-    GLOBAL_PERCENTILE_SQL,
+    WINDOW_PERCENTILE_SQL,
     _percentile,
+    _window_offset,
     run_metrics,
 )
 
@@ -113,19 +114,28 @@ def test_percentile_is_half_up():
     """
     raw = sqlite3.connect(":memory:")
     raw.row_factory = sqlite3.Row
-    raw.execute("CREATE TABLE runs (duration_ms INTEGER)")
+    # created_at, because the query is now bounded to the metrics window (WR-09) and
+    # every row below is stamped inside it: this test is about the RANK, and a row the
+    # WHERE pruned would leave it measuring an empty population.
+    raw.execute("CREATE TABLE runs (duration_ms INTEGER, created_at TEXT)")
+    offset = _window_offset()
 
     disagreements = 0
     for n in range(1, 61):
         values = list(range(n))
         raw.execute("DELETE FROM runs")
-        raw.executemany("INSERT INTO runs (duration_ms) VALUES (?)", [(v,) for v in values])
+        raw.executemany(
+            "INSERT INTO runs (duration_ms, created_at) VALUES (?, datetime('now'))",
+            [(v,) for v in values],
+        )
         for pct in (0.50, 0.95, 0.99):
             expected = min(n - 1, math.floor(pct * (n - 1) + 0.5))
             assert _percentile(values, pct) == values[expected], (
                 f"_percentile is not half-up at n={n}, pct={pct}"
             )
-            from_sql = raw.execute(GLOBAL_PERCENTILE_SQL, (pct,)).fetchone()["value"]
+            from_sql = raw.execute(
+                WINDOW_PERCENTILE_SQL, (offset, pct)
+            ).fetchone()["value"]
             if from_sql != _percentile(values, pct):
                 disagreements += 1
     raw.close()
@@ -142,7 +152,9 @@ def test_percentile_of_nothing_is_zero(conn):
     # The empty state is a defined number, not a crash and not None: the card renders
     # `0 ms` before the first run rather than "undefined".
     assert _percentile([], 0.50) == 0
-    assert run_metrics(conn)["latency_ms"] == {"p50": 0, "p95": 0, "max": 0}
+    assert run_metrics(conn)["latency_ms"] == {
+        "p50": 0, "p95": 0, "max": 0, "window_days": settings.metrics_window_days,
+    }
 
 
 def test_last_runs_is_bounded_and_newest_first(conn):
@@ -411,3 +423,77 @@ def test_the_window_bounds_the_chart_not_the_ledger(conn):
     assert payload["runs"] == 2
     assert payload["cost_usd"]["total"] == 0.42
     assert payload["latency_ms"]["max"] == 9999
+
+
+def test_the_p50_card_and_the_p50_chart_are_one_population(conn):
+    """WR-09: two numbers labelled p50, on a page whose whole premise is credibility.
+
+    The rank EXPRESSION was already shared, and the review's own words are that this
+    was not enough: `GLOBAL_PERCENTILE_SQL` had no `WHERE` — it was every run for the
+    life of the Fly volume — while `DAILY_BUCKETS_SQL` was bounded to
+    `metrics_window_days`. A statistic is its population as much as its formula, so the
+    card and the chart could differ by tens of seconds while both were labelled p50, and
+    a visitor comparing them (which is the right thing to do) would conclude the page
+    was broken.
+
+    The scenario below is the review's, seeded for real: 100 runs at 5000ms outside the
+    window plus 3 runs at 200ms today. Before the fix the card read 5000 and the chart's
+    only point sat at 200.
+
+    MUTATION (executed): delete the `WHERE created_at >= datetime('now', ?, 'start of
+    day')` from WINDOW_PERCENTILE_SQL and drop the offset parameter. The card goes back
+    to 5000 while the chart still plots 200, and this reds on the card assertion.
+    """
+    window = settings.metrics_window_days
+    for _ in range(100):
+        _insert_run(conn, day_offset=-(window + 6), duration_ms=5000, cost_usd=0.01)
+    for _ in range(3):
+        _insert_run(conn, day_offset=0, duration_ms=200, cost_usd=0.01)
+
+    payload = run_metrics(conn)
+
+    plotted = [d["p50_ms"] for d in payload["daily"] if d["p50_ms"] is not None]
+    assert plotted == [200], f"the chart is not plotting what was seeded: {plotted}"
+    assert payload["latency_ms"]["p50"] == 200, (
+        "the p50 card is computed over a different population than the p50 line"
+    )
+    assert payload["latency_ms"]["p95"] == 200, "p95 is windowed on one side only"
+
+    # ANTI-VACUITY: the out-of-window runs really are in the store, really are slower,
+    # and really would move an unwindowed percentile. Without this the assertions above
+    # would pass on an empty table.
+    assert payload["runs"] == 103
+    assert payload["latency_ms"]["max"] == 5000, (
+        "the slow runs never landed — the card assertion above proves nothing"
+    )
+    assert _percentile(sorted([5000] * 100 + [200] * 3), 0.50) == 5000, (
+        "the unwindowed p50 of this seeding is not 5000, so the fix is untested here"
+    )
+
+    # The label the page prints is the same number the WHERE was built from.
+    assert payload["latency_ms"]["window_days"] == window
+
+
+def test_the_p50_card_is_the_windows_median_not_a_day_average(conn):
+    """One population, not a reconciliation of two.
+
+    The card could be made to "agree" with the chart by averaging the daily p50s, which
+    is a different statistic that happens to look close — and is wrong whenever the days
+    hold different numbers of runs. This pins that the card is the median of exactly the
+    ROWS the chart's days cover: three runs across two days, whose union median (900)
+    equals neither day's p50 (100 and 900) by accident and is not their mean (500).
+
+    MUTATION (executed): compute the card as the mean of the daily p50s. Reds with 500.
+    """
+    _insert_run(conn, day_offset=0, duration_ms=100)
+    _insert_run(conn, day_offset=-1, duration_ms=900)
+    _insert_run(conn, day_offset=-1, duration_ms=1000)
+
+    payload = run_metrics(conn)
+    by_day = {d["day"]: d["p50_ms"] for d in payload["daily"] if d["p50_ms"] is not None}
+
+    assert sorted(by_day.values()) == [100, 1000], f"the days did not seed as expected: {by_day}"
+    assert payload["latency_ms"]["p50"] == _percentile([100, 900, 1000], 0.50) == 900
+    # ...and the two wrong-but-plausible answers are excluded by name.
+    assert payload["latency_ms"]["p50"] != 550, "the card averages the daily p50s"
+    assert payload["latency_ms"]["p50"] != 100, "the card reads only the latest day"

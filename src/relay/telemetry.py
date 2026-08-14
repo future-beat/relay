@@ -105,7 +105,7 @@ def _percentile(sorted_values: list[int], pct: float) -> int:
 
     Its production role is now to be that statement of the definition in Python:
     tests/test_metrics.py::test_percentile_is_half_up asserts this function and
-    GLOBAL_PERCENTILE_SQL agree for every sampled pair, which is what stops the two
+    WINDOW_PERCENTILE_SQL agree for every sampled pair, which is what stops the two
     from drifting apart the next time either is touched.
     """
     if not sorted_values:
@@ -153,16 +153,30 @@ TOTALS_SQL = (
 # GROUP BY, it is part of /metrics' published shape, and nothing on the page reads it.
 OUTCOMES_SQL = "SELECT outcome, COUNT(*) AS n FROM runs GROUP BY outcome"
 
-# Nearest-rank percentile in SQL. `MIN(n - 1, ...)` is the two-argument scalar min;
-# `MAX(CASE ...)` is the aggregate picking the single ranked row out. Empty table ->
-# one row of NULL, which the caller floors to 0. The `? * (n - 1)` rank must stay
-# identical to _percentile's index, and test_percentile_is_half_up pins that.
-GLOBAL_PERCENTILE_SQL = (
+# Nearest-rank percentile in SQL, over THE SAME ROWS the latency chart plots (WR-09).
+#
+# The `WHERE` is that agreement, and it is not an optimisation. Without it this query
+# was every run for the life of the volume while DAILY_BUCKETS_SQL was bounded to
+# metrics_window_days: 100 runs at 5000ms three weeks ago plus 3 runs at 200ms today put
+# a "p50 ms" card reading 5000 directly above a latency chart whose only plotted point
+# sat at 200. Two numbers labelled p50, contradicting each other, on a page whose whole
+# premise is that what it shows is real. Sharing the rank EXPRESSION was never enough —
+# a statistic is its population as much as its formula, so the population is shared too.
+#
+# `MIN(n - 1, ...)` is the two-argument scalar min; `MAX(CASE ...)` is the aggregate
+# picking the single ranked row out. An empty window -> one row of NULL, which the
+# caller floors to 0. The `? * (n - 1)` rank must stay identical to _percentile's index
+# and to DAILY_BUCKETS_SQL's, and test_percentile_is_half_up pins that.
+#
+# Parameters are bound in the order the placeholders appear in the TEXT: the window
+# offset (inside the CTE) first, then the percentile.
+WINDOW_PERCENTILE_SQL = (
     "WITH ranked AS ("
     " SELECT duration_ms,"
     "        ROW_NUMBER() OVER (ORDER BY duration_ms) AS rn,"
     "        COUNT(*)     OVER ()                     AS n"
-    " FROM runs)"
+    " FROM runs"
+    " WHERE created_at >= datetime('now', ?, 'start of day'))"
     " SELECT MAX(CASE WHEN rn = 1 + MIN(n - 1, CAST(ROUND(? * (n - 1)) AS INTEGER))"
     "                 THEN duration_ms END) AS value"
     " FROM ranked"
@@ -212,7 +226,10 @@ LAST_RUNS_SQL = (
 
 # DASH-04 / D-10: cost and latency bucketed by day, not per run — legible at 3 runs
 # and at 300. The rank expression is character-for-character the one in
-# GLOBAL_PERCENTILE_SQL, so the chart's p50 and the card's p50 are the same statistic.
+# WINDOW_PERCENTILE_SQL AND the `WHERE` is the same window, so the chart's p50 and the
+# card's p50 are the same statistic over the same rows — the card partitioned by nothing
+# where the chart partitions by day (WR-09: the shared expression alone left two numbers
+# labelled p50 free to disagree by tens of seconds).
 #
 # The `WHERE` is what keeps this bounded, and it is served by idx_runs_created_at
 # (db.py:83); `date(created_at)` in the GROUP BY is then a function over already-pruned
@@ -261,8 +278,7 @@ def _daily_series(conn: Database) -> list[dict[str, Any]]:
     Empty days carry runs=0 and cost_usd=0.0 (both true) but p50/p95 None, not 0: a
     zero would plot a spike down to the floor and read as "every run was instant".
     """
-    window = max(1, settings.metrics_window_days)
-    offset = f"-{window - 1} days"
+    offset = _window_offset()
     rows = {
         r["day"]: {
             "day": r["day"],
@@ -280,8 +296,23 @@ def _daily_series(conn: Database) -> list[dict[str, Any]]:
     ]
 
 
+def _window_days() -> int:
+    return max(1, settings.metrics_window_days)
+
+
+def _window_offset() -> str:
+    """The window, as SQLite's own modifier — computed ONCE for every query that uses it.
+
+    The chart and the percentile cards have to be bounded by the same expression, not by
+    two expressions that happen to agree today (WR-09). A second `f"-{n} days"` written
+    beside the other query is exactly how the two populations drifted apart the first
+    time, and an off-by-one between them would be invisible on the page.
+    """
+    return f"-{_window_days() - 1} days"
+
+
 def _sql_percentile(conn: Database, pct: float) -> int:
-    row = conn.execute(GLOBAL_PERCENTILE_SQL, (pct,)).fetchone()
+    row = conn.execute(WINDOW_PERCENTILE_SQL, (_window_offset(), pct)).fetchone()
     value = row["value"] if row is not None else None
     return int(value) if value is not None else 0
 
@@ -306,10 +337,18 @@ def run_metrics(conn: Database) -> dict[str, Any]:
             "total": round(total_cost, 4),
             "mean_per_run": round(total_cost / n_runs, 4) if n_runs else 0.0,
         },
+        # p50 and p95 are over the CHART'S window and say so, because the page prints
+        # them side by side and a card that disagrees with the graph under it costs more
+        # credibility than a longer label does (WR-09). `max` is deliberately the
+        # LIFETIME extreme and is not rendered on any card — it is a ledger fact like
+        # cost_usd.total, and windowing it would quietly rewrite what the slowest run
+        # ever was. window_days is published so the page can label the two percentiles
+        # from the server's own number rather than hardcoding 14 beside a setting.
         "latency_ms": {
             "p50": _sql_percentile(conn, 0.50),
             "p95": _sql_percentile(conn, 0.95),
             "max": int(totals["max_ms"]),
+            "window_days": _window_days(),
         },
         "daily": _daily_series(conn),
         "last_runs": [dict(r) for r in conn.execute(LAST_RUNS_SQL).fetchall()],

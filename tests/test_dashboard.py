@@ -2243,6 +2243,19 @@ def test_dashboard_renders_the_summary_from_metrics(client):
     for key in ("m.runs", "m.latency_ms", "m.cost_usd", "m.tokens", "m.last_runs"):
         assert key in block, f"the summary never reads {key}"
 
+    # WR-09: the two percentile cards are computed over the chart's window, so their
+    # labels have to say which window — from the SERVER's number. A literal here would
+    # keep printing "last 14d" the day metrics_window_days moves, which is the same
+    # class of quiet lie the finding was about.
+    code = _code_only(block)
+    assert "m.latency_ms.window_days" in code, "the p50 card does not name its window"
+    assert not re.search(r'"p50 ms"|"p95 ms"', code), (
+        "a percentile card is labelled with no population at all"
+    )
+    assert not re.search(r"last 14d|last 14 days", code), (
+        "the window length is hardcoded beside the setting that defines it"
+    )
+
 
 def test_dashboard_renders_without_a_demo_key(client, monkeypatch):
     """Pitfall 14: the public landing surface must survive an unconfigured deployment.
