@@ -297,20 +297,75 @@ _WITHHELD = "[withheld]"
 #
 # Derived from the enums rather than written out, so a new status or category joins this
 # set on the day it is added and nobody has to remember. It is a NARROW exemption on
-# purpose: everything else a non-allowlisted tool returns is still harvested by default,
-# including the customer's plan — "pro" is also a short closed-set word, but it is an
-# attribute OF A PERSON rather than of the ticket's processing state, and it stays
-# withheld.
+# purpose: everything else a non-allowlisted tool returns is still harvested by default.
+# It is a VALUE-based exemption, which is why it is confined to values nobody wrote — the
+# only other exemption in this file (`_PERSONA_EXEMPT_FIELDS`, below) is key-based for
+# exactly that reason, and the two must not be merged.
 _ENUMERABLE_VALUES = frozenset(
     member.value.casefold() for member in (*TicketStatus, *TicketCategory)
 )
+
+# The one KEY-AWARE exemption from the harvest: the looked-up customer's own `name` and
+# `plan`, and only where they sit on the `customer` record a tool returned. Everything
+# else that record carries — the address, the signup date — is harvested exactly as before.
+#
+# WHY IT IS HERE. These two fields are the demo's PAYOFF. The reply the agent writes is the
+# artifact that proves it is real and good, and with these harvested it publishes as
+#     "Hi [withheld], as a [withheld] plan customer, your workspace is allowed 600
+#      requests per minute"
+# — reproduced on the live deployment. That is not a mask working; that is a redacted
+# document teaching every visitor to skim past the marker, which is the same cost NF-4
+# recorded for ticket statuses one exemption above. We were paying visible product quality
+# to conceal two literals that are not secret.
+#
+# READ THIS BEFORE YOU SEED A REAL CUSTOMER — the condition, and it is the whole argument:
+# RELAY'S CUSTOMERS ARE FIXTURES. `db.SEED_CUSTOMERS` holds four fictional personas (Ava
+# Chen, Liam Patel, Noah Smith, Mia Torres) hardcoded in a PUBLIC repository, and no other
+# customer row is ever created — nothing in this service writes to `customers`. So the
+# values this exemption unmasks are already published, to everyone, in the source tree.
+# Concealing a constant anyone can `git clone` buys nothing and costs the payoff sentence.
+# That last clause is not left on trust: `test_nothing_outside_the_seed_creates_a_customer_row`
+# scans src/relay for an INSERT into `customers` and fails, naming this set, the day one
+# appears. It is a regression guard and not a proof — an ORM, a migration or a manual
+# sqlite3 session on the volume all go around it.
+#
+# THE MOMENT THAT STOPS BEING TRUE, this exemption is WRONG — not merely stale. A real
+# person's name and service tier, republished from a stored record onto a keyless,
+# unauthenticated, 30-day-deep route, is PRECISELY the disclosure the mask exists to
+# prevent, and it would be this constant that let it out. If you add a signup path, an
+# import, a CRM sync, or seed one real row by hand:
+#
+#     DELETE THIS SET (or narrow it to the ids you can prove are fictional). Re-harvesting
+#     `name` and `plan` restores the mask over them with no other change anywhere.
+#
+# The lever is HERE, not a wider mask and not the tool's payload. `lookup_customer` must go
+# on returning these — the agent is asked to read them ("so you know their plan and
+# history", "Address the customer by name") and a reply that cannot use the customer's name
+# is a worse product. Withholding them from the PUBLIC FEED is a separate decision from
+# putting them in the model's context, and this set is where that decision is written down.
+#
+# KEY-AWARE, not value-based, on purpose. A skip list of the literals ("Mia Torres", "pro")
+# would unmask those strings EVERYWHERE they occur — including where some other tool
+# returned them about someone else — and it would silently follow whatever the seed data
+# says. Keyed on (containing key, field), the exemption reaches the customer record's two
+# fields and nothing else: the same word arriving under any other key is still harvested.
+# It is also restricted to STRING values below, so a future `plan` that becomes a dict of
+# free text does not walk through the hole its own key opened.
+_PERSONA_EXEMPT_FIELDS = frozenset({("customer", "name"), ("customer", "plan")})
 
 # A harvested literal shorter than this is not masked. Two reasons, both about the mask
 # being worth having: a one- or two-character value ("1", "ok") carries no disclosure on
 # its own, and masking one would replace a token that occurs everywhere in ordinary prose
 # — a drill-down reading "[withheld]" in forty places teaches a visitor to ignore the
-# marker, which costs more than the token was worth. Three is where the shortest value
-# that IS disclosive lives: a plan name ("pro").
+# marker, which costs more than the token was worth. Three was chosen because the shortest
+# DISCLOSIVE value the payload then held was a plan name ("pro").
+#
+# That example is now exempt where it is disclosive-shaped — `_PERSONA_EXEMPT_FIELDS` keeps
+# `customer.plan` out of the harvest — but the floor is still load-bearing at three, and
+# measured to be: raising it to 4 reds two tests. A given name is the case that survives
+# ("Mia", from `_name_components`, is three characters, and it is the form the system
+# prompt asks the model to write), and so is any three-character value a tool other than
+# the lookup returns, including "pro" itself arriving under some other key.
 _MIN_WITHHOLD_LEN = 3
 
 
@@ -434,15 +489,19 @@ def _name_components(value: str) -> list[str]:
     that has case and in the ones that do not; "unknown tool foobar" and every guardrail
     denial fail on their first word.
 
-    THE TRADEOFF THIS INHERITS, stated for whoever adds a fifth seeded persona: a
-    component is masked wherever it stands as a whole token, INCLUDING where it means the
-    ordinary English word. The four personas in `db.SEED_CUSTOMERS` (Ava, Liam, Noah,
-    Mia — Chen, Patel, Smith, Torres) collide with nothing a support agent writes, so the
-    cost today is zero. A persona named "Bill", "Mark" or "Grant" would publish "your
-    [withheld] is due" on the demo's payoff surface. `_MIN_WITHHOLD_LEN` is the only
-    guard against that and it only stops the two-character case. If a new name collides,
-    the lever is the seed data or an exemption beside `_ENUMERABLE_VALUES` — not a wider
+    THE TRADEOFF THIS CARRIES, stated for whoever harvests a proper-noun-shaped value
+    again: a component is masked wherever it stands as a whole token, INCLUDING where it
+    means the ordinary English word. A withheld value containing "Bill", "Mark" or "Grant"
+    publishes "your [withheld] is due" on the demo's payoff surface. `_MIN_WITHHOLD_LEN`
+    is the only guard against that and it only stops the two-character case. The lever is
+    the value's source or an exemption up beside `_PERSONA_EXEMPT_FIELDS` — not a wider
     mask.
+
+    The four seeded personas' names (Ava, Liam, Noah, Mia — Chen, Patel, Smith, Torres)
+    are no longer harvested at all: `customers.name` is exempt by field. This function is
+    still reached by every other harvested value, and stays because the FIRST paragraph's
+    vector — a sub-token of a literal the mask claims to hold — is a property of the mask
+    and not of the seed data. It is exercised by any non-exempt proper-noun-shaped value.
     """
     components = value.split()
     if len(components) < 2:
@@ -452,11 +511,14 @@ def _name_components(value: str) -> list[str]:
     return [part for part in components if _harvestable(part)]
 
 
-def _collect_strings(value: Any, out: set[str]) -> None:
+def _collect_strings(value: Any, out: set[str], *, owner: str | None = None) -> None:
     """Every FREE-TEXT string VALUE in a JSON value, at any depth. Keys are not collected.
 
     Keys are the tool author's column names — "name", "plan", "status" — and masking
-    those words out of prose would redact the sentence and disclose nothing.
+    those words out of prose would redact the sentence and disclose nothing. They ARE read
+    on the way down, though: `owner` carries the key the current container was found
+    under, so `_PERSONA_EXEMPT_FIELDS` can name a field rather than a value. See that
+    constant for the exemption and for the warning that comes with it.
 
     Neither are values drawn from Relay's own closed vocabulary (`_ENUMERABLE_VALUES`).
     The harvest exists to withhold what SOMEBODY WROTE, and a ticket status is not that:
@@ -476,11 +538,15 @@ def _collect_strings(value: Any, out: set[str]) -> None:
             out.add(value)
             out.update(_name_components(value))
     elif isinstance(value, list):
+        # `owner` rides through a list: a record found under "customer" keeps that key
+        # whether the tool returned one of them or several.
         for item in value:
-            _collect_strings(item, out)
+            _collect_strings(item, out, owner=owner)
     elif isinstance(value, dict):
-        for item in value.values():
-            _collect_strings(item, out)
+        for key, item in value.items():
+            if isinstance(item, str) and (owner, key) in _PERSONA_EXEMPT_FIELDS:
+                continue
+            _collect_strings(item, out, owner=key)
 
 
 def withheld_from_run(
@@ -550,6 +616,13 @@ def withheld_from_run(
       not collected. That is a deliberate narrowing to FREE TEXT, and it is safe for
       these values only because they are a closed set this service publishes anyway.
       Adding a genuinely disclosive value to those enums would widen it silently.
+    - A looked-up customer record's `name` and `plan` are not collected either
+      (`_PERSONA_EXEMPT_FIELDS`), so the reply reads "Hi Mia, as a pro plan customer"
+      rather than as a redacted document. THAT IS SAFE ONLY BECAUSE THIS SERVICE'S
+      CUSTOMERS ARE FOUR FICTIONAL PERSONAS HARDCODED IN A PUBLIC REPO. Seeding a real
+      customer makes it a live disclosure of a real person's name and service tier on a
+      keyless route; read the constant before you do. The record's address and signup
+      date are NOT exempt and are harvested as before.
     - Non-strings are not collected. An integer identifier restated in prose survives,
       because masking "42" wherever it occurs would rewrite costs, counts and timings.
     """
@@ -694,13 +767,18 @@ def project_run_detail(
     visitor's own ticket, and masking a plan name out of the knowledge base would
     corrupt the demo's payoff to protect nothing.
 
-    AND IT IS A FLOOR, NOT A PROOF. The mask replaces literals; a genuine paraphrase of
-    a name or a plan shares no substring with the value and survives it. That argument
+    AND FOR TWO OF THOSE VALUES IT IS NOT EVEN A FLOOR, BY DECISION. The persona's `name`
+    and `plan` are exempt from the harvest and published verbatim in prose — see
+    `_PERSONA_EXEMPT_FIELDS`, which carries the whole argument and the warning for whoever
+    seeds a real customer. Everything else the lookup returns is masked as described below.
+
+    AND FOR THE REST IT IS A FLOOR, NOT A PROOF. The mask replaces literals; a genuine
+    paraphrase of an address or a signup date shares no substring with it. That argument
     used to end "…and `lookup_customer` still hands the model ten of that address's
     ticket subjects", naming the structural closure — stop putting other people's words
     in the context — as the thing this file could not do. THAT CLOSURE WAS TAKEN: the
-    tool no longer returns any ticket subject, so what a paraphrase can still reach is a
-    fictional persona's name, plan and signup date, hardcoded in a public repo. Anyone
+    tool no longer returns any ticket subject, so what a paraphrase can still reach is one
+    fictional persona's record, hardcoded in a public repo. Anyone
     widening this branch should still assume prose discloses the GIST of everything the
     run looked up, and decide whether that is acceptable rather than assume the mask made
     it safe — the right lever for a new disclosure is the tool's payload, not this mask.
