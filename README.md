@@ -2,7 +2,9 @@
 
 [![CI](https://github.com/future-beat/relay/actions/workflows/ci.yml/badge.svg)](https://github.com/future-beat/relay/actions/workflows/ci.yml)
 
-**Live demo: https://relay-agent.fly.dev** — the root redirects to a dashboard of real agent runs (cost, latency, outcomes).
+**Live demo: https://relay-agent.fly.dev** — the root redirects to a dashboard of real
+agent runs: cost and latency over time, a live feed of runs as they happen, a per-run
+trace you can open, and a form to run a ticket yourself.
 
 An AI support-triage agent, built as a **production service** — not a notebook.
 
@@ -17,26 +19,35 @@ The agent loop is written by hand on the [Claude API](https://platform.claude.co
 (no orchestration framework), so the control flow, step caps, and event stream are
 fully visible and testable.
 
-## Status / roadmap
+## What's in it
 
-- [x] **Phase 1 — Core agent service**: FastAPI + SSE, hand-written agent loop,
-      tools (`lookup_customer`, `search_docs`, `set_category`, `send_reply`,
-      `create_escalation`), SQLite with seed data, keyword doc search
-- [x] **Phase 2 — Guardrails**: Pydantic-validated tool inputs, per-run cost
-      budget with hard abort, write-tool policy (`?dry_run=true`), structured
-      error events on API failure, per-step `usage` events with running cost
-- [x] **Phase 3 — Evaluation harness**: 12-ticket golden dataset, deterministic
-      action/category grading plus LLM-as-judge grounding checks, JSON report
-      artifact, threshold exit code for CI (`python -m relay.evals`)
-- [x] **Phase 4 — Observability**: JSON structured logs, OpenTelemetry spans
-      per run/model-call/tool (OTLP export via `OTEL_EXPORTER_OTLP_ENDPOINT`),
-      per-run metrics in SQLite, `/metrics` aggregates, `/dashboard` page
-- [x] **Phase 5 — MCP server**: the same tool registry (plus ticket
-      lifecycle tools) served over the Model Context Protocol via stdio,
-      behind the same validation and write-policy guardrails
-- [x] **Phase 6 — Ship it**: Dockerfile with container healthcheck, GitHub
-      Actions CI (lint + tests + Docker smoke test on every push; on-demand
-      eval workflow with report artifact), Fly.io deploy config
+Relay v1.0 shipped 2026-08-15 — six phases, 455 tests, deployed on a single
+scale-to-zero Fly machine.
+
+- **Security perimeter** — two-tier API-key auth (constant-time, fails closed),
+  per-route moving-window rate limits, a durable daily spend ceiling, and
+  server-side `ticket_id` binding against prompt injection
+- **Async-safe data layer** — SQLite behind a single lock with WAL and nest-safe
+  transactions, one `asyncio.to_thread` offload seam, and a shutdown drain that
+  lets in-flight SSE runs finish
+- **Semantic retrieval** — a committed [Voyage](https://www.voyageai.com/)
+  embeddings index over `kb/*.md`, a measured relevance floor, stable citation
+  ids, and a citation guard that refuses to send a reply whose claims are not
+  grounded in a retrieved document — falling back to keyword search when the
+  embedding service is absent
+- **Evaluation harness** — a 12-ticket golden set graded deterministically and by
+  a second model, retrieval recall@k / MRR, a prompt-injection case asserting the
+  guard fires, and a CI-gated pass threshold
+- **Run event persistence** — every agent step written to `run_events` inside that
+  step's own transaction, so a tool's write and the record of it commit together
+- **Public live feed and dashboard** — a projection-only SSE `/events` stream
+  (allowlisted field by field, never a spread), SQL-aggregated cards and outcome
+  distribution, hand-rolled inline SVG charts, a budget gauge reading the
+  service's own arithmetic, and a per-run drill-down with timings, retrieval
+  scores and cited-vs-not highlighting
+
+The development record — phase plans, code reviews, verification reports and the
+milestone audit — is in [`.planning/`](.planning/).
 
 See [docs/PROJECT_BRIEF.md](docs/PROJECT_BRIEF.md) for the full project definition.
 
@@ -70,7 +81,9 @@ result, and a final `resolution` event.
 | `GET`  | `/tickets/{id}`               | yes  | Fetch a ticket                         |
 | `POST` | `/tickets/{id}/process`       | yes  | Run the agent; streams steps as SSE. `?dry_run=true` denies write tools by policy |
 | `GET`  | `/metrics`                    | no   | Run counts, outcomes, token/cost totals, latency p50/p95 |
-| `GET`  | `/dashboard`                  | no   | Minimal live dashboard over `/metrics` |
+| `GET`  | `/events`                     | no   | Public SSE feed of every run's redacted steps, live |
+| `GET`  | `/runs/{run_uid}`             | no   | One run's full trace, redacted server-side |
+| `GET`  | `/dashboard`                  | no   | Live dashboard: cards, charts, feed, drill-down, "Try it" |
 
 Keyed routes take the key in an `X-API-Key` header — see
 [Security & limits](#security--limits) for the published demo key.
@@ -113,7 +126,7 @@ traffic is the failure mode worth being loud about.
 
 | | |
 |---|---|
-| Public (no key) | `GET /`, `GET /health`, `GET /metrics`, `GET /dashboard` |
+| Public (no key) | `GET /`, `GET /health`, `GET /metrics`, `GET /events`, `GET /runs/{id}`, `GET /dashboard` |
 | Key required | `POST /tickets`, `GET /tickets/{id}`, `POST /tickets/{id}/process` |
 
 `/health` is public precisely so the container `HEALTHCHECK` and the CI smoke
@@ -140,6 +153,10 @@ request.
 | `POST /tickets/{id}/process` | 5/hour | 60/hour |
 | `POST /tickets` | 20/hour | 120/hour |
 | `GET /tickets/{id}` | 120/hour | 600/hour |
+
+The public surfaces carry their own anonymous buckets, so a burst on one cannot
+starve another: `GET /events` 30/min, `GET /runs/{id}` 120/min, and a 60/min
+meter on authentication itself charged before any credential is checked.
 
 Exceeding one returns `429` with `Retry-After` and
 `X-RateLimit-Limit`/`-Remaining`/`-Reset`, plus a body naming the limit that was
@@ -269,8 +286,10 @@ safe mode is the one you get without reading the docs.
 pytest
 ```
 
-Tests cover the tools and the HTTP surface without calling the Claude API, so
-they run free and fast in CI.
+455 tests covering the tools, the HTTP surface, the guardrails and the redaction
+boundary — none of them call the Claude or Voyage API, so the suite runs free and
+fast in CI. Every load-bearing guard is paired with the mutation that should turn
+it red, and that mutation was run.
 
 ## Architecture
 
@@ -278,14 +297,21 @@ they run free and fast in CI.
 client ──POST /tickets/{id}/process──▶ FastAPI ──▶ agent loop (Claude API)
    ◀───────── SSE: text / tool_use / tool_result / resolution ─────────┘
                                           │
-                          tools ──▶ SQLite (customers, tickets,
-                                    escalations, replies)
-                                └─▶ kb/*.md (docs search)
+                       tools ──▶ SQLite (customers, tickets,
+                       │         escalations, replies, runs, run_events)
+                       └──▶ retrieval ──▶ kb/index.json  (Voyage embeddings)
+                                     └──▶ kb/*.md        (keyword fallback)
+
+each step ──▶ run_events (same transaction as the step's own write)
+                   │
+                   └──▶ projection (allowlist) ──▶ broker ──▶ GET /events
+                                                 └─────────▶ GET /runs/{uid}
 ```
+
 
 ## Deployment
 
-CI runs lint, the 37-test suite, and a Docker build + container smoke test on
+CI runs lint, the 455-test suite, and a Docker build + container smoke test on
 every push. The eval suite runs on demand (Actions → Evals) against the
 `ANTHROPIC_API_KEY` repository secret and uploads the JSON report as an
 artifact.
