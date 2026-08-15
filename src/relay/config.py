@@ -18,8 +18,30 @@ PUBLISHED_DEMO_KEY = "relay-demo-2026"
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="RELAY_", env_file=".env", extra="ignore")
 
+    # Every credential field below carries repr=False. Pydantic renders field values in
+    # __repr__/__str__, so any incidental repr of this object printed all four keys in
+    # plaintext — most concretely a pytest assertion whose failure message reprs settings,
+    # which CI runs with ANTHROPIC_API_KEY in the environment and archives as a build log.
+    #
+    # repr=False and NOT SecretStr, deliberately. SecretStr is the stronger property (it
+    # also masks model_dump and any serialisation), but it changes the field TYPE at every
+    # read site, and this model is a module-level singleton that ~90 test sites mutate with
+    # monkeypatch.setattr while validate_assignment is off — so an assigned plain str would
+    # not be coerced, and .get_secret_value() would raise AttributeError. One of those read
+    # sites is auth.resolve_tier, which fails closed: a mistake there is an outage, not a
+    # leak. What repr=False closes is exactly the channel that leaks today.
+    #
+    # STILL OPEN, by construction: model_dump(), model_dump_json() and anything that
+    # serialises this model return these values in the clear. Nothing in the tree does that
+    # today (checked: no model_dump/dict()/json() call takes settings, and no log record
+    # carries the object) — the credentials leave this process only as compare_digest bytes
+    # (auth), an Authorization header (Voyage/Anthropic), and the deliberately-published
+    # demo key on the dashboard. Do not assume more protection than repr.
+
     # Read without the RELAY_ prefix so the same variable works for the SDK's own lookup.
-    anthropic_api_key: str | None = Field(default=None, validation_alias="ANTHROPIC_API_KEY")
+    anthropic_api_key: str | None = Field(
+        default=None, validation_alias="ANTHROPIC_API_KEY", repr=False
+    )
     model: str = "claude-sonnet-5"
     db_path: Path = Path("relay.db")
     kb_dir: Path = Path("kb")
@@ -30,8 +52,13 @@ class Settings(BaseSettings):
     mcp_allow_writes: bool = False
 
     # Security perimeter (phase 1). Both keys unset means auth fails closed.
-    api_key: str | None = None
-    demo_key: str | None = None
+    api_key: str | None = Field(default=None, repr=False)
+    # demo_key is repr=False too, even though D-02 publishes it on the dashboard on
+    # purpose. Published means one deliberate channel that escapes it for the context it
+    # lands in — not that it should also fall out of every traceback and assertion
+    # message. It is still a credential the demo tier authenticates with, and the
+    # deployed value is rotatable only if it is not scattered through old build logs.
+    demo_key: str | None = Field(default=None, repr=False)
     max_daily_cost_usd: float = 5.0
     # Only read a proxy-supplied client IP when the deployment is actually behind one.
     # Aliased so the short RELAY_TRUST_PROXY name works as well as the attribute-derived one.
@@ -90,7 +117,9 @@ class Settings(BaseSettings):
     # CI and local dev run the retrieval path without a credential. Never logged,
     # never in a span attribute, never in a query string — it leaves the process
     # only as an Authorization header to the Voyage endpoint.
-    voyage_api_key: str | None = Field(default=None, validation_alias="VOYAGE_API_KEY")
+    voyage_api_key: str | None = Field(
+        default=None, validation_alias="VOYAGE_API_KEY", repr=False
+    )
     voyage_model: str = "voyage-4-lite"
     # Must match the output_dimension the committed kb index was built with. Changing
     # it without rebuilding the index yields vectors of two different widths.
