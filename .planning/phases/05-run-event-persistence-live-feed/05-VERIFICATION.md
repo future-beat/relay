@@ -323,3 +323,19 @@ The `/events` redaction boundary survived an independent probe wider than the on
 _Verified: 2026-08-12_
 _Verifier: Claude (gsd-verifier), goal-backward, adversarial stance_
 _Baseline at start and finish: 338 passed, ruff clean, working tree clean_
+
+---
+
+## Manual verifications closed in production (2026-08-15)
+
+Both rows carried from `05-VALIDATION.md` § Manual-Only Verifications, unverifiable in-suite
+by construction. Deployed at `relay-agent.fly.dev`, image built from `main` @ `07bf209`.
+
+| Behavior | Requirement | Result |
+|---|---|---|
+| `run_uid` present on the live volume after deploy | DATA-03 / D-13 | **Confirmed.** The guarded `ALTER` ran against the pre-existing week-old volume. The legacy run (`runs.id=1`, 2026-08-03) survived with `run_uid = NULL` and reads as legacy rather than crashing — the exact case the fail-closed handling was written for. `/metrics` `last_runs` now carries `run_uid`. |
+| An open `/events` tab does not hold the Fly machine awake | SC-4 / D-09 | **Confirmed by the user.** Dashboard left open and idle past the ceiling; `fly status` subsequently reported `stopped`. The heartbeat does not reset its own idle deadline in production, so `min_machines_running = 0` still reaches scale-to-zero with a live viewer attached. |
+
+This closes every verification item in the milestone. D-09 was the one property whose failure
+mode was silent and expensive — a forgotten tab quietly holding a paid machine awake — and it
+is the reason the idle-deadline mutation was treated as load-bearing during execution.
