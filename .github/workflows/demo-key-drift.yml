@@ -1,0 +1,98 @@
+# The published demo key is pinned across README.md, scripts/demo.sh and
+# PUBLISHED_DEMO_KEY by a unit test — but that test only proves those three agree with
+# each other. Nothing proved they agree with the DEPLOYMENT, and they drifted: a key set
+# by hand during a deploy left the README's curl returning 401 against the live service
+# while the suite stayed green. This closes config <-> deployment, the one edge the unit
+# test cannot see.
+#
+# Deliberately its own workflow, not a job in ci.yml: it depends on a live external host,
+# so a Fly outage must never redden an unrelated pull request.
+name: Demo key drift
+
+on:
+  push:
+    branches: [main]          # catch a PUBLISHED_DEMO_KEY change immediately
+  schedule:
+    - cron: "17 20 * * *"     # and catch an out-of-band `fly secrets set` daily
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    env:
+      HOST: https://relay-agent.fly.dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read the published constant
+        run: |
+          KEY=$(python -c "import re,sys; \
+            m=re.search(r'^PUBLISHED_DEMO_KEY\s*=\s*\"([^\"]+)\"', \
+            open('src/relay/config.py').read(), re.M); \
+            sys.exit('PUBLISHED_DEMO_KEY not found in src/relay/config.py') if not m \
+            else print(m.group(1))")
+          echo "PUBLISHED_KEY=$KEY" >> "$GITHUB_ENV"
+          echo "constant: $KEY"
+
+      # The machine is scale-to-zero, so the first request pays a cold start. Retry
+      # before concluding anything — an unreachable host is a different failure from a
+      # drifted key and must not be reported as one.
+      - name: Wake the deployment
+        id: wake
+        run: |
+          for i in $(seq 1 10); do
+            if curl -sf --max-time 30 "$HOST/health" >/dev/null; then
+              echo "awake after $i attempt(s)"; exit 0
+            fi
+            sleep 6
+          done
+          echo "::error::$HOST did not answer /health after 10 attempts — the deployment \
+          is unreachable. This is NOT a key-drift failure; check fly status."
+          exit 1
+
+      # The check that actually matters: the constant must AUTHENTICATE, not merely
+      # appear somewhere. This is the config <-> deployment edge that drifted.
+      - name: The published key authenticates
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+                 -H "X-API-Key: $PUBLISHED_KEY" "$HOST/tickets/1")
+          echo "published key -> HTTP $code"
+          if [ "$code" != "200" ]; then
+            echo "::error::The published demo key does not authenticate against $HOST \
+            (HTTP $code). README.md, scripts/demo.sh and PUBLISHED_DEMO_KEY all agree on \
+            '$PUBLISHED_KEY', so the deployment is what disagrees. Fix at the source: \
+            fly secrets set RELAY_DEMO_KEY=$PUBLISHED_KEY --app relay-agent"
+            exit 1
+          fi
+
+      # Anti-vacuity. Without this, a service that answered 200 to everything — auth
+      # disabled, a catch-all route, a caching proxy in front — would satisfy the step
+      # above and the check would prove nothing. A wrong key must be refused.
+      - name: A wrong key is still refused
+        run: |
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
+                 -H "X-API-Key: definitely-not-the-demo-key" "$HOST/tickets/1")
+          echo "bogus key -> HTTP $code"
+          if [ "$code" != "401" ]; then
+            echo "::error::A bogus key returned HTTP $code, expected 401. The previous \
+            step therefore proves nothing about the published key — the perimeter itself \
+            is not behaving. Check auth on $HOST before trusting this workflow again."
+            exit 1
+          fi
+
+      # The dashboard renders the key from the same setting the service authenticates
+      # against, so this and the step above should never disagree. If they do, something
+      # is serving a stale page — a cached response, or a machine on an older image.
+      - name: The dashboard publishes the same key
+        run: |
+          if ! curl -sf --max-time 30 "$HOST/dashboard" | grep -qF -- "$PUBLISHED_KEY"; then
+            echo "::error::$HOST/dashboard does not render '$PUBLISHED_KEY', although \
+            that key authenticates. The page and the credential come from one setting, so \
+            a mismatch means a stale page is being served — suspect a cache or a machine \
+            running an older image."
+            exit 1
+          fi
+          echo "dashboard publishes the constant"
