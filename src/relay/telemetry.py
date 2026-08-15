@@ -21,6 +21,7 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from .config import settings
 from .db import Database
+from .guardrails import GUARD_NAMES
 
 
 class JsonFormatter(logging.Formatter):
@@ -156,13 +157,15 @@ _PUBLIC_RUN_COLUMNS = (
 #                             b-tree, so LIMIT 20 stops it after 20 rows — bounded
 #   DAILY_BUCKETS_SQL         SEARCH runs USING INDEX idx_runs_created_at — bounded to
 #                             settings.metrics_window_days
+#   GUARDRAIL_DENIALS_SQL     SCAN run_events + temp b-trees for the GROUP BY and ORDER
+#                             BY — bounded by the retention sweep, not by a WHERE
 #
 # So: the first three grow with the table for the life of the Fly volume. The percentile
 # pair is bounded to the metrics window — but that WHERE is there because the card and
 # the chart have to be one statistic (WR-09), not as a cost control, and removing it for
 # a display reason would silently un-bound this read too.
 #
-# All six run inside one asyncio.to_thread (main.py) holding Database's process-wide
+# All seven run inside one asyncio.to_thread (main.py) holding Database's process-wide
 # lock for the whole read, and /metrics carries no rate-limit dependency at all — so an
 # unauthenticated `while :; do curl $H/metrics; done` is a lock-holding loop competing
 # with every in-flight run's per-event write. Bounding the three scans and metering the
@@ -259,6 +262,82 @@ LAST_RUNS_SQL = (
 )
 
 
+# SEC-04's counter. The requirement promises that a mismatched model-supplied ticket_id
+# produces "a model-visible denial event (not a crash) AND A COUNTER INCREMENT"; the
+# binding, the event and the not-a-crash half shipped in phase 1, and nothing ever
+# counted (v1.0 milestone audit, F-3).
+#
+# IT IS AN AGGREGATION, NOT A NEW IN-MEMORY COUNTER. Phase 5's `run_events` already
+# persists every step of every run, so the increment the requirement asks for has been
+# happening as a row for one phase — it was only never read back. Deriving the number
+# here instead of holding it in a process global is what every other number on /metrics
+# does, and it survives the restart that a scale-to-zero Fly machine takes between
+# visitors (min_machines_running = 0, so an in-memory tally would read 0 to almost
+# everyone who ever loaded the page).
+#
+# WHY `denied_by` AND NOT `type = 'guardrail'`. The obvious source is the guardrail EVENT
+# rows, and it is the wrong one: `_execute_guarded` refuses under three names, and only
+# two of them yield a `guardrail` event. A policy denial (dry run hits a write tool)
+# returns `denied_by: "policy"` and is never announced as a guardrail event at all, so an
+# event-sourced count would silently omit the guard that fires most often on the public
+# demo. `denied_by` is stamped by the refusal ITSELF, at every one of those returns, so a
+# guard added later is counted on the day it refuses something rather than on the day
+# somebody remembers to also count it — SEC-04 names the binding case, and a counter
+# narrower than the denial set is how the next guard goes uncounted.
+#
+# The GROUP BY is what makes it that: the guard name is the key, never a hardcoded
+# `WHERE denied_by = 'ticket_binding'`. `guardrails.GUARD_NAMES` is used only to
+# zero-fill, so an unregistered guard still appears the moment it fires.
+#
+# One row per denial, structurally: a denied call returns before `spec.execute`, so it
+# writes exactly one `tool_result` row (agent.py hands the denied write-tool row back to
+# the caller precisely so it lands after the guardrail event, in causal order). A retry
+# that succeeds adds a second, undenied row. So COUNT(*) is a count of refusals, not of
+# runs that had one — a run the model retried twice contributes two.
+#
+# WHAT THE NUMBER MEANS, and it is NOT lifetime: `run_events` is the one table this
+# service deletes from. `purge_expired_run_events` drops rows older than
+# settings.events_retention_days (30) at startup, and `runs` is deliberately spared — so
+# this count is a ROLLING WINDOW over surviving rows while every `runs`-derived number on
+# the same page is a lifetime total. It is published with its own `retention_days` for
+# exactly that reason: the two live side by side and a reader must not add them up.
+# (Because the sweep only runs at startup, the window is "at least 30 days" on a machine
+# that has been up longer — it is a floor on the age of the oldest row, never a ceiling.)
+#
+# It is also the one query here that is NOT unbounded-by-neglect: it scans, but the sweep
+# is a real ceiling on the table, which is more than TOTALS_SQL/OUTCOMES_SQL/
+# OUTCOME_DISTRIBUTION_SQL can say. It carries no WHERE on created_at on purpose —
+# adding one would make the retention window look like a display choice rather than the
+# data-protection decision it is (WR-05), and would double the places that define it.
+#
+# PUBLIC-DISCLOSURE CHECK, since /metrics is keyless. What leaves is a guard NAME and a
+# COUNT. The names are a closed vocabulary this service publishes already — `project()`
+# puts `guard` on every guardrail frame of the live feed and `_project_tool_result` puts
+# `denied_by` on every denied tool result, both to the same anonymous audience — so the
+# aggregate is strictly less than what an anonymous listener can already watch happen
+# per-event. The denied PAYLOAD is what must not ride along (it is the model's output
+# echoed from a ticket body), and the SELECT list is where that is decided: two scalars,
+# a guard name and its count, and no third. `payload` is READ (json_extract walks it to
+# one enumerated name) and never SELECTED, so no part of the raw row can reach the
+# response by being carried along beside the number. Explicit columns, no star (WR-10),
+# and tests/test_metrics.py::test_the_denial_counter_publishes_no_part_of_the_denied
+# _payload is the assertion rather than this paragraph.
+#
+# `json_extract` is SQLite's JSON1, compiled in unconditionally since 3.38 and enabled in
+# every build this ships on (3.12-slim in Docker and CI; 3.50 locally). Named as a
+# dependency rather than assumed. A payload whose `result` is not an object yields NULL
+# and is not counted — an undercount, never a crash, matching the fail-closed posture the
+# drill-down takes on the same rows.
+_DENIED_BY_PATH = "$.result.denied_by"
+
+GUARDRAIL_DENIALS_SQL = (
+    "SELECT json_extract(payload, ?) AS guard, COUNT(*) AS n"
+    " FROM run_events"
+    " WHERE type = 'tool_result' AND json_extract(payload, ?) IS NOT NULL"
+    " GROUP BY guard ORDER BY n DESC, guard"
+)
+
+
 # DASH-04 / D-10: cost and latency bucketed by day, not per run — legible at 3 runs
 # and at 300. The rank expression is character-for-character the one in
 # WINDOW_PERCENTILE_SQL AND the `WHERE` is the same window, so the chart's p50 and the
@@ -352,6 +431,32 @@ def _sql_percentile(conn: Database, pct: float) -> int:
     return int(value) if value is not None else 0
 
 
+def _guardrail_denials(conn: Database) -> dict[str, Any]:
+    """SEC-04's counter: how many tool calls each guard has refused, on record.
+
+    Zero-filled from GUARD_NAMES first, so a guard that has never fired renders as
+    "armed, 0" rather than as a missing key — the same argument _OUTCOME_BUCKETS makes
+    for the distribution chart, and it matters more here: the whole point of the number
+    is that the guard is watching, and a page that shows `ticket_binding` only after the
+    first prompt injection tells a visitor nothing on the day nobody attacks the demo.
+
+    Overlaid rather than filtered, so an UNREGISTERED guard is still reported. Dropping
+    an unknown key would be the counter quietly deciding which denials are real.
+    """
+    by_guard = dict.fromkeys(GUARD_NAMES, 0)
+    rows = conn.execute(GUARDRAIL_DENIALS_SQL, (_DENIED_BY_PATH, _DENIED_BY_PATH)).fetchall()
+    for row in rows:
+        by_guard[row["guard"]] = int(row["n"])
+    return {
+        "total": sum(by_guard.values()),
+        "by_guard": by_guard,
+        # Published with the number, never inferred by the reader: this one is a rolling
+        # window over `run_events` while every other count on this page is lifetime over
+        # `runs`. See GUARDRAIL_DENIALS_SQL.
+        "retention_days": settings.events_retention_days,
+    }
+
+
 def run_metrics(conn: Database) -> dict[str, Any]:
     totals = conn.execute(TOTALS_SQL).fetchone()
     n_runs = int(totals["runs"])
@@ -387,4 +492,7 @@ def run_metrics(conn: Database) -> dict[str, Any]:
         },
         "daily": _daily_series(conn),
         "last_runs": [dict(r) for r in conn.execute(LAST_RUNS_SQL).fetchall()],
+        # SEC-04. Counted over `run_events`, so — unlike everything above it — this is a
+        # rolling window and carries its own retention_days to say so.
+        "guardrail_denials": _guardrail_denials(conn),
     }

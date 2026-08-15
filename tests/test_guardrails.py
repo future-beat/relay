@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import json
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -12,6 +13,7 @@ from relay import retrieval
 from relay.agent import _execute_guarded, bind_to_ticket, run_ticket
 from relay.config import settings
 from relay.guardrails import (
+    GUARD_NAMES,
     RunBudget,
     SendReplyInput,
     ToolInputError,
@@ -348,6 +350,46 @@ def test_the_unbound_path_still_executes_a_ticket_id_bearing_tool(conn, registry
     )
     assert is_error is False, result
     assert _reply_ticket_ids(conn) == [TICKET["id"]]
+
+
+# --- the guard registry (SEC-04's counter) ---
+
+
+def test_every_denial_in_the_agent_is_a_registered_guard():
+    """GUARD_NAMES must name every guard that can refuse a tool call.
+
+    telemetry's denial counter (SEC-04) zero-fills from this tuple so a guard that has
+    never fired still reads "armed, 0". An unregistered guard is not UNCOUNTED — the
+    aggregation groups by whatever it finds, and
+    test_an_unregistered_guard_is_still_counted pins that — but it is INVISIBLE until
+    the day it first refuses something, which is a weaker version of the F-3 failure
+    this constant was added for: the page silently omitting a control it has.
+
+    Source-scanning, in the manner of test_nothing_outside_the_seed_creates_a_customer
+    _row: a regression guard, not a proof. It reads agent.py, which is where all three
+    `denied_by` literals in this codebase are written today (mcp_server.py raises
+    RuntimeError instead and stamps nothing). A fourth guard written anywhere else
+    walks past this.
+
+    MUTATION (executed): add `"denied_by": "rate_limit"` to a denial return in
+    _execute_guarded without touching GUARD_NAMES. Reds, naming rate_limit.
+    """
+    source = (Path(__file__).parent.parent / "src" / "relay" / "agent.py").read_text(
+        encoding="utf-8"
+    )
+    written = set(re.findall(r'"denied_by":\s*"([a-z_]+)"', source))
+
+    assert written, "the scan found no denials at all — this test proves nothing"
+    assert written == set(GUARD_NAMES), (
+        f"agent.py denies under {sorted(written)} but GUARD_NAMES registers"
+        f" {sorted(GUARD_NAMES)} — the counter's zero-fill is out of date"
+    )
+    # Both comparison sites in the loop read a registered name too, so a typo in one of
+    # them (which would silently stop emitting a guardrail event) is caught here.
+    compared = set(re.findall(r'denied_by"\)\s*==\s*"([a-z_]+)"', source))
+    assert compared <= set(GUARD_NAMES), (
+        f"the agent loop compares denied_by against unregistered names: {sorted(compared)}"
+    )
 
 
 # --- citation guard (RAG-04) ---

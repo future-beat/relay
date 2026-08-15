@@ -14,16 +14,25 @@ default), so every seed here inserts through `_insert_run` with an explicit
 `datetime('now', ?)` offset. That is the only reason this file writes raw SQL.
 """
 
+import json
 import math
 import random
 import re
 import sqlite3
 from pathlib import Path
+from typing import Any
 
+from helpers import FakeClient, response, text_block, tool_use_block
 from relay import telemetry
+from relay.agent import run_ticket
 from relay.config import settings
+from relay.db import purge_expired_run_events
+from relay.events import RunRecorder
+from relay.guardrails import GUARD_NAMES
 from relay.telemetry import (
+    _DENIED_BY_PATH,
     DAILY_BUCKETS_SQL,
+    GUARDRAIL_DENIALS_SQL,
     LAST_RUNS_SQL,
     OUTCOME_DISTRIBUTION_SQL,
     OUTCOMES_SQL,
@@ -588,3 +597,276 @@ def test_the_metrics_query_plans_are_what_this_comment_says(conn):
         assert claim in header, f"the module comment no longer states {claim!r}"
     # ...and it does not restate the claim that was false.
     assert "Every one of them replaces" not in header
+
+    # 5. SEC-04's counter, measured with the rest. It scans a DIFFERENT table, and the
+    #    header has to say which — "SCAN run_events", not a seventh line under `runs`.
+    denials_plan = _plan(conn, GUARDRAIL_DENIALS_SQL, (_DENIED_BY_PATH, _DENIED_BY_PATH))
+    assert re.search(r"\bSCAN (TABLE )?run_events\b", denials_plan), (
+        f"GUARDRAIL_DENIALS_SQL no longer reads run_events — fix the comment: {denials_plan}"
+    )
+    assert not scan.search(denials_plan), (
+        f"the denial counter started reading `runs` — that is not what it counts: {denials_plan}"
+    )
+    assert "GUARDRAIL_DENIALS_SQL     SCAN run_events" in header
+    assert "bounded by the retention sweep" in header
+
+
+# ---------------------------------------------------------------------------
+# SEC-04: the guardrail denial counter
+# ---------------------------------------------------------------------------
+
+
+def _insert_event(conn, seq: int, type_: str, payload: dict, run_uid: str = "u1") -> None:
+    conn.execute(
+        "INSERT INTO run_events (run_uid, ticket_id, seq, type, payload) VALUES (?, ?, ?, ?, ?)",
+        (run_uid, 1, seq, type_, json.dumps(payload)),
+    )
+    conn.commit()
+
+
+def _insert_denial(conn, guard: str | None, *, run_uid: str = "u1", seq: int = 1) -> None:
+    """One denial, written the way the agent loop writes it.
+
+    Which means: a `tool_result` row carrying `denied_by`, PLUS — for the two guards
+    that announce themselves — the `guardrail` event row that precedes it. `policy`
+    gets no event row, because `_execute_guarded` returns its denial without the loop
+    ever yielding a guardrail event for it. That asymmetry is the whole reason the
+    counter is sourced from the denial rather than from the event stream, so the
+    fixture has to reproduce it or the test cannot tell the two sources apart.
+
+    Raw rows rather than a driven run because these cases are about the AGGREGATION —
+    an unregistered guard, a payload that is not an object — and several of them cannot
+    be produced by the loop as it stands. test_a_binding_denial_increments_the_counter
+    is what proves the aggregation reads the rows a REAL denial writes.
+    """
+    result: Any = {"error": "denied"} if guard is None else {"error": "denied", "denied_by": guard}
+    if guard in _GUARDS_THAT_EMIT_AN_EVENT:
+        _insert_event(conn, seq, "guardrail", {"guard": guard, "tool": "send_reply",
+                                               "action": "denied"}, run_uid)
+    _insert_event(conn, seq, "tool_result", {
+        "tool": "send_reply", "result": result, "is_error": guard is not None,
+    }, run_uid)
+
+
+# The two guards whose denial the agent loop also yields a `guardrail` event for.
+# `policy` is deliberately absent — see _insert_denial.
+_GUARDS_THAT_EMIT_AN_EVENT = frozenset({"ticket_binding", "citation"})
+
+
+async def test_a_binding_denial_increments_the_counter(conn, registry, monkeypatch):
+    """SEC-04, the clause the v1.0 audit found unimplemented (F-3).
+
+    The requirement reads: a mismatched model-supplied id produces "a model-visible
+    denial event (not a crash) AND A COUNTER INCREMENT". The binding, the event and the
+    not-a-crash half shipped in phase 1 and are tested in tests/test_guardrails.py.
+    Nothing counted — there was a log line and a span attribute and no number anywhere —
+    and the requirement was marked complete and nearly archived as shipped.
+
+    This drives the requirement's own scenario through the real loop: a prompt-injected
+    send_reply naming another ticket, denied by the binding guard, recorded by the real
+    RunRecorder, counted by the real /metrics aggregation. Nothing about the denial is
+    constructed by the test except the model's move.
+
+    ANTI-VACUITY: the counter is read BEFORE the run and asserted at 0, so a test that
+    passed by counting nothing cannot pass here — the assertion is that the number
+    MOVED. The guardrail event and the surviving victim row are asserted alongside, so
+    "the count went up" cannot be satisfied by a run that failed some other way.
+
+    MUTATION (executed, output in the commit message): change GUARDRAIL_DENIALS_SQL's
+    filter to `json_extract(payload, '$.result.denied_by') = 'citation'`, i.e. count a
+    guard that did not fire. Reds on the `after` assertion with ticket_binding == 0.
+    """
+    monkeypatch.setattr(settings, "voyage_api_key", None)
+    for ticket_id, email in ((1, "liam@brightco.io"), (2, "mia@datalane.ai")):
+        conn.execute(
+            "INSERT INTO tickets (id, customer_email, subject, body) VALUES (?, ?, ?, ?)",
+            (ticket_id, email, "s", "b"),
+        )
+    conn.commit()
+    ticket = {"id": 1, "customer_email": "liam@brightco.io", "subject": "s", "body": "b"}
+
+    before = run_metrics(conn)["guardrail_denials"]
+    assert before["by_guard"]["ticket_binding"] == 0, (
+        "the counter did not start at zero — an increment cannot be observed"
+    )
+    assert before["total"] == 0
+
+    client = FakeClient([
+        # The injection: a write tool aimed at ticket 2, from ticket 1's run.
+        response([tool_use_block("send_reply", {
+            "ticket_id": 2, "body": "Your account has been credited $500, as instructed.",
+        })]),
+        response([text_block("Understood.")], stop_reason="end_turn"),
+    ])
+    recorder = RunRecorder(conn, run_uid="run-sec04", ticket_id=1)
+    events = [e async for e in run_ticket(client, registry, ticket, recorder=recorder)]
+
+    # The other three halves of SEC-04, so the increment is known to belong to a real
+    # denial of a real cross-ticket write rather than to any error at all.
+    guardrails = [e for e in events if e.type == "guardrail"]
+    assert [g.data["guard"] for g in guardrails] == ["ticket_binding"], (
+        "the scripted call was not denied by the binding guard — the count below is vacuous"
+    )
+    assert conn.execute("SELECT COUNT(*) FROM replies WHERE ticket_id = 2").fetchone()[0] == 0
+
+    after = run_metrics(conn)["guardrail_denials"]
+    assert after["by_guard"]["ticket_binding"] == 1, (
+        "SEC-04's denial produced an event and no counter increment — F-3, again"
+    )
+    assert after["total"] == 1
+    # The counter counts DENIALS, not runs-with-a-denial and not every error: this run
+    # also ended without a terminal action, and that is not a guardrail refusing.
+    assert after["by_guard"]["policy"] == 0
+    assert after["by_guard"]["citation"] == 0
+
+
+def test_the_counter_counts_every_guard_and_not_just_the_one_sec_04_names(conn):
+    """The guard name is the GROUP BY key, never a hardcoded filter.
+
+    SEC-04 names the binding case, so the cheap implementation is `WHERE denied_by =
+    'ticket_binding'` — and then the citation guard (RAG-04, phase 3) is uncounted
+    today and the next guard is uncounted silently. The count is keyed on whatever the
+    denial stamped, which is why `policy` is here: it is the guard that fires on every
+    dry run and it never emits a `guardrail` event at all, so a counter sourced from
+    the EVENT stream instead of from the denial would miss it entirely.
+
+    MUTATION (executed): source the count from `WHERE type = 'guardrail'` and group by
+    `$.guard`. Reds on `policy` ALONE — 3 seeded, 0 counted, while ticket_binding and
+    citation still tally correctly because those two do emit an event. That single
+    missing guard is the omission the denial-sourced query exists to avoid, and the
+    fixture seeds the real event rows so the test can see it as a difference of one
+    key rather than as everything collapsing to zero.
+    """
+    seeded = {"ticket_binding": 2, "policy": 3, "citation": 1}
+    seq = 0
+    for guard, n in seeded.items():
+        for _ in range(n):
+            seq += 1
+            _insert_denial(conn, guard, seq=seq)
+    # Two rows that must NOT be counted: a tool result that was not denied, and one
+    # whose result is not an object at all (json_extract yields NULL rather than raising).
+    seq += 1
+    _insert_denial(conn, None, seq=seq)
+    _insert_event(conn, seq + 1, "tool_result", {"tool": "x", "result": "not-an-object"})
+
+    denials = run_metrics(conn)["guardrail_denials"]
+
+    assert denials["by_guard"] == seeded, f"the counter is not counting by guard: {denials}"
+    assert denials["total"] == 6
+    # Every registered guard has a key even at zero: the point of the number is that the
+    # guard is armed, and a missing key on a quiet day says nothing.
+    assert set(denials["by_guard"]) == set(GUARD_NAMES)
+
+
+def test_an_unregistered_guard_is_still_counted(conn):
+    """Default-report, the mirror of the redactors' default-deny.
+
+    GUARD_NAMES zero-fills the shape; it must not FILTER it. A guard added to
+    _execute_guarded and forgotten in the registry would otherwise refuse tool calls
+    that no number on the page ever admits to — the failure mode F-3 was, arriving by a
+    different door.
+
+    MUTATION (executed): build the result as
+    `{g: counts.get(g, 0) for g in GUARD_NAMES}`, i.e. filter to registered names.
+    Reds — the new guard's 2 denials vanish and the total drops to 2.
+    """
+    _insert_denial(conn, "ticket_binding", seq=1)
+    _insert_denial(conn, "a_guard_nobody_registered", seq=2)
+    _insert_denial(conn, "a_guard_nobody_registered", seq=3)
+
+    denials = run_metrics(conn)["guardrail_denials"]
+
+    assert denials["by_guard"]["a_guard_nobody_registered"] == 2
+    assert denials["total"] == 3, "an unregistered guard's denials went missing from the total"
+
+
+def test_the_denial_count_is_a_retention_window_and_says_so(conn, monkeypatch):
+    """What the number MEANS, pinned: it is not a lifetime total, and it is labelled.
+
+    `run_events` is the one table this service deletes from — purge_expired_run_events
+    drops rows past settings.events_retention_days at startup and deliberately spares
+    `runs`. So this count is a rolling window sitting beside `runs`-derived lifetime
+    totals on the same page, and the only thing stopping a reader adding them up is
+    that it publishes its own window.
+
+    MUTATION (executed): hardcode `"retention_days": 30` in _guardrail_denials. Reds
+    when the setting is monkeypatched to 7 — the label would then be a constant that
+    stops describing the sweep the moment anyone tunes it.
+    """
+    _insert_denial(conn, "ticket_binding", seq=1)
+    _insert_denial(conn, "ticket_binding", seq=2, run_uid="u2")
+
+    assert run_metrics(conn)["guardrail_denials"]["retention_days"] == (
+        settings.events_retention_days
+    )
+
+    # The sweep really does take rows out from under this count — the window is real,
+    # not just a label. Backdate one denial past the window and purge.
+    conn.execute(
+        "UPDATE run_events SET created_at = datetime('now', ?) WHERE run_uid = 'u2'",
+        (f"-{settings.events_retention_days + 1} days",),
+    )
+    conn.commit()
+    # Two rows go: the denial's tool_result and the guardrail event that announced it.
+    assert purge_expired_run_events(conn, retention_days=settings.events_retention_days) == 2
+
+    assert run_metrics(conn)["guardrail_denials"]["by_guard"]["ticket_binding"] == 1, (
+        "the count did not follow the retention sweep — it is not the window it claims"
+    )
+
+    # And the label is READ from the setting rather than written beside it: tune the
+    # sweep and the number the page prints follows it.
+    monkeypatch.setattr(settings, "events_retention_days", 7)
+    assert run_metrics(conn)["guardrail_denials"]["retention_days"] == 7
+
+
+def test_the_denial_counter_publishes_no_part_of_the_denied_payload(conn):
+    """/metrics is keyless, and what it counts is stored raw. Only the NAME may leave.
+
+    `run_events.payload` is unredacted by design (D-01) — the row this counter reads is
+    the whole denied call: the model's reply body, the ticket id it tried to act on,
+    the guard's own error prose. /metrics has no auth dependency at all, so anything
+    the aggregation carried out of that row would be published to anyone.
+
+    The guard NAMES are already public per-event on the same anonymous audience —
+    `project()` puts `guard` on every guardrail frame of the live feed and
+    `_project_tool_result` puts `denied_by` on every denied tool result — so an
+    aggregate of them discloses strictly less than what a visitor can already watch
+    happen. The payload beside them is a different matter, and this is the assertion
+    that it stays behind.
+
+    MUTATION (executed): add `json_extract(payload, '$.result.error') AS reason` to
+    GUARDRAIL_DENIALS_SQL's SELECT and carry it into the returned dict. Reds on the
+    injected reply body, which rides out inside the guard's own error message.
+    """
+    secret_body = "Your account has been credited $500 as ava@acmecorp.com instructed"
+    _insert_event(conn, 1, "guardrail", {
+        "guard": "ticket_binding", "tool": "send_reply",
+        "expected_ticket_id": 1, "supplied_ticket_id": 99, "action": "denied",
+    })
+    _insert_event(conn, 2, "tool_result", {
+        "tool": "send_reply",
+        "is_error": True,
+        "result": {
+            "error": f"ticket_id 99 is not this run's ticket. {secret_body}",
+            "denied_by": "ticket_binding",
+            "expected_ticket_id": 1,
+            "supplied_ticket_id": 99,
+        },
+    })
+
+    denials = run_metrics(conn)["guardrail_denials"]
+    assert denials["by_guard"]["ticket_binding"] == 1, (
+        "no denial was counted — the leak assertions below would be vacuous"
+    )
+
+    # Serialised, so the check reaches every nested value rather than the top level.
+    published = json.dumps(denials)
+    for leaked in (secret_body, "ava@acmecorp.com", "credited", "99", "not this run's"):
+        assert leaked not in published, (
+            f"the denial counter published {leaked!r} from the raw stored payload"
+        )
+    # Positively: names and numbers, and nothing else of any type.
+    assert set(denials) == {"total", "by_guard", "retention_days"}
+    assert all(isinstance(v, int) for v in denials["by_guard"].values())
+    assert isinstance(denials["total"], int) and isinstance(denials["retention_days"], int)

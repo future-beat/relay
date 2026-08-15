@@ -57,6 +57,27 @@ class ToolInputError(Exception):
     pass
 
 
+# Every guard that can REFUSE a tool call, by the name it refuses under. This is the
+# closed vocabulary `_execute_guarded` stamps into a denial as `denied_by`, the feed and
+# the drill-down republish as `denied_by`/`guard`, and telemetry counts by (SEC-04).
+#
+# It lives here, in the module that owns the concept, because it is now read by three
+# layers that must not each keep their own copy: the denial site (agent.py), the public
+# serialisers (events.py), and the counter (telemetry.GUARDRAIL_DENIALS_SQL, which
+# zero-fills these names so a guard that has never fired reads as "armed, 0" rather than
+# as absent). A guard added without being registered here would be counted — the SQL
+# groups by whatever it finds — but would be invisible while its count was zero, which
+# is the "silently uncounted" failure this constant exists to make impossible.
+#
+# agent.py still writes the literals at its three denial sites, because a denial dict
+# reading `"denied_by": GUARD_TICKET_BINDING` is harder to read than the string it
+# produces. tests/test_guardrails.py::test_every_denial_in_the_agent_is_a_registered_guard
+# scans that file and reds the day a fourth literal appears here-unregistered. That is a
+# regression guard and not a proof: it sees agent.py only, which is where every
+# `denied_by` in this codebase is written today.
+GUARD_NAMES = ("policy", "ticket_binding", "citation")
+
+
 @dataclass
 class ToolPolicy:
     """Decides whether a tool may run. Write-tier tools can be disabled per
