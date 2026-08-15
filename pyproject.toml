@@ -14,7 +14,10 @@ dependencies = [
     "pydantic-settings>=2.3",
     "opentelemetry-sdk>=1.25",
     "opentelemetry-exporter-otlp-proto-http>=1.25",
-    "mcp>=1.2",
+    # 2.0 API: Server(on_list_tools=...), Tool(input_schema=...), CallToolResult(is_error=...).
+    # Floored at 2.0 because no test calls create_server, so a 1.x resolve would TypeError at
+    # startup with a green suite (v1.0 milestone audit, F-2).
+    "mcp>=2.0",
     "limits>=5.8,<6",
     # Semantic retrieval (phase 3). Cosine similarity over the prebuilt kb index.
     # Floor stays at 2.3 and NOT 2.5: numpy 2.5+ declares requires-python >=3.12,
