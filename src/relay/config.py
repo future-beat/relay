@@ -12,6 +12,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # configured, and a default here would make every unconfigured deployment accept a key
 # published on the internet. It documents what the hosted instance is deployed with;
 # .env.example still ships empty so local dev generates its own.
+# Changing this value means `fly secrets set RELAY_DEMO_KEY=<new> --app relay-agent`
+# as well. A unit test pins README.md and scripts/demo.sh to this constant, but a
+# unit test cannot see the deployment — these once drifted, leaving the README's
+# curl returning 401 against the live service with the suite fully green. The
+# .github/workflows/demo-key-drift.yml job is what covers that edge.
 PUBLISHED_DEMO_KEY = "relay-demo-2026"
 
 
