@@ -4,6 +4,18 @@
 
 Relay is an AI support-triage agent built as a production service: it receives support tickets over a REST API, works each one autonomously with a hand-written agent loop on the Claude API (customer lookup, classification, grounded doc search, reply or escalation), and streams its reasoning as SSE. This milestone remasters the existing v1 into a portfolio showpiece: production-hardened, with real semantic retrieval and a polished live dashboard.
 
+## Current State
+
+**v1.0 shipped 2026-08-15** — live at https://relay-agent.fly.dev. 22/22 requirements across 6 phases, 455 tests, deployed on a single Fly machine with `min_machines_running = 0` (scale-to-zero verified in production with a live `/events` viewer attached).
+
+Delivered: API-key auth with tiered rate limits and a daily spend ceiling; an async-safe SQLite layer with a shutdown drain; Voyage semantic retrieval with citation guarding and keyword fallback; eval coverage including a prompt-injection case; durable per-step run events with a public projection-only live feed; and the dashboard — cards, drill-down, inline SVG charts, and a Try-it form that runs real tickets.
+
+Archive: [milestones/v1.0-ROADMAP.md](milestones/v1.0-ROADMAP.md) · [milestones/v1.0-REQUIREMENTS.md](milestones/v1.0-REQUIREMENTS.md)
+
+## Next Milestone Goals
+
+Not yet defined — run `/gsd-new-milestone`. The v1.0 audit left one item with production teeth (`record_run` running synchronously on the event loop) plus a `/metrics` perimeter gap that becomes real the moment the demo gets traffic; both are natural candidates.
+
 ## Core Value
 
 A visitor hitting the live demo sees a credible, safe, observably-real AI agent service — impressive to read and watch, cheap to keep running.

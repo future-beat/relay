@@ -2,10 +2,10 @@
 gsd_state_version: 1.0
 milestone: v1.0
 milestone_name: milestone
-status: verifying
-stopped_at: Phase 6 planned (7 plans, 6 waves, checker PASS)
+status: complete
+stopped_at: v1.0 archived
 last_updated: "2026-08-12T06:54:38.104Z"
-last_activity: 2026-08-15 -- milestone complete; scale-to-zero confirmed live
+last_activity: 2026-08-15 -- v1.0 milestone archived
 progress:
   total_phases: 6
   completed_phases: 6
