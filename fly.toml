@@ -35,6 +35,22 @@ kill_timeout = 30
   auto_start_machines = true
   min_machines_running = 0
 
+# Probes /health because it is public, unmetered and does no DB or Claude API work, so
+# a check every 30s costs nothing. timeout is 5s, not the Dockerfile HEALTHCHECK's 3s:
+# a worker holding the DB lock has stalled the event loop for a measured ~0.81s,
+# shared-cpu jitter stacks on top, and 5s is busy_timeout, the bound on that stall.
+# grace_period covers a cold start, observed at ~5s to wake from stopped. A failing
+# check does not restart the machine: Fly only stops routing to it and fails
+# `fly deploy`. Crash and OOM recovery is the restart policy's job (default
+# on-failure). Checks are not proxied traffic, so they never keep the scale-to-zero
+# machine awake.
+[[http_service.checks]]
+  method = 'GET'
+  path = '/health'
+  interval = '30s'
+  timeout = '5s'
+  grace_period = '10s'
+
 [[vm]]
   size = 'shared-cpu-1x'
   memory = '512mb'

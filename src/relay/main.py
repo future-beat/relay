@@ -170,9 +170,12 @@ def _gate(bucket: str, *, meter_spend: bool = False, public: bool = False):
             # Offloaded, because the cost here is acquiring Database's lock, not
             # running the query. The SUM is microseconds behind idx_runs_created_at,
             # but a worker thread holds that lock for a whole transaction() — a
-            # measured 0.81s loop stall, bounded only by busy_timeout (5s). The
-            # container HEALTHCHECK times out at 3s, so a stalled loop that cannot
-            # answer /health gets the machine restarted, killing every in-flight run.
+            # measured 0.81s loop stall, bounded only by busy_timeout (5s). A loop
+            # stalled that long stops answering /health: Fly's service check (fly.toml,
+            # 5s) then pulls the machine out of routing and fails any `fly deploy` in
+            # progress. Fly does not restart on a failed check and ignores the
+            # Dockerfile HEALTHCHECK, but platforms that honour that 3s HEALTHCHECK can
+            # restart the container, killing every in-flight run.
             # HTTPException raised in the thread propagates back through to_thread.
             try:
                 await asyncio.to_thread(enforce_daily_budget, app.state.conn)
