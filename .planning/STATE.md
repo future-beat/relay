@@ -103,3 +103,4 @@ Resume file: .planning/phases/06-dashboard-experience/06-01-PLAN.md
 |------|------|------|
 | 2026-08-13 | dashboard-sparse-states | gitignore PDF/WAL sidecars; explain the latency chart's sparse render and the gauge's idle day |
 | 2026-10-23 | 261023-pqt-add-fly-io-http-health-check-on-health-t | Fly HTTP health check on /health (30s/5s/10s grace); VM stays 512MB scale-to-zero — memory measured ~145MiB idle |
+| 2026-10-23 | fast: main-py-health-check-comment | Correct main.py comment: a failed Fly health check stops routing and fails deploys, it does not restart |
