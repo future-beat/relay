@@ -28,7 +28,7 @@ See: .planning/PROJECT.md (updated 2026-08-05)
 Phase: 05 (Run Event Persistence & Live Feed) — EXECUTING
 Plan: 7 of 7 executed
 Status: Milestone complete -- 22/22 requirements, 6/6 phases, deployed and verified in production
-Last activity: 2026-08-11 -- Phase 05 execution started
+Last activity: 2026-10-23 -- Completed quick task 261023-pqt: Fly HTTP health check on /health
 
 Progress: [██████████] 100%
 
@@ -102,3 +102,4 @@ Resume file: .planning/phases/06-dashboard-experience/06-01-PLAN.md
 | Date | Slug | What |
 |------|------|------|
 | 2026-08-13 | dashboard-sparse-states | gitignore PDF/WAL sidecars; explain the latency chart's sparse render and the gauge's idle day |
+| 2026-10-23 | 261023-pqt-add-fly-io-http-health-check-on-health-t | Fly HTTP health check on /health (30s/5s/10s grace); VM stays 512MB scale-to-zero — memory measured ~145MiB idle |
